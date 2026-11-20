@@ -1,4 +1,4 @@
-//! The tray app: model loaded once, global shortcut (XDG portal), record -> transcribe (transcribe.cpp splits long takes at pauses) -> paste.
+//! The tray app: global shortcut (XDG portal), record -> transcribe (asr: long takes are cut at pauses) -> paste.
 //! All settings live in the tray menu (saved to config.toml on every change).
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc as std_mpsc};
@@ -11,11 +11,9 @@ use tokio::sync::mpsc;
 
 use crate::config::{Config, KeepLoaded, Output, PasteKeys};
 use crate::output::{Keyboard, Notice};
-use crate::{RATE, audio, models, tc};
+use crate::{RATE, asr, audio, models};
 
 pub const APP_ID: &str = "local.dictation.Dictation";
-/// CPU threads for transcribe.cpp (its decoder runs on the CPU); 4 measured fine on the 6-core 5600H.
-const THREADS: i32 = 4;
 
 pub fn socket_path() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap_or("/tmp".into())).join("dictation.sock")
@@ -63,33 +61,29 @@ enum Mem {
 // ---------------------------------------------------------------- engine: owns the model, runs on its own thread
 
 enum Job {
-    Load { model: std::path::PathBuf, threads: i32 },
+    Load { weights: std::path::PathBuf, kernels: std::path::PathBuf },
     Unload,
     Transcribe(Vec<f32>),
 }
 
 fn engine(jobs: std_mpsc::Receiver<Job>, ev: mpsc::UnboundedSender<Ev>) {
-    let mut asr: Option<tc::Asr> = None;
-    if let Err(e) = tc::init() {
-        let _ = ev.send(Ev::EngineLoaded(Err(e.to_string())));
-        return;
-    }
+    let mut model: Option<asr::Asr> = None;
     for job in jobs {
         match job {
-            Job::Load { model, threads } => {
-                asr = None; // free the old model first (VRAM)
+            Job::Load { weights, kernels } => {
+                model = None; // free the old model first (VRAM)
+                asr::set_kernel_cache(&kernels);
                 let t = Instant::now();
-                let r = (|| -> Result<String, tc::Error> {
-                    let mut a = tc::Asr::load(&model, threads)?;
-                    a.run(&vec![0.0; RATE])?; // warm-up (first run of a new binary also compiles GPU shaders)
-                    let backend = a.backend();
-                    asr = Some(a);
-                    Ok(format!("{backend}, loaded in {:.1} s", t.elapsed().as_secs_f64()))
+                let r = (|| -> Result<String, String> {
+                    let mut a = asr::Asr::load(&weights)?;
+                    a.run(&vec![0.0; RATE])?; // warm-up (the first run of new kernels compiles them, then cached)
+                    model = Some(a);
+                    Ok(format!("loaded in {:.1} s", t.elapsed().as_secs_f64()))
                 })();
-                let _ = ev.send(Ev::EngineLoaded(r.map_err(|e| e.to_string())));
+                let _ = ev.send(Ev::EngineLoaded(r));
             }
             Job::Unload => {
-                asr = None;
+                model = None;
                 #[cfg(all(target_os = "linux", target_env = "gnu"))]
                 unsafe {
                     libc::malloc_trim(0); // hand freed heap back to the OS (glibc keeps it otherwise)
@@ -97,12 +91,15 @@ fn engine(jobs: std_mpsc::Receiver<Job>, ev: mpsc::UnboundedSender<Ev>) {
             }
             Job::Transcribe(x) => {
                 let t = Instant::now();
-                let r = match asr.as_mut() {
-                    Some(a) => a.run(&x).map_err(|e| e.to_string()),
+                let r = match model.as_mut() {
+                    Some(a) => a.run(&x),
                     None => Err("model not loaded".into()),
                 };
                 let ms = t.elapsed().as_secs_f64() * 1000.0;
-                let _ = ev.send(Ev::Done(r.map(|text| Take { audio: x, text, ms })));
+                if let Ok((_, s)) = &r {
+                    println!("  mel {:.0} ms, pauses {:.0} ms, encoder {:.0} ms, decoder {:.0} ms", s.mel, s.vad, s.enc, s.dec);
+                }
+                let _ = ev.send(Ev::Done(r.map(|(text, _)| Take { audio: x, text, ms })));
             }
         }
     }
@@ -126,7 +123,7 @@ impl Tray {
     fn status_text(&self) -> String {
         let key = if self.shortcut.is_empty() { String::new() } else { format!(" — {}", self.shortcut) };
         match self.download {
-            Some((id, _, true)) => return format!("Checking {}…", models::find(id).name),
+            Some((id, _, true)) => return format!("Checking and converting {}…", models::find(id).name),
             Some((id, pct, false)) => return format!("Downloading {}… {pct}%", models::find(id).name),
             None => {}
         }
@@ -486,7 +483,25 @@ fn time_name() -> String {
 
 // ---------------------------------------------------------------- main loop
 
+/// `log` messages (wgpu and other crates) -> stderr, warnings and errors only, prefixed with their source.
+struct StderrLog;
+impl log::Log for StderrLog {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= log::Level::Warn
+    }
+    fn log(&self, r: &log::Record) {
+        if self.enabled(r.metadata()) {
+            eprintln!("{} {}: {}", r.target(), r.level(), r.args());
+        }
+    }
+    fn flush(&self) {}
+}
+
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    static LOG: StderrLog = StderrLog;
+    if log::set_logger(&LOG).is_ok() {
+        log::set_max_level(log::LevelFilter::Warn);
+    }
     if send("status").is_ok() {
         return Err("Dictation is already running (see the tray).".into());
     }
@@ -588,10 +603,16 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error>> {
     // Queue a (re)load of the configured model on the engine thread. Takes queued after it wait for it.
     let load = |cfg: &Config, mem: &mut Mem| {
         let m = models::find(&cfg.model);
-        let _ = jobs.send(Job::Load { model: m.path(), threads: THREADS });
+        let _ = jobs.send(Job::Load { weights: m.weights(), kernels: m.kernel_cache() });
         *mem = Mem::Loading;
     };
-    if state == State::NoModel {
+    if state == State::NoModel && models::find(&cfg.model).download_started() {
+        // A download to finish, or a GGUF from an older version of the app to check and convert.
+        downloading = true;
+        let id = models::find(&cfg.model).id;
+        start_download(id, &tx, &tray);
+        tray.update(move |t: &mut Tray| t.download = Some((id, 0, false))).await;
+    } else if state == State::NoModel {
         notice.show("Dictation needs a model", "Click the tray icon to download Parakeet Ultra (740 MB).", "dialog-information").await;
     } else if cfg.keep_loaded == KeepLoaded::Always {
         load(&cfg, &mut mem);
@@ -746,7 +767,7 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = jobs.send(Job::Unload);
                 mem = Mem::Unloaded;
             }
-            println!("model file missing: {}", models::find(&cfg.model).path().display());
+            println!("model file missing: {}", models::find(&cfg.model).weights().display());
         }
         // Settings changes apply once the current take is pasted: a loaded model is swapped for the new choice,
         // an unloaded one just loads the new choice next time. "Always" loads right away.

@@ -1,5 +1,5 @@
 """Word error rate of each take in recordings/log.jsonl against a reference text.
-usage: .venv/bin/python experiments/bench/wer.py <reference.txt> [wav name, default: last take]"""
+usage: python3 experiments/bench/wer.py <reference.txt> [wav name, default: last take]"""
 import json, re, sys
 from pathlib import Path
 

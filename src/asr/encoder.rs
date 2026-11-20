@@ -1,7 +1,7 @@
 //! Parakeet (NeMo FastConformer) encoder in burn, weights from our converted file (weights.rs).
 //! Structure follows transcribe.cpp `src/conformer/conformer.cpp` and `src/arch/parakeet/encoder.cpp`
 //! (MIT, (c) 2026 The transcribe.cpp authors), including "kestrel" length masking in the subsampling stage.
-use crate::weights::Weights;
+use super::weights::Weights;
 use burn::tensor::activation::{sigmoid, silu, softmax};
 use burn::tensor::module::{conv1d, conv2d};
 use burn::tensor::ops::ConvOptions;
@@ -186,19 +186,10 @@ impl Block {
         y.reshape([D, t]).swap_dims(0, 1).matmul(self.pw2.clone())
     }
 
-    pub fn fwd(&self, x: Tensor<2>, pos: Tensor<2>, taps: &mut Vec<(String, Tensor<2>)>, i: usize) -> Tensor<2> {
+    pub fn fwd(&self, x: Tensor<2>, pos: Tensor<2>) -> Tensor<2> {
         let x = x.clone() + Self::ff(self.n_ff1.fwd(x), &self.ff1).mul_scalar(0.5);
-        if i == 0 {
-            taps.push(("enc.block.0.ff1".into(), x.clone()));
-        }
         let x = x.clone() + self.attn(self.n_att.fwd(x), pos);
-        if i == 0 {
-            taps.push(("enc.block.0.attn".into(), x.clone()));
-        }
         let x = x.clone() + self.conv(self.n_conv.fwd(x));
-        if i == 0 {
-            taps.push(("enc.block.0.conv".into(), x.clone()));
-        }
         let x = x.clone() + Self::ff(self.n_ff2.fwd(x), &self.ff2).mul_scalar(0.5);
         self.n_out.fwd(x)
     }
@@ -321,20 +312,16 @@ impl Encoder {
     }
     /// mel [frames, 128] of `n_samples` audio -> [T_valid, D]. Frames past the valid length are dropped after the
     /// subsampler, which equals transcribe.cpp's key-padding + conv masks (relative positions don't depend on T).
-    pub fn fwd(&self, mel: Tensor<2>, n_samples: usize, taps: &mut Vec<(String, Tensor<2>)>) -> Tensor<2> {
+    pub fn fwd(&self, mel: Tensor<2>, n_samples: usize) -> Tensor<2> {
         let len = valid_lengths(n_samples, 160);
         let mut x = self.pre.fwd(mel, len);
-        taps.push(("enc.pre_encode.out".into(), x.clone()));
         let t = x.dims()[0].min(len[3]);
         if t < x.dims()[0] {
             x = x.narrow(0, 0, t);
         }
         let pos = pos_emb(t, &x.device());
-        for (i, b) in self.blocks.iter().enumerate() {
-            x = b.fwd(x, pos.clone(), taps, i);
-            if i == 0 || i == 12 {
-                taps.push((format!("enc.block.{i}.out"), x.clone()));
-            }
+        for b in &self.blocks {
+            x = b.fwd(x, pos.clone());
         }
         x
     }

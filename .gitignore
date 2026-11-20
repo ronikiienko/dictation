@@ -1,7 +1,6 @@
-# build output (app/ = old pre-2026-11-20 build dir)
+# build output
 /target/
-/app/
-# tooling: cargo/pip/hf caches, transcribe.cpp build, tmp; venvs
+# tooling: cargo cache, tmp; venvs
 /.cache/
 /.venv*/
 __pycache__/

@@ -1,7 +1,7 @@
 //! TDT greedy decoder (prediction network + joint), CPU: int8 (Q8_0) weights, f32 activations.
 //! Ported from transcribe.cpp `src/arch/parakeet/decoder.cpp` `decode_tdt_greedy` (MIT, (c) 2026 The transcribe.cpp
 //! authors), with the "kestrel" global symbol budget (`stt.parakeet.tdt.symbol_budget = global`).
-use crate::weights::Weights;
+use super::weights::Weights;
 
 pub struct Decoder {
     hidden: usize,
@@ -12,10 +12,8 @@ pub struct Decoder {
     global_budget: bool,
     embed: Vec<f32>, // [vocab][hidden]
     lstm: Vec<Lstm>,
-    pub joint_h: usize,
-    /// Joint encoder projection [joint_h][d_enc] + bias (applied by the caller, on the GPU, see `enc_proj`).
-    pub enc_w: (Vec<f32>, Vec<usize>),
-    pub enc_b: Vec<f32>,
+    /// The joint's encoder projection (joint.enc) is applied by the caller, on the GPU.
+    joint_h: usize,
     pred_w: Q8, // [joint_h][hidden]
     pred_b: Vec<f32>,
     out_w: Q8, // [vocab + n_dur][joint_h]
@@ -107,43 +105,6 @@ struct State {
     c: Vec<Vec<f32>>,
 }
 
-/// y = W x + b, W row-major [rows][cols]. Runtime-dispatched to AVX2+FMA where available.
-fn matvec(w: &[f32], x: &[f32], b: Option<&[f32]>, y: &mut [f32]) {
-    #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
-        // SAFETY: the CPU supports the features enabled on matvec_avx2.
-        return unsafe { matvec_avx2(w, x, b, y) };
-    }
-    matvec_body(w, x, b, y)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn matvec_avx2(w: &[f32], x: &[f32], b: Option<&[f32]>, y: &mut [f32]) {
-    matvec_body(w, x, b, y)
-}
-
-#[inline(always)]
-fn matvec_body(w: &[f32], x: &[f32], b: Option<&[f32]>, y: &mut [f32]) {
-    let cols = x.len();
-    for (r, out) in y.iter_mut().enumerate() {
-        let row = &w[r * cols..(r + 1) * cols];
-        let mut acc = [0f32; 16];
-        let (rc, rt) = (row.chunks_exact(16), row.chunks_exact(16).remainder());
-        for (wc, xc) in rc.zip(x.chunks_exact(16)) {
-            for i in 0..16 {
-                acc[i] = wc[i].mul_add(xc[i], acc[i]);
-            }
-        }
-        let mut s: f32 = acc.iter().sum();
-        let off = cols - rt.len();
-        for (i, wv) in rt.iter().enumerate() {
-            s += wv * x[off + i];
-        }
-        *out = s + b.map_or(0.0, |b| b[r]);
-    }
-}
-
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
@@ -162,12 +123,10 @@ impl Decoder {
             blank: g.int("tokenizer.ggml.blank_token_id") as usize,
             durations: g.ints("stt.parakeet.tdt.durations").into_iter().map(|d| d as usize).collect(),
             max_symbols: g.int("stt.parakeet.tdt.max_symbols") as usize,
-            global_budget: matches!(g.meta.get("stt.parakeet.tdt.symbol_budget"), Some(crate::gguf::Value::Str(s)) if s == "global"),
+            global_budget: matches!(g.meta.get("stt.parakeet.tdt.symbol_budget"), Some(super::gguf::Value::Str(s)) if s == "global"),
             embed: w("pred.embed.weight"),
             lstm,
             joint_h: g.int("stt.parakeet.joint.hidden") as usize,
-            enc_w: g.f32("joint.enc.weight"),
-            enc_b: w("joint.enc.bias"),
             pred_w: Q8::load(g, "joint.pred.weight"),
             pred_b: w("joint.pred.bias"),
             out_w: Q8::load(g, "joint.out.weight"),
@@ -202,11 +161,6 @@ impl Decoder {
 
     /// Greedy TDT over `enc_proj` = [T][joint_h] (encoder frames already through joint.enc). Returns token ids.
     pub fn decode(&self, enc_proj: &[f32], t_enc: usize) -> Vec<usize> {
-        self.decode_counted(enc_proj, t_enc).0
-    }
-
-    /// Also returns (iterations, predictor steps).
-    pub fn decode_counted(&self, enc_proj: &[f32], t_enc: usize) -> (Vec<usize>, usize, usize) {
         let (h, jh) = (self.hidden, self.joint_h);
         let n_out = self.out_b.len();
         let zero = State { h: vec![vec![0.0; h]; self.lstm.len()], c: vec![vec![0.0; h]; self.lstm.len()] };
@@ -222,12 +176,10 @@ impl Decoder {
         let mut budget = self.max_symbols * t_enc;
         let max_iters = 16 * t_enc + 1024;
         let mut iter = 0;
-        let mut preds = 0;
         while step < t_enc && iter < max_iters && (!self.global_budget || budget > 0) {
             iter += 1;
             if dirty {
                 self.predict(last, &state, &mut next, &mut gates, &mut tmp);
-                preds += 1;
                 self.pred_w.matvec(&next.h[self.lstm.len() - 1], Some(&self.pred_b), &mut pred_proj);
                 dirty = false;
             }
@@ -260,34 +212,6 @@ impl Decoder {
                 new_symbols = 0;
             }
         }
-        (out, iter, preds)
+        out
     }
-
-    /// First decode step's values (for comparing against transcribe.cpp's dec.* dumps):
-    /// (lstm h/c per layer, log-softmaxed joint logits) at the start state and encoder frame 0.
-    pub fn first_step(&self, enc_proj: &[f32]) -> (Vec<(Vec<f32>, Vec<f32>)>, Vec<f32>) {
-        let h = self.hidden;
-        let zero = State { h: vec![vec![0.0; h]; self.lstm.len()], c: vec![vec![0.0; h]; self.lstm.len()] };
-        let mut next = zero.clone();
-        self.predict(None, &zero, &mut next, &mut Vec::new(), &mut Vec::new());
-        let mut pp = vec![0f32; self.joint_h];
-        self.pred_w.matvec(&next.h[self.lstm.len() - 1], Some(&self.pred_b), &mut pp);
-        let act: Vec<f32> = (0..self.joint_h).map(|k| (enc_proj[k] + pp[k]).max(0.0)).collect();
-        let mut logits = vec![0f32; self.out_b.len()];
-        self.out_w.matvec(&act, Some(&self.out_b), &mut logits);
-        let mx = logits.iter().cloned().fold(f32::MIN, f32::max);
-        let lse = (logits.iter().map(|&v| ((v - mx) as f64).exp()).sum::<f64>()).ln() as f32 + mx;
-        logits.iter_mut().for_each(|v| *v -= lse);
-        (next.h.into_iter().zip(next.c).collect(), logits)
-    }
-}
-
-/// CPU joint encoder projection (reference / fallback): [T][d] -> [T][joint_h].
-pub fn enc_proj_cpu(d: &Decoder, enc: &[f32], t: usize) -> Vec<f32> {
-    let din = enc.len() / t;
-    let mut out = vec![0f32; t * d.joint_h];
-    for i in 0..t {
-        matvec(&d.enc_w.0, &enc[i * din..(i + 1) * din], Some(&d.enc_b), &mut out[i * d.joint_h..(i + 1) * d.joint_h]);
-    }
-    out
 }

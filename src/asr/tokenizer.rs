@@ -2,7 +2,7 @@
 //! Ported from transcribe.cpp `src/transcribe-tokenizer.cpp` `decode_sentencepiece` and the Parakeet result builder in
 //! `src/arch/parakeet/model.cpp` (MIT, (c) 2026 The transcribe.cpp authors): special pieces dropped, "<0xHH>" byte
 //! tokens reassembled, U+2581 -> space, runs of spaces collapsed, ends trimmed.
-use crate::weights::Weights;
+use super::weights::Weights;
 
 pub struct Tokenizer {
     pieces: Vec<String>,

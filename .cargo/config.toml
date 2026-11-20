@@ -1,6 +1,0 @@
-# Build environment for the transcribe-cpp crate, which compiles transcribe.cpp (C++/CMake, Vulkan) from source.
-# Everything comes from the project's .cache/build (cmake from a venv, Vulkan + SPIR-V headers in a local prefix);
-# only the Vulkan loader (/usr/lib/libvulkan.so) and glslc come from the system.
-[env]
-CMAKE = "/home/rostyslav/Documents/WhateverProjects/dictation/.cache/build/venv/bin/cmake"
-TRANSCRIBE_CMAKE_ARGS = "-DCMAKE_PREFIX_PATH=/home/rostyslav/Documents/WhateverProjects/dictation/.cache/build/prefix -DVulkan_INCLUDE_DIR=/home/rostyslav/Documents/WhateverProjects/dictation/.cache/build/prefix/include -DVulkan_LIBRARY=/usr/lib/libvulkan.so -DTRANSCRIBE_USE_SYSTEM_BLAS=OFF"

@@ -1,7 +1,9 @@
 //! Model catalog and downloader (Hugging Face, resumable via .part files, SHA-256 checked).
 //! Models live in the OS's per-user app data folder (`directories` crate):
 //! Linux `~/.local/share/dictation/models`, macOS `~/Library/Application Support/dictation/models`,
-//! Windows `%APPDATA%\dictation\data\models`.
+//! Windows `%APPDATA%\dictation\data\models`. Each model has its own folder `<models>/<id>/` with
+//! `model.weights` (converted from the downloaded GGUF, which is deleted afterwards) and `kernels/` (compiled GPU
+//! kernels, filled as lengths are first seen).
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -12,7 +14,7 @@ pub struct ModelInfo {
     pub id: &'static str,
     pub name: &'static str,
     pub note: &'static str,
-    /// File name inside the models folder.
+    /// File name of the download (a transcribe.cpp GGUF).
     pub file: &'static str,
     pub url: &'static str,
     pub size: u64,
@@ -23,7 +25,7 @@ pub struct ModelInfo {
 pub const CATALOG: &[ModelInfo] = &[ModelInfo {
     id: "parakeet-ultra-q8",
     name: "Parakeet Ultra, 8-bit (Q8_0)",
-    note: "recommended: best accuracy, ~0.7 GB VRAM",
+    note: "recommended: best accuracy, ~1 GB VRAM",
     file: "parakeet-ultra-Q8_0.gguf",
     url: "https://huggingface.co/handy-computer/parakeet-ultra-gguf/resolve/main/parakeet-ultra-Q8_0.gguf",
     size: 740_363_168,
@@ -47,12 +49,26 @@ pub fn open_dir() -> Result<(), String> {
 }
 
 impl ModelInfo {
-    pub fn path(&self) -> PathBuf {
-        dir().join(self.file)
+    pub fn folder(&self) -> PathBuf {
+        dir().join(self.id)
     }
-    /// Cheap check (size only); the full SHA-256 check runs once, after downloading.
+    pub fn weights(&self) -> PathBuf {
+        self.folder().join("model.weights")
+    }
+    pub fn kernel_cache(&self) -> PathBuf {
+        self.folder().join("kernels")
+    }
+    fn gguf_part(&self) -> PathBuf {
+        self.folder().join(format!("{}.part", self.file))
+    }
+    /// A converted weights file this build can load.
     pub fn installed(&self) -> bool {
-        std::fs::metadata(self.path()).map(|m| m.len() == self.size).unwrap_or(false)
+        crate::asr::is_current(&self.weights())
+    }
+    /// A finished (or partial) download is already on disk, or a GGUF from an older version of the app sits in
+    /// the models folder: "downloading" then only checks and converts it.
+    pub fn download_started(&self) -> bool {
+        self.gguf_part().exists() || dir().join(self.file).exists()
     }
 }
 
@@ -62,7 +78,7 @@ pub struct Progress {
     pub done: AtomicU64,
     pub total: AtomicU64,
     pub cancel: AtomicBool,
-    /// Download finished, checking the SHA-256.
+    /// Download finished: checking the SHA-256, then converting.
     pub verifying: AtomicBool,
 }
 
@@ -80,12 +96,16 @@ fn sha256_file(path: &std::path::Path) -> std::io::Result<String> {
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Download to `<file>.part` (resuming if it exists), check the SHA-256, then rename into place.
-/// Blocking; run it in a thread.
+/// Download the GGUF to `<id>/<file>.part` (resuming if it exists), check the SHA-256, convert it into
+/// `model.weights`, delete the GGUF. Blocking; run it in a thread.
 pub fn download(m: &ModelInfo, p: &Arc<Progress>) -> Result<(), String> {
-    let dest = m.path();
-    let part = dest.with_extension("gguf.part");
-    std::fs::create_dir_all(dest.parent().unwrap()).map_err(|e| e.to_string())?;
+    let part = m.gguf_part();
+    std::fs::create_dir_all(m.folder()).map_err(|e| e.to_string())?;
+    // A GGUF from an older version of the app (models/<file>): use it as a finished download.
+    let old = dir().join(m.file);
+    if old.exists() && !part.exists() {
+        std::fs::rename(&old, &part).map_err(|e| e.to_string())?;
+    }
     let mut have = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
     if have > m.size {
         have = 0;
@@ -133,5 +153,6 @@ pub fn download(m: &ModelInfo, p: &Arc<Progress>) -> Result<(), String> {
         let _ = std::fs::remove_file(&part);
         return Err(format!("checksum mismatch (got {got}); the file was removed, try again"));
     }
-    std::fs::rename(&part, &dest).map_err(|e| e.to_string())
+    crate::asr::convert(&part, &m.weights()).map_err(|e| format!("converting the model: {e}"))?;
+    std::fs::remove_file(&part).map_err(|e| e.to_string())
 }

@@ -1,28 +1,28 @@
 //! Whole pipeline: pcm (16 kHz mono f32) -> text. Mel and decoder on the CPU, encoder + pause head on the GPU.
 //! Order of steps follows transcribe.cpp `src/arch/parakeet/model.cpp` (MIT, (c) 2026 The transcribe.cpp authors).
-use crate::decoder::Decoder;
-use crate::encoder::{valid_lengths, Encoder, Ld, Vad};
-use crate::weights::Weights;
-use crate::longform::{self, Params};
-use crate::mel::Mel;
-use crate::tokenizer::Tokenizer;
+use super::decoder::Decoder;
+use super::encoder::{valid_lengths, Encoder, Ld, Vad};
+use super::weights::Weights;
+use super::longform::{self, Params};
+use super::mel::Mel;
+use super::tokenizer::Tokenizer;
 use burn::tensor::{DType, Device, FloatDType, Tensor, TensorData};
 use std::time::Instant;
 
+/// Pause scan: the subsampler runs this many mel frames (30 s) at a time inside a 120 s scan block. Same result as
+/// the whole block at once, ~600 MB less VRAM at the peak.
+const SCAN_CHUNK: usize = 3000;
+
 pub struct Model {
-    pub dev: Device,
-    pub enc: Encoder,
+    dev: Device,
+    enc: Encoder,
     vad: Vad,
     joint_enc: (Tensor<2>, Tensor<2>),
-    pub dec: Decoder,
+    dec: Decoder,
     tok: Tokenizer,
-    pub mel: Mel,
-    pub lf: Params,
+    mel: Mel,
+    lf: Params,
     hop: usize,
-    /// Pause scan: subsampler chunk in mel frames (0 = whole scan block at once).
-    pub scan_chunk: usize,
-    /// Release the GPU memory pool's free pages after each take.
-    pub cleanup: bool,
 }
 
 /// Time spent per stage, milliseconds.
@@ -40,18 +40,13 @@ fn dec(v: f64) -> f64 {
 }
 
 impl Model {
-    pub fn load(g: &Weights, dev: Device, low: FloatDType, q8: bool) -> Model {
-        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;
-        let l = Ld { g, dev: &dev, low, q8 };
-        let t0 = Instant::now();
+    /// Weights go to the GPU as f16 activations with int8 (Q8_0) matrices; the encoder's weights as persistent
+    /// allocations (own buffers, not pages of the dynamic pool).
+    pub fn load(g: &Weights, dev: Device) -> Model {
+        let l = Ld { g, dev: &dev, low: FloatDType::F16, q8: true };
         let enc = dev.memory_persistent_allocations(&l, |l| Encoder::load(l));
         let vad = Vad::load(&l);
         let joint_enc = (l.lin("joint.enc.weight"), l.row("joint.enc.bias"));
-        let t_up = ms(t0);
-        let t0 = Instant::now();
-        let _ = Tensor::<1>::zeros([1], &dev).into_data(); // wait for the queued uploads
-        let t_wait = ms(t0);
-        let t0 = Instant::now();
         let sr = g.int("stt.frontend.sample_rate") as usize;
         let hop = g.int("stt.frontend.hop_length") as usize;
         let mel = Mel::new(
@@ -81,8 +76,7 @@ impl Model {
         };
         let dec = Decoder::load(g);
         let tok = Tokenizer::load(g);
-        println!("load: GPU weights {t_up:.0} ms + wait {t_wait:.0} ms; decoder, tokenizer, mel {:.0} ms", ms(t0));
-        Model { enc, vad, joint_enc, dec, tok, mel, lf, hop, dev, scan_chunk: 3000, cleanup: true }
+        Model { enc, vad, joint_enc, dec, tok, mel, lf, hop, dev }
     }
 
     fn mel_tensor(&self, pcm: &[f32]) -> Tensor<2> {
@@ -92,12 +86,12 @@ impl Model {
     }
 
     /// Encoder output through the joint's encoder projection, on the GPU: [T_valid][joint_h] f32.
-    pub fn encode(&self, pcm: &[f32], t: &mut Timing) -> (Vec<f32>, usize) {
+    fn encode(&self, pcm: &[f32], t: &mut Timing) -> (Vec<f32>, usize) {
         let t0 = Instant::now();
         let mel = self.mel_tensor(pcm);
         t.mel += t0.elapsed().as_secs_f64() * 1e3;
         let t0 = Instant::now();
-        let x = self.enc.fwd(mel, pcm.len(), &mut Vec::new());
+        let x = self.enc.fwd(mel, pcm.len());
         let n = x.dims()[0];
         let p = (x.matmul(self.joint_enc.0.clone()) + self.joint_enc.1.clone()).cast(FloatDType::F32);
         let v = p.into_data().convert::<f32>().try_into_vec::<f32>().unwrap();
@@ -119,16 +113,15 @@ impl Model {
     }
 
     /// Speech probability per encoder frame for one block (subsampler + pause head only).
-    /// The subsampler runs `scan_chunk` mel frames at a time (0 = whole block at once): same result, smaller buffers.
-    pub fn speech_probs(&self, pcm: &[f32]) -> Vec<f32> {
+    fn speech_probs(&self, pcm: &[f32]) -> Vec<f32> {
         let len = valid_lengths(pcm.len(), self.hop);
-        let x = self.enc.pre.fwd_chunked(self.mel_tensor(pcm), len, self.scan_chunk);
+        let x = self.enc.pre.fwd_chunked(self.mel_tensor(pcm), len, SCAN_CHUNK);
         let p = self.vad.fwd(x).into_data().convert::<f32>().try_into_vec::<f32>().unwrap();
         p[..p.len().min(len[3])].to_vec()
     }
 
     /// Pieces as (start sample, length); one piece for takes up to 30 s.
-    pub fn segments(&self, pcm: &[f32]) -> Vec<(usize, usize)> {
+    fn segments(&self, pcm: &[f32]) -> Vec<(usize, usize)> {
         let rate = self.lf.sample_rate as f64;
         longform::pause_segments(pcm.len(), &self.lf, |start, len| {
             let probs = self.speech_probs(&pcm[start..start + len]);
@@ -137,16 +130,12 @@ impl Model {
         })
     }
 
-    pub fn decode_ids(&self, ids: &[usize]) -> String {
-        self.tok.decode(ids)
-    }
-
+    /// Takes over 30 s are cut at pauses (the model's own pause head) and the pieces' texts joined with spaces.
+    /// Afterwards the GPU memory pool hands its free pages back.
     pub fn transcribe(&self, pcm: &[f32]) -> (String, Timing) {
         let mut t = Timing::default();
         let text = self.transcribe_inner(pcm, &mut t);
-        if self.cleanup {
-            self.dev.memory_cleanup();
-        }
+        self.dev.memory_cleanup();
         (text, t)
     }
 

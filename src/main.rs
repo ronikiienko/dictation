@@ -1,4 +1,4 @@
-//! dictation — offline dictation for KDE Wayland (Parakeet Ultra via transcribe.cpp). Settings are in the tray menu.
+//! dictation — offline dictation for KDE Wayland (Parakeet Ultra, own Rust port on burn/Vulkan). Settings are in the tray menu.
 //!   dictation            run the tray app
 //!   dictation toggle     start / stop a take in the running app (for a custom shortcut or scripts)
 use dictation::daemon;

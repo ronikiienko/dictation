@@ -6,7 +6,7 @@
 //! Kinds: "f32", "f16" (as stored in the GGUF), "q8" (Q8_0 in burn's quantized byte layout: the int8 values, then one
 //! f16 scale per block of 32, aligned to 4; 2-D [rows, cols] with blocks along cols). The q8 layout belongs to burn
 //! 0.22: `LAYOUT` names it, and a file with another layout must be converted again.
-use crate::gguf::{Gguf, Value};
+use super::gguf::{Gguf, Value};
 use burn::tensor::quantization::{QuantScheme, QuantValue, ScaleDtype};
 use burn::tensor::{AllocationProperty, Bytes, DType, TensorData};
 use serde_json::{json, Map, Value as Json};
@@ -121,6 +121,11 @@ fn split_q8(b: &[u8], n: usize) -> (&[i8], Vec<f32>) {
     let s = &b[b.len() - nb * 2..];
     let d = s.chunks_exact(2).map(|x| half::f16::from_le_bytes([x[0], x[1]]).to_f32()).collect();
     (q, d)
+}
+
+/// Whether `path` is a weights file this build can load (else: convert the GGUF again).
+pub fn is_current(path: &Path) -> bool {
+    Weights::open(path).is_ok()
 }
 
 impl Weights {
