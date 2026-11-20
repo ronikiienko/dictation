@@ -11,6 +11,7 @@ directories = "6.0.0"
 evdev = "0.13.2"
 futures-util = "0.3.34"
 hound = "3"
+jiff = "1.0.1"
 ksni = "0.3.7"
 libc = "0.2.191"
 log = "0.4.35"
@@ -27,3 +28,8 @@ ureq = "3.5.2"
 
 [profile.release]
 debug = 1
+
+# Research tool, not part of the app: WER/timing check on recorded takes.
+[[example]]
+name = "check"
+path = "experiments/check.rs"

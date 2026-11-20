@@ -1,9 +1,16 @@
 //! Check the app's transcription path on recorded takes: whole take in (transcribe.cpp segments long takes
 //! itself), text out. One JSON line per take on stdout.
-//! usage: check <wav>...
+//! usage: cargo run --release --example check -- <wav>...   (uses the app's downloaded model)
 use dictation::*;
 use serde_json::json;
 use std::time::Instant;
+
+fn read_wav(path: &std::path::Path) -> Result<Vec<f32>, hound::Error> {
+    let mut r = hound::WavReader::open(path)?;
+    let s = r.spec();
+    assert!(s.sample_rate as usize == RATE && s.channels == 1 && s.bits_per_sample == 16, "need 16 kHz mono 16-bit");
+    r.samples::<i16>().map(|v| v.map(|v| v as f32 / 32768.0)).collect()
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tc::init()?;

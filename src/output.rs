@@ -58,7 +58,8 @@ impl Clipboard {
     }
 }
 
-/// One notification updated in place: recording (stays) -> transcribing (stays) -> result (times out).
+/// Short notifications (result, errors), each replacing the previous one. Recording state is shown by the tray icon
+/// and the start/stop sounds, not by notifications.
 #[derive(Default)]
 pub struct Notice {
     pub id: Option<u32>,
@@ -66,19 +67,14 @@ pub struct Notice {
 }
 
 impl Notice {
-    pub async fn show(&mut self, title: &str, body: &str, icon: &str, stay: bool) {
+    pub async fn show(&mut self, title: &str, body: &str, icon: &str) {
         if !self.enabled {
             return;
         }
-        use notify_rust::{Notification, Timeout, Urgency};
+        use notify_rust::{Hint, Notification, Timeout};
         let mut n = Notification::new();
-        n.appname("Dictation").summary(title).body(body).icon(icon);
-        if stay {
-            n.urgency(Urgency::Critical).timeout(Timeout::Never); // critical: KDE keeps it until replaced
-        } else {
-            n.urgency(Urgency::Normal).timeout(Timeout::Milliseconds(4000));
-            n.hint(notify_rust::Hint::Transient(true));
-        }
+        n.appname("Dictation").summary(title).body(body).icon(icon).timeout(Timeout::Milliseconds(4000));
+        n.hint(Hint::Transient(true));
         if let Some(id) = self.id {
             n.id(id);
         }

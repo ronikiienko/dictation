@@ -8,8 +8,6 @@ use std::path::PathBuf;
 pub struct Config {
     /// Speech model id from models::CATALOG.
     pub model: String,
-    /// CPU threads for the decoder (it runs on the CPU in transcribe.cpp).
-    pub threads: i32,
     /// Microphone: cpal device id, or "" for the system default.
     pub microphone: String,
     /// What happens with the text.
@@ -20,7 +18,7 @@ pub struct Config {
     pub sounds: bool,
     /// Desktop notifications (recording, transcribing, result).
     pub notifications: bool,
-    /// Keep every take as wav + a line in recordings/log.jsonl (like gauge).
+    /// Keep every take as wav + a line in recordings/log.jsonl (off by default: it stores the user's voice).
     pub save_recordings: bool,
     /// When to free the speech model (~0.7 GB VRAM). It is loaded again when the next take starts, while you speak
     /// (~1 s).
@@ -72,13 +70,12 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             model: "parakeet-ultra-q8".into(),
-            threads: 4,
             microphone: String::new(),
             output: Output::Paste,
             paste_keys: PasteKeys::CtrlV,
             sounds: true,
             notifications: true,
-            save_recordings: true,
+            save_recordings: false,
             keep_loaded: KeepLoaded::OneMinute,
         }
     }

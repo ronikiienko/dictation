@@ -14,6 +14,8 @@ use crate::output::{Keyboard, Notice};
 use crate::{RATE, audio, models, tc};
 
 pub const APP_ID: &str = "local.dictation.Dictation";
+/// CPU threads for transcribe.cpp (its decoder runs on the CPU); 4 measured fine on the 6-core 5600H.
+const THREADS: i32 = 4;
 
 pub fn socket_path() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap_or("/tmp".into())).join("dictation.sock")
@@ -24,7 +26,6 @@ pub enum Ev {
     /// New settings chosen in the tray menu.
     Set(Config),
     /// config.toml edited by hand (`dictation reload`).
-    Reload,
     Download(&'static str),
     Downloaded(&'static str, Result<(), String>),
     ConfigureShortcut,
@@ -89,7 +90,10 @@ fn engine(jobs: std_mpsc::Receiver<Job>, ev: mpsc::UnboundedSender<Ev>) {
             }
             Job::Unload => {
                 asr = None;
-                unsafe { libc::malloc_trim(0) }; // hand freed heap back to the OS
+                #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                unsafe {
+                    libc::malloc_trim(0); // hand freed heap back to the OS (glibc keeps it otherwise)
+                }
             }
             Job::Transcribe(x) => {
                 let t = Instant::now();
@@ -418,7 +422,7 @@ async fn shortcut_task(tx: mpsc::UnboundedSender<Ev>, mut configure: mpsc::Unbou
     Ok(())
 }
 
-// ---------------------------------------------------------------- control socket (`dictation toggle|reload|status`)
+// ---------------------------------------------------------------- control socket (`dictation toggle`; `status` = single-instance check)
 
 async fn socket_task(tx: mpsc::UnboundedSender<Ev>, status: tokio::sync::watch::Receiver<String>) {
     let path = socket_path();
@@ -437,8 +441,6 @@ async fn socket_task(tx: mpsc::UnboundedSender<Ev>, status: tokio::sync::watch::
             }
             let reply = match line.trim() {
                 "toggle" => tx.send(Ev::Toggle).map(|_| "ok".to_string()),
-                "reload" => tx.send(Ev::Reload).map(|_| "ok".to_string()),
-                "unload" => tx.send(Ev::UnloadNow).map(|_| "ok".to_string()),
                 "status" => Ok(status.borrow().clone()),
                 _ => Ok("unknown command".to_string()),
             }
@@ -459,7 +461,7 @@ pub fn send(cmd: &str) -> std::io::Result<String> {
     Ok(line.trim().to_string())
 }
 
-// ---------------------------------------------------------------- recordings (same format as gauge / dictate.py)
+// ---------------------------------------------------------------- recordings (wav + one JSON line per take)
 
 fn save_take(t: &Take) -> std::io::Result<()> {
     let dir = crate::root().join("recordings");
@@ -473,19 +475,13 @@ fn save_take(t: &Take) -> std::io::Result<()> {
     w.finalize().map_err(std::io::Error::other)?;
     use std::io::Write;
     let line = serde_json::json!({"wav": format!("{name}.wav"), "seconds": (t.audio.len() as f64 / RATE as f64 * 100.0).round() / 100.0,
-        "parakeet": t.text, "final_model": "ultra-vk", "parakeet_ms": t.ms.round(),
-        "segmenting": "transcribe.cpp", "app": "dictation-rs"});
+        "text": t.text, "ms": t.ms.round()});
     writeln!(std::fs::OpenOptions::new().create(true).append(true).open(dir.join("log.jsonl"))?, "{line}")
 }
 
-/// Local time as YYYYMMDD-HHMMSS (same names as gauge), via libc to avoid a date crate.
+/// Local time as YYYYMMDD-HHMMSS.
 fn time_name() -> String {
-    unsafe {
-        let t = libc::time(std::ptr::null_mut());
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&t, &mut tm);
-        format!("{:04}{:02}{:02}-{:02}{:02}{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec)
-    }
+    jiff::ZonedDateTime::now().strftime("%Y%m%d-%H%M%S").to_string()
 }
 
 // ---------------------------------------------------------------- main loop
@@ -592,11 +588,11 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error>> {
     // Queue a (re)load of the configured model on the engine thread. Takes queued after it wait for it.
     let load = |cfg: &Config, mem: &mut Mem| {
         let m = models::find(&cfg.model);
-        let _ = jobs.send(Job::Load { model: m.path(), threads: cfg.threads });
+        let _ = jobs.send(Job::Load { model: m.path(), threads: THREADS });
         *mem = Mem::Loading;
     };
     if state == State::NoModel {
-        notice.show("Dictation needs a model", "Click the tray icon to download Parakeet Ultra (740 MB).", "dialog-information", false).await;
+        notice.show("Dictation needs a model", "Click the tray icon to download Parakeet Ultra (740 MB).", "dialog-information").await;
     } else if cfg.keep_loaded == KeepLoaded::Always {
         load(&cfg, &mut mem);
     }
@@ -618,9 +614,8 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error>> {
                         if cfg.sounds {
                             audio::play(audio::Cue::Start);
                         }
-                        notice.show("● Recording…", "Press the shortcut again to stop", "audio-input-microphone", true).await;
                     }
-                    Err(e) => notice.show("Microphone error", &e, "dialog-error", false).await,
+                    Err(e) => notice.show("Microphone error", &e, "dialog-error").await,
                 },
                 (_, Some(r)) => {
                     if cfg.sounds {
@@ -629,14 +624,12 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error>> {
                     state = if busy > 0 { State::Transcribing } else { State::Idle };
                     match r.stop() {
                         Ok(x) if x.len() >= RATE / 4 => {
-                            let wait = if mem == Mem::Loading { " (model still loading)" } else { "" };
-                            notice.show("Transcribing…", &format!("{:.1} s of audio{wait}", x.len() as f64 / RATE as f64), "view-refresh", true).await;
                             busy += 1;
                             let _ = jobs.send(Job::Transcribe(x));
                             state = State::Transcribing;
                         }
-                        Ok(_) => notice.show("Too short, skipped", "", "dialog-information", false).await,
-                        Err(e) => notice.show("Microphone error", &e, "dialog-error", false).await,
+                        Ok(_) => notice.show("Too short, skipped", "", "dialog-information").await,
+                        Err(e) => notice.show("Microphone error", &e, "dialog-error").await,
                     }
                     last_used = Instant::now();
                 }
@@ -672,7 +665,7 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error>> {
                             (false, Output::Clipboard) => "Copied to clipboard",
                         };
                         if state != State::Recording {
-                            notice.show(title, &body, if t.text.is_empty() { "dialog-information" } else { "dialog-ok" }, false).await;
+                            notice.show(title, &body, if t.text.is_empty() { "dialog-information" } else { "dialog-ok" }).await;
                         }
                         println!("{:.1}s audio, {:.0} ms: {}", t.audio.len() as f64 / RATE as f64, t.ms, t.text);
                         if cfg.save_recordings {
@@ -681,7 +674,7 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
-                    Err(e) => notice.show("Transcription failed", &e, "dialog-error", false).await,
+                    Err(e) => notice.show("Transcription failed", &e, "dialog-error").await,
                 }
             }
             Ev::EngineLoaded(r) => match r {
@@ -695,7 +688,7 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("model load failed: {e}");
                     mem = Mem::Unloaded; // the next take tries again
                     load_failed = true;
-                    notice.show("Model failed to load", &e, "dialog-error", false).await;
+                    notice.show("Model failed to load", &e, "dialog-error").await;
                 }
             },
             Ev::Tick => {}
@@ -718,12 +711,12 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error>> {
                 tray.update(|t: &mut Tray| t.download = None).await;
                 match r {
                     Ok(()) => {
-                        notice.show("Model downloaded", models::find(id).name, "dialog-ok", false).await;
+                        notice.show("Model downloaded", models::find(id).name, "dialog-ok").await;
                         let mut c = cfg.clone();
                         c.model = id.into();
                         let _ = tx.send(Ev::Set(c));
                     }
-                    Err(e) => notice.show("Download failed", &e, "dialog-error", false).await,
+                    Err(e) => notice.show("Download failed", &e, "dialog-error").await,
                 }
             }
             Ev::Set(new) => {
@@ -731,10 +724,6 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("save config: {e}");
                 }
                 pending_reload |= apply(&mut cfg, new);
-                load_failed = false;
-            }
-            Ev::Reload => {
-                pending_reload |= apply(&mut cfg, Config::load());
                 load_failed = false;
             }
             Ev::Shortcut(s) => {
@@ -799,7 +788,19 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Take new settings. -> whether a loaded model has to be swapped (model or thread count changed).
 fn apply(cfg: &mut Config, new: Config) -> bool {
-    let reload = new.model != cfg.model || new.threads != cfg.threads;
+    let reload = new.model != cfg.model;
     *cfg = new;
     reload
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[cfg(unix)] // compares with `date`
+    fn time_name_is_local_yyyymmdd_hhmmss() {
+        let n = super::time_name();
+        let date = std::process::Command::new("date").arg("+%Y%m%d-%H%M").output().unwrap();
+        assert!(n.starts_with(String::from_utf8_lossy(&date.stdout).trim()), "{n}");
+        assert_eq!(n.len(), 15);
+    }
 }

@@ -36,9 +36,7 @@ pub fn find(id: &str) -> &'static ModelInfo {
 
 /// Folder holding the downloaded models (not created here).
 pub fn dir() -> PathBuf {
-    directories::ProjectDirs::from("", "", "dictation")
-        .map(|d| d.data_dir().join("models"))
-        .unwrap_or_else(|| crate::root().join("models")) // no home directory: fall back to the project folder
+    directories::ProjectDirs::from("", "", "dictation").expect("no home directory").data_dir().join("models")
 }
 
 /// Show the models folder in the file manager (created first, so there is something to open).
