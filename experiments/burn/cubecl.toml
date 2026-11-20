@@ -1,0 +1,17 @@
+# Paths are relative to experiments/burn (run burn-enc from there).
+[autotune]
+level = "minimal"
+
+[compilation]
+cache = true
+
+[compilation.logger]
+level = "basic"
+file = "../../.cache/tmp/burn/compile.log"
+
+[environment]
+path = { directory = "../../.cache/tmp/burn/env" }
+
+[autotune.logger]
+level = "minimal"
+file = "../../.cache/tmp/burn/autotune.log"
