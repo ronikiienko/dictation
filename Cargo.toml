@@ -1,0 +1,26 @@
+[package]
+name = "dictation"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arboard = { version = "3.7.0", default-features = false, features = ["wayland-data-control"] }
+ashpd = { version = "0.14.1", default-features = false, features = ["tokio", "global_shortcuts"] }
+cpal = { version = "0.18.2", features = ["pulseaudio"] }
+evdev = "0.13.2"
+futures-util = "0.3.34"
+hound = "3"
+ksni = "0.3.7"
+libc = "0.2.191"
+log = "0.4.35"
+notify-rust = { version = "4.19.0", default-features = false, features = ["z-with-tokio"] }
+rodio = { version = "0.23.0", default-features = false, features = ["playback"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
+toml = "1.2.1"
+transcribe-cpp = { version = "0.4.2", default-features = false, features = ["vulkan"] }
+ureq = "3.5.2"
+
+[profile.release]
+debug = 1
