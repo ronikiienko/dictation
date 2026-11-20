@@ -1,4 +1,4 @@
-//! Minimal GGUF reader: metadata is skipped except what we need, tensors are dequantized to f32 on request.
+//! Minimal GGUF reader: metadata values are parsed, tensors are dequantized to f32 on request.
 //! Supports the types in the Parakeet Ultra Q8_0 file: F32, F16, Q8_0.
 use std::collections::HashMap;
 use std::io::{self, Read};
@@ -14,6 +14,17 @@ pub struct Gguf {
     data: Vec<u8>,
     data_start: usize,
     pub tensors: HashMap<String, TensorInfo>,
+    pub meta: HashMap<String, Value>,
+}
+
+/// A metadata value (only the kinds Parakeet's GGUF uses are kept; others are skipped as `Other`).
+#[derive(Debug, Clone)]
+pub enum Value {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Str(String),
+    Arr(Vec<Value>),
 }
 
 struct Cur<'a>(&'a [u8], usize);
@@ -33,39 +44,25 @@ impl Cur<'_> {
         let n = self.u64() as usize;
         String::from_utf8_lossy(self.bytes(n)).into_owned()
     }
-    /// Skip a metadata value of type `t`; returns u32/u64 values (for general.alignment).
-    fn skip_value(&mut self, t: u32) -> Option<u64> {
+    fn value(&mut self, t: u32) -> Value {
         match t {
-            0 | 1 | 7 => {
-                self.bytes(1);
-                None
-            }
-            2 | 3 => {
-                self.bytes(2);
-                None
-            }
-            4 | 5 => Some(self.u32() as u64),
-            6 => {
-                self.bytes(4);
-                None
-            }
-            10 | 11 => Some(self.u64()),
-            12 => {
-                self.bytes(8);
-                None
-            }
-            8 => {
-                self.string();
-                None
-            }
+            0 => Value::Int(self.bytes(1)[0] as i64),
+            1 => Value::Int(self.bytes(1)[0] as i8 as i64),
+            2 => Value::Int(u16::from_le_bytes(self.bytes(2).try_into().unwrap()) as i64),
+            3 => Value::Int(i16::from_le_bytes(self.bytes(2).try_into().unwrap()) as i64),
+            4 => Value::Int(self.u32() as i64),
+            5 => Value::Int(self.u32() as i32 as i64),
+            6 => Value::Float(f32::from_le_bytes(self.bytes(4).try_into().unwrap()) as f64),
+            7 => Value::Bool(self.bytes(1)[0] != 0),
+            8 => Value::Str(self.string()),
             9 => {
                 let et = self.u32();
                 let n = self.u64();
-                for _ in 0..n {
-                    self.skip_value(et);
-                }
-                None
+                Value::Arr((0..n).map(|_| self.value(et)).collect())
             }
+            10 => Value::Int(self.u64() as i64),
+            11 => Value::Int(self.u64() as i64),
+            12 => Value::Float(f64::from_le_bytes(self.bytes(8).try_into().unwrap())),
             _ => panic!("unknown gguf value type {t}"),
         }
     }
@@ -80,15 +77,16 @@ impl Gguf {
         let _version = c.u32();
         let n_tensors = c.u64();
         let n_kv = c.u64();
-        let mut alignment = 32usize;
+        let mut meta = HashMap::new();
         for _ in 0..n_kv {
             let key = c.string();
             let t = c.u32();
-            let v = c.skip_value(t);
-            if key == "general.alignment" {
-                alignment = v.unwrap() as usize;
-            }
+            meta.insert(key, c.value(t));
         }
+        let alignment = match meta.get("general.alignment") {
+            Some(Value::Int(a)) => *a as usize,
+            _ => 32,
+        };
         let mut tensors = HashMap::new();
         for _ in 0..n_tensors {
             let name = c.string();
@@ -99,7 +97,33 @@ impl Gguf {
             tensors.insert(name, TensorInfo { ne, ty, offset });
         }
         let data_start = c.1.div_ceil(alignment) * alignment;
-        Ok(Gguf { data, data_start, tensors })
+        Ok(Gguf { data, data_start, tensors, meta })
+    }
+
+    pub fn int(&self, key: &str) -> i64 {
+        match self.meta.get(key) {
+            Some(Value::Int(v)) => *v,
+            v => panic!("gguf {key}: expected int, got {v:?}"),
+        }
+    }
+    pub fn float(&self, key: &str) -> f64 {
+        match self.meta.get(key) {
+            Some(Value::Float(v)) => *v,
+            Some(Value::Int(v)) => *v as f64,
+            v => panic!("gguf {key}: expected float, got {v:?}"),
+        }
+    }
+    pub fn strs(&self, key: &str) -> Vec<String> {
+        match self.meta.get(key) {
+            Some(Value::Arr(a)) => a.iter().map(|v| match v { Value::Str(s) => s.clone(), _ => panic!("{key}: not strings") }).collect(),
+            v => panic!("gguf {key}: expected array, got {v:?}"),
+        }
+    }
+    pub fn ints(&self, key: &str) -> Vec<i64> {
+        match self.meta.get(key) {
+            Some(Value::Arr(a)) => a.iter().map(|v| match v { Value::Int(i) => *i, _ => panic!("{key}: not ints") }).collect(),
+            v => panic!("gguf {key}: expected array, got {v:?}"),
+        }
     }
 
     pub fn info(&self, name: &str) -> &TensorInfo {

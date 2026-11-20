@@ -9,6 +9,8 @@ publish = false
 # "persistence" keeps the compiled-kernel (SPIR-V) cache on disk (cubecl.toml [compilation] cache = true).
 burn = { version = "0.22.1", default-features = false, features = ["std", "vulkan", "fusion", "persistence"] }
 half = "2"
+hound = "3"
+realfft = "3"
 
 [profile.release]
 debug = 1
