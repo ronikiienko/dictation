@@ -2,7 +2,7 @@
 //! Order of steps follows transcribe.cpp `src/arch/parakeet/model.cpp` (MIT, (c) 2026 The transcribe.cpp authors).
 use crate::decoder::Decoder;
 use crate::encoder::{valid_lengths, Encoder, Ld, Vad};
-use crate::gguf::Gguf;
+use crate::weights::Weights;
 use crate::longform::{self, Params};
 use crate::mel::Mel;
 use crate::tokenizer::Tokenizer;
@@ -19,6 +19,10 @@ pub struct Model {
     pub mel: Mel,
     pub lf: Params,
     hop: usize,
+    /// Pause scan: subsampler chunk in mel frames (0 = whole scan block at once).
+    pub scan_chunk: usize,
+    /// Release the GPU memory pool's free pages after each take.
+    pub cleanup: bool,
 }
 
 /// Time spent per stage, milliseconds.
@@ -36,11 +40,18 @@ fn dec(v: f64) -> f64 {
 }
 
 impl Model {
-    pub fn load(g: &Gguf, dev: Device, low: FloatDType, q8: bool) -> Model {
+    pub fn load(g: &Weights, dev: Device, low: FloatDType, q8: bool) -> Model {
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;
         let l = Ld { g, dev: &dev, low, q8 };
+        let t0 = Instant::now();
         let enc = dev.memory_persistent_allocations(&l, |l| Encoder::load(l));
         let vad = Vad::load(&l);
         let joint_enc = (l.lin("joint.enc.weight"), l.row("joint.enc.bias"));
+        let t_up = ms(t0);
+        let t0 = Instant::now();
+        let _ = Tensor::<1>::zeros([1], &dev).into_data(); // wait for the queued uploads
+        let t_wait = ms(t0);
+        let t0 = Instant::now();
         let sr = g.int("stt.frontend.sample_rate") as usize;
         let hop = g.int("stt.frontend.hop_length") as usize;
         let mel = Mel::new(
@@ -68,7 +79,10 @@ impl Model {
             min_tail_seconds: 0.5,
             min_feature_samples: 320,
         };
-        Model { enc, vad, joint_enc, dec: Decoder::load(g), tok: Tokenizer::load(g), mel, lf, hop, dev }
+        let dec = Decoder::load(g);
+        let tok = Tokenizer::load(g);
+        println!("load: GPU weights {t_up:.0} ms + wait {t_wait:.0} ms; decoder, tokenizer, mel {:.0} ms", ms(t0));
+        Model { enc, vad, joint_enc, dec, tok, mel, lf, hop, dev, scan_chunk: 3000, cleanup: true }
     }
 
     fn mel_tensor(&self, pcm: &[f32]) -> Tensor<2> {
@@ -105,9 +119,10 @@ impl Model {
     }
 
     /// Speech probability per encoder frame for one block (subsampler + pause head only).
-    fn speech_probs(&self, pcm: &[f32]) -> Vec<f32> {
+    /// The subsampler runs `scan_chunk` mel frames at a time (0 = whole block at once): same result, smaller buffers.
+    pub fn speech_probs(&self, pcm: &[f32]) -> Vec<f32> {
         let len = valid_lengths(pcm.len(), self.hop);
-        let x = self.enc.pre.fwd(self.mel_tensor(pcm), len);
+        let x = self.enc.pre.fwd_chunked(self.mel_tensor(pcm), len, self.scan_chunk);
         let p = self.vad.fwd(x).into_data().convert::<f32>().try_into_vec::<f32>().unwrap();
         p[..p.len().min(len[3])].to_vec()
     }
@@ -128,16 +143,23 @@ impl Model {
 
     pub fn transcribe(&self, pcm: &[f32]) -> (String, Timing) {
         let mut t = Timing::default();
+        let text = self.transcribe_inner(pcm, &mut t);
+        if self.cleanup {
+            self.dev.memory_cleanup();
+        }
+        (text, t)
+    }
+
+    fn transcribe_inner(&self, pcm: &[f32], t: &mut Timing) -> String {
         if self.lf.fits_one_segment(pcm.len()) {
-            let s = self.one_shot(pcm, &mut t);
-            return (s, t);
+            return self.one_shot(pcm, t);
         }
         let t0 = Instant::now();
         let segs = self.segments(pcm);
         t.vad = t0.elapsed().as_secs_f64() * 1e3;
         let mut text = String::new();
         for (start, len) in segs {
-            let s = self.one_shot(&pcm[start..start + len], &mut t);
+            let s = self.one_shot(&pcm[start..start + len], t);
             if !s.is_empty() {
                 if !text.is_empty() {
                     text.push(' ');
@@ -145,6 +167,6 @@ impl Model {
                 text.push_str(&s);
             }
         }
-        (text, t)
+        text
     }
 }

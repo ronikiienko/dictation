@@ -2,7 +2,7 @@
 //! Ported from transcribe.cpp `src/transcribe-tokenizer.cpp` `decode_sentencepiece` and the Parakeet result builder in
 //! `src/arch/parakeet/model.cpp` (MIT, (c) 2026 The transcribe.cpp authors): special pieces dropped, "<0xHH>" byte
 //! tokens reassembled, U+2581 -> space, runs of spaces collapsed, ends trimmed.
-use crate::gguf::Gguf;
+use crate::weights::Weights;
 
 pub struct Tokenizer {
     pieces: Vec<String>,
@@ -20,7 +20,7 @@ fn is_lang_tag(p: &str) -> bool {
 }
 
 impl Tokenizer {
-    pub fn load(g: &Gguf) -> Tokenizer {
+    pub fn load(g: &Weights) -> Tokenizer {
         let pieces = g.strs("tokenizer.ggml.tokens");
         let types = g.ints("tokenizer.ggml.token_type");
         let unk = g.int("tokenizer.ggml.unknown_token_id");

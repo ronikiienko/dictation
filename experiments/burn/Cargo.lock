@@ -757,9 +757,13 @@ name = "burn-enc"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "bytemuck",
+ "bytes",
  "half",
  "hound",
+ "memmap2",
  "realfft",
+ "serde_json",
 ]
 
 [[package]]

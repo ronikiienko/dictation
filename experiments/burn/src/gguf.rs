@@ -1,7 +1,8 @@
-//! Minimal GGUF reader: metadata values are parsed, tensors are dequantized to f32 on request.
+//! Minimal GGUF reader (input of the converter in weights.rs): metadata values are parsed, tensors read on request.
 //! Supports the types in the Parakeet Ultra Q8_0 file: F32, F16, Q8_0.
 use std::collections::HashMap;
 use std::io::{self, Read};
+
 
 pub struct TensorInfo {
     /// ggml order: ne[0] is the fastest-varying (row) dimension.
@@ -70,8 +71,9 @@ impl Cur<'_> {
 
 impl Gguf {
     pub fn open(path: &std::path::Path) -> io::Result<Gguf> {
-        let mut data = Vec::new();
-        std::fs::File::open(path)?.read_to_end(&mut data)?;
+        let mut f = std::fs::File::open(path)?;
+        let mut data = Vec::with_capacity(f.metadata()?.len() as usize);
+        f.read_to_end(&mut data)?;
         let mut c = Cur(&data, 0);
         assert_eq!(c.bytes(4), b"GGUF");
         let _version = c.u32();
@@ -100,32 +102,6 @@ impl Gguf {
         Ok(Gguf { data, data_start, tensors, meta })
     }
 
-    pub fn int(&self, key: &str) -> i64 {
-        match self.meta.get(key) {
-            Some(Value::Int(v)) => *v,
-            v => panic!("gguf {key}: expected int, got {v:?}"),
-        }
-    }
-    pub fn float(&self, key: &str) -> f64 {
-        match self.meta.get(key) {
-            Some(Value::Float(v)) => *v,
-            Some(Value::Int(v)) => *v as f64,
-            v => panic!("gguf {key}: expected float, got {v:?}"),
-        }
-    }
-    pub fn strs(&self, key: &str) -> Vec<String> {
-        match self.meta.get(key) {
-            Some(Value::Arr(a)) => a.iter().map(|v| match v { Value::Str(s) => s.clone(), _ => panic!("{key}: not strings") }).collect(),
-            v => panic!("gguf {key}: expected array, got {v:?}"),
-        }
-    }
-    pub fn ints(&self, key: &str) -> Vec<i64> {
-        match self.meta.get(key) {
-            Some(Value::Arr(a)) => a.iter().map(|v| match v { Value::Int(i) => *i, _ => panic!("{key}: not ints") }).collect(),
-            v => panic!("gguf {key}: expected array, got {v:?}"),
-        }
-    }
-
     pub fn info(&self, name: &str) -> &TensorInfo {
         self.tensors.get(name).unwrap_or_else(|| panic!("tensor {name} not in gguf"))
     }
@@ -150,6 +126,18 @@ impl Gguf {
             ty => panic!("{name}: unsupported ggml type {ty}"),
         };
         (v, t.ne.iter().rev().copied().collect())
+    }
+
+    /// F16 tensor as stored (no conversion), shape = reversed ne. None if the tensor isn't F16.
+    pub fn f16(&self, name: &str) -> Option<(Vec<half::f16>, Vec<usize>)> {
+        let t = self.info(name);
+        if t.ty != 1 {
+            return None;
+        }
+        let n: usize = t.ne.iter().product();
+        let b = &self.data[self.data_start + t.offset..][..n * 2];
+        let v = b.chunks_exact(2).map(|x| half::f16::from_le_bytes([x[0], x[1]])).collect();
+        Some((v, t.ne.iter().rev().copied().collect()))
     }
 
     /// Q8_0 tensor as raw int8 values + one f32 scale per block of 32 (blocks run along ne[0]),

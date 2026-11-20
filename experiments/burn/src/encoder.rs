@@ -1,7 +1,7 @@
-//! Parakeet (NeMo FastConformer) encoder in burn, weights from the transcribe.cpp GGUF.
+//! Parakeet (NeMo FastConformer) encoder in burn, weights from our converted file (weights.rs).
 //! Structure follows transcribe.cpp `src/conformer/conformer.cpp` and `src/arch/parakeet/encoder.cpp`
 //! (MIT, (c) 2026 The transcribe.cpp authors), including "kestrel" length masking in the subsampling stage.
-use crate::gguf::Gguf;
+use crate::weights::Weights;
 use burn::tensor::activation::{sigmoid, silu, softmax};
 use burn::tensor::module::{conv1d, conv2d};
 use burn::tensor::ops::ConvOptions;
@@ -15,7 +15,7 @@ const LN_EPS: f32 = 1e-5;
 const BN_EPS: f32 = 1e-5;
 
 pub struct Ld<'a> {
-    pub g: &'a Gguf,
+    pub g: &'a Weights,
     pub dev: &'a Device,
     /// Working precision of the activations (F16 or F32); norms and softmax always run in f32 (ggml does too:
     /// the residual stream reaches ~±6800, and its square overflows f16).
@@ -48,17 +48,15 @@ impl Ld<'_> {
         let n = v.len();
         Tensor::from_data(TensorData::new(v, [1, n]), (self.dev, DType::F32))
     }
-    /// Linear weight for y = x @ w ([in, out]). With Q8=1, Q8_0 weights stay int8 on the GPU: uploaded in the GGUF
-    /// layout [out, in] (blocks of 32 along `in`, one f16 scale each = burn's Q8S per-block scheme) and transposed
-    /// as a view.
+    /// Linear weight for y = x @ w ([in, out]). Q8_0 weights stay int8 on the GPU (Q8=1), f16 weights stay f16 with
+    /// f16 activations: both uploaded straight from the weights file in their stored layout [out, in] and
+    /// transposed as a view. Anything else is converted on the CPU.
     pub fn lin(&self, name: &str) -> Tensor<2> {
-        if self.q8 {
-            if let Some((q, d, shape)) = self.g.q8_0(name) {
-                use burn::tensor::quantization::{QuantScheme, QuantValue, ScaleDtype};
-                let scheme = QuantScheme::default().with_value(QuantValue::Q8S).per_block([32], ScaleDtype::F16);
-                let data = TensorData::quantized(q, [shape[0], shape[1]], scheme, &d, None);
-                return Tensor::<2>::from_data(data, self.dev).transpose();
-            }
+        let kind = self.g.kind(name);
+        if (kind == "q8" && self.q8) || (kind == "f16" && self.low == FloatDType::F16) {
+            let data = self.g.lin_data(name);
+            let w = if kind == "q8" { Tensor::<2>::from_data(data, self.dev) } else { Tensor::<2>::from_data(data, (self.dev, DType::F16)) };
+            return w.transpose();
         }
         let (v, shape) = self.g.f32(name);
         let (out, inp) = (shape[0], shape[1..].iter().product::<usize>());
@@ -242,10 +240,40 @@ impl PreEncode {
     /// mel [frames, 128] (f32) -> [frames/8, D]. Conv2d over (time, freq), dw_striding x3. Frames past the valid
     /// lengths `len` are zeroed after relu0, conv2 and conv5 (transcribe.cpp mask_after_stride).
     pub fn fwd(&self, mel: Tensor<2>, len: [usize; 4]) -> Tensor<2> {
+        self.fwd_at(mel, len, 0)
+    }
+
+    /// Same result as `fwd`, computed `chunk` mel frames at a time (plus a margin on both sides) to bound the
+    /// size of the intermediate buffers. Output frame j depends only on mel frames 8j-7 ..= 8j+7, so with chunk
+    /// starts on multiples of 8 and a margin >= 8 each kept frame sees exactly its full-run inputs.
+    pub fn fwd_chunked(&self, mel: Tensor<2>, len: [usize; 4], chunk: usize) -> Tensor<2> {
+        const MARGIN: usize = 32; // mel frames, multiple of 8
+        let t = mel.dims()[0];
+        let n_out = stride2(stride2(stride2(t)));
+        let step = (chunk / 8).max(1); // output frames per chunk
+        if chunk == 0 || n_out <= step {
+            return self.fwd(mel, len);
+        }
+        let mut parts = Vec::new();
+        let mut j0 = 0;
+        while j0 < n_out {
+            let j1 = (j0 + step).min(n_out);
+            let a = (8 * j0).saturating_sub(MARGIN);
+            let b = (8 * j1 + MARGIN).min(t);
+            let y = self.fwd_at(mel.clone().narrow(0, a, b - a), len, a);
+            parts.push(y.narrow(0, j0 - a / 8, j1 - j0));
+            j0 = j1;
+        }
+        Tensor::cat(parts, 0)
+    }
+
+    /// `mel` is the slice of the full mel starting at frame `off` (a multiple of 8); masks use global indices.
+    fn fwd_at(&self, mel: Tensor<2>, len: [usize; 4], off: usize) -> Tensor<2> {
         let [t, f] = mel.dims();
         let s2 = |c: usize| ConvOptions::new([2, 2], [1, 1], [1, 1], c);
         let pw = ConvOptions::new([1, 1], [0, 0], [1, 1], 1);
         let dev = mel.device();
+        let len = [len[0], len[1].saturating_sub(off / 2), len[2].saturating_sub(off / 4), len[3].saturating_sub(off / 8)];
         let mask = |x: Tensor<4>, valid: usize| {
             let tt = x.dims()[2];
             if valid >= tt {

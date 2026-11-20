@@ -1,10 +1,13 @@
-//! Parakeet Ultra in Rust: mel + TDT decoder on the CPU, encoder (burn, Vulkan) on the GPU; weights from the
-//! transcribe.cpp GGUF. Experiment for replacing transcribe.cpp in the app.
+//! Parakeet Ultra in Rust: mel + TDT decoder on the CPU, encoder (burn, Vulkan) on the GPU; weights converted once
+//! from the transcribe.cpp GGUF (weights.rs). Experiment for replacing transcribe.cpp in the app.
 //!
-//! usage: burn-enc check <model.gguf> <ref dir from ref_dump.py>   step-by-step comparison with transcribe.cpp
-//!        burn-enc wav <model.gguf> <file.wav>...                  transcribe (16 kHz mono wav), with timing
-//!        burn-enc bench <model.gguf> <ref dir> [runs]             encoder speed / VRAM (env MEMLOG, LENS, SWEEP)
+//! usage: burn-enc convert <model.gguf> <out weights file>             GGUF -> our weights file (once)
+//!        burn-enc check <weights> <ref dir from ref_dump.py>   step-by-step comparison with transcribe.cpp
+//!        burn-enc wav <weights> <file.wav>...                  transcribe (16 kHz mono wav), with timing
+//!        burn-enc bench <weights> <ref dir> [runs]             encoder speed / VRAM (env MEMLOG, LENS, SWEEP)
 //! env:   F16=0  f32 activations (default f16);  Q8=0  dequantized weights (default: Q8_0 stays int8 on the GPU)
+//!        wav: SEGS=1 cut points, VADCMP=1 chunked vs whole-block pause scan, SCAN_CHUNK=<mel frames> (default 3000,
+//!        0 = whole 120 s block), CLEANUP=0 keep the GPU pool after each take
 mod decoder;
 mod encoder;
 mod gguf;
@@ -12,10 +15,11 @@ mod longform;
 mod mel;
 mod pipeline;
 mod tokenizer;
+mod weights;
 
 use burn::tensor::{Device, DeviceConfig, DeviceKind, FloatDType, Tensor, TensorData};
 use encoder::{Encoder, Ld};
-use gguf::Gguf;
+use weights::Weights;
 use std::path::Path;
 use std::time::Instant;
 
@@ -79,10 +83,15 @@ fn read_wav(p: &Path) -> Vec<f32> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("convert") => {
+            let t = Instant::now();
+            weights::convert(Path::new(&args[2]), Path::new(&args[3])).unwrap();
+            println!("converted in {:.1}s", t.elapsed().as_secs_f64());
+        }
         Some("check") => check(Path::new(&args[2]), Path::new(&args[3])),
         Some("wav") => wav(Path::new(&args[2]), &args[3..]),
         Some("bench") => bench(Path::new(&args[2]), Path::new(&args[3]), args.get(4).map_or(10, |s| s.parse().unwrap())),
-        _ => eprintln!("usage: burn-enc check|wav|bench ... (see src/main.rs)"),
+        _ => eprintln!("usage: burn-enc convert|check|wav|bench ... (see src/main.rs)"),
     }
 }
 
@@ -90,8 +99,12 @@ fn load(model: &Path) -> pipeline::Model {
     let t0 = Instant::now();
     let (dev, low, q8) = device();
     let t1 = Instant::now();
-    let g = Gguf::open(model).unwrap();
-    let m = pipeline::Model::load(&g, dev, low, q8);
+    let g = Weights::open(model).unwrap();
+    let mut m = pipeline::Model::load(&g, dev, low, q8);
+    if let Ok(v) = std::env::var("SCAN_CHUNK") {
+        m.scan_chunk = v.parse().unwrap();
+    }
+    m.cleanup = flag("CLEANUP", true);
     println!("device init {:.2}s, model loaded in {:.2}s", (t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
     m
 }
@@ -183,12 +196,23 @@ fn tokenizer_text(m: &pipeline::Model, ids: &[usize]) -> String {
 }
 
 fn wav(model: &Path, files: &[String]) {
-    let m = load(model);
+    let mut m = load(model);
     for f in files {
         let pcm = read_wav(Path::new(f));
         if flag("SEGS", false) {
             let segs: Vec<String> = m.segments(&pcm).iter().map(|(s, n)| format!("{:.3}-{:.3}", *s as f64 / 16000.0, (s + n) as f64 / 16000.0)).collect();
             println!("segments: {}", segs.join(" "));
+        }
+        // VADCMP=1: speech probabilities of the first scan block, subsampler chunked vs whole block.
+        if flag("VADCMP", false) {
+            let n = pcm.len().min((m.lf.scan_block_seconds * 16000.0) as usize);
+            let chunked = m.speech_probs(&pcm[..n]);
+            let saved = m.scan_chunk;
+            m.scan_chunk = 0;
+            let whole = m.speech_probs(&pcm[..n]);
+            m.scan_chunk = saved;
+            let d = chunked.iter().zip(&whole).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            println!("vadcmp: {} vs {} frames, max |diff| {d:.3e}", chunked.len(), whole.len());
         }
         let t0 = Instant::now();
         let (text, t) = m.transcribe(&pcm);
@@ -219,7 +243,7 @@ fn bench(model: &Path, refdir: &Path, runs: usize) {
     mem("device");
     println!("device init {:.2}s", tp.elapsed().as_secs_f64());
     let t0 = Instant::now();
-    let g = Gguf::open(model).unwrap();
+    let g = Weights::open(model).unwrap();
     let l = Ld { g: &g, dev: &dev, low, q8 };
     // Weights as persistent allocations (own buffers, not carved out of the dynamic pool's pages).
     let enc = dev.memory_persistent_allocations(&l, |l| Encoder::load(l));

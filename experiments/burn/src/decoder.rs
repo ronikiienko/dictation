@@ -1,7 +1,7 @@
 //! TDT greedy decoder (prediction network + joint), CPU: int8 (Q8_0) weights, f32 activations.
 //! Ported from transcribe.cpp `src/arch/parakeet/decoder.cpp` `decode_tdt_greedy` (MIT, (c) 2026 The transcribe.cpp
 //! authors), with the "kestrel" global symbol budget (`stt.parakeet.tdt.symbol_budget = global`).
-use crate::gguf::Gguf;
+use crate::weights::Weights;
 
 pub struct Decoder {
     hidden: usize,
@@ -37,7 +37,7 @@ pub struct Q8 {
 }
 
 impl Q8 {
-    fn load(g: &Gguf, name: &str) -> Q8 {
+    fn load(g: &Weights, name: &str) -> Q8 {
         let (q, d, shape) = g.q8_0(name).unwrap_or_else(|| panic!("{name}: expected Q8_0"));
         Q8 { q, d, cols: shape[1] }
     }
@@ -149,7 +149,7 @@ fn sigmoid(x: f32) -> f32 {
 }
 
 impl Decoder {
-    pub fn load(g: &Gguf) -> Decoder {
+    pub fn load(g: &Weights) -> Decoder {
         let w = |n: &str| g.f32(n).0;
         let hidden = g.int("stt.parakeet.predictor.hidden") as usize;
         let layers = g.int("stt.parakeet.predictor.n_layers") as usize;
