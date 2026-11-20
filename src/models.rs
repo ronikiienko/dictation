@@ -1,4 +1,8 @@
-//! Model catalog and downloader (Hugging Face, resumable via .part files).
+//! Model catalog and downloader (Hugging Face, resumable via .part files, SHA-256 checked).
+//! Models live in the OS's per-user app data folder (`directories` crate):
+//! Linux `~/.local/share/dictation/models`, macOS `~/Library/Application Support/dictation/models`,
+//! Windows `%APPDATA%\dictation\data\models`.
+use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -8,31 +12,47 @@ pub struct ModelInfo {
     pub id: &'static str,
     pub name: &'static str,
     pub note: &'static str,
-    /// Relative to the project root.
+    /// File name inside the models folder.
     pub file: &'static str,
     pub url: &'static str,
     pub size: u64,
+    /// Hex SHA-256 of the file (Hugging Face's LFS oid).
+    pub sha256: &'static str,
 }
 
-pub const CATALOG: &[ModelInfo] = &[
-    ModelInfo {
-        id: "parakeet-ultra-q8",
-        name: "Parakeet Ultra, 8-bit (Q8_0)",
-        note: "recommended: best accuracy, ~0.7 GB VRAM",
-        file: "models/parakeet-ultra-gguf/parakeet-ultra-Q8_0.gguf",
-        url: "https://huggingface.co/handy-computer/parakeet-ultra-gguf/resolve/main/parakeet-ultra-Q8_0.gguf",
-        size: 740_363_168,
-    },
-];
+pub const CATALOG: &[ModelInfo] = &[ModelInfo {
+    id: "parakeet-ultra-q8",
+    name: "Parakeet Ultra, 8-bit (Q8_0)",
+    note: "recommended: best accuracy, ~0.7 GB VRAM",
+    file: "parakeet-ultra-Q8_0.gguf",
+    url: "https://huggingface.co/handy-computer/parakeet-ultra-gguf/resolve/main/parakeet-ultra-Q8_0.gguf",
+    size: 740_363_168,
+    sha256: "007a59761e9258779f189df396b50d12b83bb5b79e66df4b955c230d2f2a0a59",
+}];
 
 pub fn find(id: &str) -> &'static ModelInfo {
     CATALOG.iter().find(|m| m.id == id).unwrap_or(&CATALOG[0])
 }
 
+/// Folder holding the downloaded models (not created here).
+pub fn dir() -> PathBuf {
+    directories::ProjectDirs::from("", "", "dictation")
+        .map(|d| d.data_dir().join("models"))
+        .unwrap_or_else(|| crate::root().join("models")) // no home directory: fall back to the project folder
+}
+
+/// Show the models folder in the file manager (created first, so there is something to open).
+pub fn open_dir() -> Result<(), String> {
+    let d = dir();
+    std::fs::create_dir_all(&d).map_err(|e| format!("{}: {e}", d.display()))?;
+    open::that_detached(&d).map_err(|e| format!("open {}: {e}", d.display()))
+}
+
 impl ModelInfo {
     pub fn path(&self) -> PathBuf {
-        crate::root().join(self.file)
+        dir().join(self.file)
     }
+    /// Cheap check (size only); the full SHA-256 check runs once, after downloading.
     pub fn installed(&self) -> bool {
         std::fs::metadata(self.path()).map(|m| m.len() == self.size).unwrap_or(false)
     }
@@ -44,9 +64,26 @@ pub struct Progress {
     pub done: AtomicU64,
     pub total: AtomicU64,
     pub cancel: AtomicBool,
+    /// Download finished, checking the SHA-256.
+    pub verifying: AtomicBool,
 }
 
-/// Download to `<file>.part` (resuming if it exists), then rename into place. Blocking; run it in a thread.
+fn sha256_file(path: &std::path::Path) -> std::io::Result<String> {
+    let mut f = std::fs::File::open(path)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Download to `<file>.part` (resuming if it exists), check the SHA-256, then rename into place.
+/// Blocking; run it in a thread.
 pub fn download(m: &ModelInfo, p: &Arc<Progress>) -> Result<(), String> {
     let dest = m.path();
     let part = dest.with_extension("gguf.part");
@@ -90,6 +127,13 @@ pub fn download(m: &ModelInfo, p: &Arc<Progress>) -> Result<(), String> {
     }
     if have != m.size {
         return Err(format!("download incomplete: {have} of {} bytes (try again to resume)", m.size));
+    }
+    p.verifying.store(true, Ordering::Relaxed);
+    let got = sha256_file(&part).map_err(|e| e.to_string())?;
+    if got != m.sha256 {
+        // Corrupt: resuming would keep the bad bytes, so start over next time.
+        let _ = std::fs::remove_file(&part);
+        return Err(format!("checksum mismatch (got {got}); the file was removed, try again"));
     }
     std::fs::rename(&part, &dest).map_err(|e| e.to_string())
 }

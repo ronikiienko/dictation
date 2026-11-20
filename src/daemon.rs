@@ -113,16 +113,18 @@ struct Tray {
     detail: String,
     cfg: Config,
     mics: Vec<(String, String)>,
-    /// (model id, percent) while downloading.
-    download: Option<(&'static str, u32)>,
+    /// (model id, percent, checking the SHA-256) while downloading.
+    download: Option<(&'static str, u32, bool)>,
     tx: mpsc::UnboundedSender<Ev>,
 }
 
 impl Tray {
     fn status_text(&self) -> String {
         let key = if self.shortcut.is_empty() { String::new() } else { format!(" — {}", self.shortcut) };
-        if let Some((id, pct)) = self.download {
-            return format!("Downloading {}… {pct}%", models::find(id).name);
+        match self.download {
+            Some((id, _, true)) => return format!("Checking {}…", models::find(id).name),
+            Some((id, pct, false)) => return format!("Downloading {}… {pct}%", models::find(id).name),
+            None => {}
         }
         match self.state {
             State::NoModel => "No model yet — click to download".into(),
@@ -207,7 +209,8 @@ impl ksni::Tray for Tray {
             .map(|m| {
                 let installed = m.installed();
                 let label = match self.download {
-                    Some((id, pct)) if id == m.id => format!("{} — downloading {pct}%", m.name),
+                    Some((id, _, true)) if id == m.id => format!("{} — checking…", m.name),
+                    Some((id, pct, false)) if id == m.id => format!("{} — downloading {pct}%", m.name),
                     _ if installed => format!("{} — {}", m.name, m.note),
                     _ => format!("{} — download {:.0} MB", m.name, m.size as f64 / 1e6),
                 };
@@ -226,6 +229,20 @@ impl ksni::Tray for Tray {
                 }
                 .into()
             })
+            .chain([
+                MenuItem::Separator,
+                StandardItem {
+                    label: "Open models folder…".into(),
+                    icon_name: "folder-open".into(),
+                    activate: Box::new(|_: &mut Self| {
+                        if let Err(e) = models::open_dir() {
+                            eprintln!("{e}");
+                        }
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            ])
             .collect();
 
         let mic_selected = self.mics.iter().position(|(id, _)| *id == self.cfg.microphone).unwrap_or(0);
@@ -494,9 +511,10 @@ fn start_download(id: &'static str, tx: &mpsc::UnboundedSender<Ev>, tray: &ksni:
         loop {
             let (done, total) = (p.done.load(Ordering::Relaxed), p.total.load(Ordering::Relaxed));
             let pct = if total > 0 { (done * 100 / total) as u32 } else { 0 };
+            let verifying = p.verifying.load(Ordering::Relaxed);
             let alive = tray.update(move |t: &mut Tray| {
                 if t.download.is_some() {
-                    t.download = Some((id, pct));
+                    t.download = Some((id, pct, verifying));
                 }
                 t.download.is_some()
             });
@@ -626,7 +644,7 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error>> {
                     downloading = true;
                     let id = models::find(&cfg.model).id;
                     start_download(id, &tx, &tray);
-                    tray.update(move |t: &mut Tray| t.download = Some((id, 0))).await;
+                    tray.update(move |t: &mut Tray| t.download = Some((id, 0, false))).await;
                 }
                 _ => {}
             },
@@ -692,7 +710,7 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error>> {
                 if !downloading {
                     downloading = true;
                     start_download(id, &tx, &tray);
-                    tray.update(move |t: &mut Tray| t.download = Some((id, 0))).await;
+                    tray.update(move |t: &mut Tray| t.download = Some((id, 0, false))).await;
                 }
             }
             Ev::Downloaded(id, r) => {
@@ -732,6 +750,14 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error>> {
         notice.enabled = cfg.notifications;
         if state == State::NoModel && installed(&cfg) {
             state = State::Idle;
+        } else if state == State::Idle && busy == 0 && !installed(&cfg) {
+            // Deleted from the models folder (or never there for a new choice): offer the download again.
+            state = State::NoModel;
+            if mem != Mem::Unloaded {
+                let _ = jobs.send(Job::Unload);
+                mem = Mem::Unloaded;
+            }
+            println!("model file missing: {}", models::find(&cfg.model).path().display());
         }
         // Settings changes apply once the current take is pasted: a loaded model is swapped for the new choice,
         // an unloaded one just loads the new choice next time. "Always" loads right away.
