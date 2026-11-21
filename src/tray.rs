@@ -378,7 +378,16 @@ mod imp {
     fn refresh<M: Model>(t: &TrayIcon, m: &M, shown: &mut Shown, clicks: &mut HashMap<MenuId, Click>) {
         let icon = m.icon();
         if shown.icon != Some(icon) {
-            match tray_icon::Icon::from_rgba(icon.rgba(SIZE), SIZE, SIZE) {
+            // macOS: the symbol alone, as a template image (except Recording, red); elsewhere the coloured disc.
+            #[cfg(target_os = "macos")]
+            let (rgba, template) = icon.glyph_rgba(SIZE);
+            #[cfg(not(target_os = "macos"))]
+            let rgba = icon.rgba(SIZE);
+            match tray_icon::Icon::from_rgba(rgba, SIZE, SIZE) {
+                #[cfg(target_os = "macos")]
+                Ok(i) if template => {
+                    let _ = t.set_icon_templated(Some(i));
+                }
                 Ok(i) => {
                     let _ = t.set_icon(Some(i));
                 }
