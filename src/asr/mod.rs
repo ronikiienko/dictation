@@ -48,8 +48,52 @@ pub fn set_kernel_cache(kernels: &Path) {
     use cubecl_runtime::config::{CubeClRuntimeConfig, RuntimeConfig, cache::CacheConfig};
     let mut c = CubeClRuntimeConfig::default();
     c.compilation.cache = true;
-    c.environment.path = CacheConfig::Directory(gpu_dir(kernels));
+    let dir = gpu_dir(kernels);
+    // Only the first call counts (see above), and it comes before CubeCL opens the database: our open/close of the
+    // index file below must not happen while this process holds Turso's locks on it (closing any handle to a file
+    // drops all of a process's fcntl locks on it).
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    FIRST.call_once(|| repair_stale_wal_index(&dir));
+    c.environment.path = CacheConfig::Directory(dir);
     CubeClRuntimeConfig::try_set(c);
+}
+
+/// CubeCL's cache is a Turso database in its experimental multi-process mode: `default.db`, the log `default.db-wal`
+/// and the log's shared index `default.db-tshm`. Twice (during experiments) the log was emptied to 0 bytes while the
+/// index still listed ~600 entries; every open then failed to read them, and CubeCL went on read-only, silently
+/// saving nothing (tuning, kernels). Cause not reproduced (NOTES.md "Read-only cache again"). With the log empty the
+/// index describes nothing that exists, so removing it loses nothing; Turso rebuilds it on open. Only when no other
+/// process uses the database (Turso holds a lock on the index's first byte for as long as a process has it open).
+fn repair_stale_wal_index(dir: &Path) {
+    let (wal, index) = (dir.join("default.db-wal"), dir.join("default.db-tshm"));
+    let wal_empty = std::fs::metadata(&wal).map_or(true, |m| m.len() == 0);
+    if !wal_empty || !index.exists() || index_in_use(&index) {
+        return;
+    }
+    match std::fs::remove_file(&index) {
+        Ok(()) => eprintln!("kernel cache: removed a stale log index ({}), it would have made the cache read-only", index.display()),
+        Err(e) => eprintln!("kernel cache: could not remove the stale log index {}: {e}", index.display()),
+    }
+}
+
+/// Whether another process has the database open: it holds a lock on the index's byte 0. Unknown counts as in use.
+#[cfg(unix)]
+fn index_in_use(index: &Path) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(f) = std::fs::OpenOptions::new().read(true).write(true).open(index) else { return true };
+    // SAFETY: a plain fcntl query on an open file; `flock` is a C struct, all-zero is valid.
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as _;
+    lock.l_whence = libc::SEEK_SET as _;
+    lock.l_start = 0;
+    lock.l_len = 1;
+    let r = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETLK, &mut lock) };
+    r != 0 || lock.l_type as i32 != libc::F_UNLCK as i32
+}
+
+#[cfg(not(unix))]
+fn index_in_use(_: &Path) -> bool {
+    true // Windows: no check written, never touch it
 }
 
 fn gpu_dir(kernels: &Path) -> std::path::PathBuf {
