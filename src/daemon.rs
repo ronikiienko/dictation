@@ -373,9 +373,10 @@ impl tray::Model for Tray {
             outputs.iter().position(|&(_, k)| k == self.cfg.paste_keys).unwrap_or(0)
         };
 
-        let mut items = vec![Label(self.status_text()), Label(self.mem_text())];
+        let mut items = vec![Label(self.status_text())];
         if self.state == State::Optimizing {
-            // Own line: one long line made the whole menu too wide.
+            // Two lines: one long line made the whole menu too wide.
+            items.push(Label(self.mem_text()));
             items.push(Label("Runs once; the computer may feel slow until it's done".into()));
         }
         items.extend([
