@@ -155,6 +155,11 @@ default-features = false
 [dependencies.cubecl-ir]
 version = "0.11.4"
 default-features = false
+features = ["serde"]
+
+[dependencies.serde]
+version = "1"
+features = ["derive"]
 
 [dependencies.cubecl-monitoring]
 version = "0.11.4"

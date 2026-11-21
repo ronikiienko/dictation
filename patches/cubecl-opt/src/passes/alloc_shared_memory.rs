@@ -51,7 +51,9 @@ impl Pass for AllocateSharedMemoryBlockPass {
         let mut rewriter = IRRewriter::<DummyListener>::default();
         let op = op.dyn_op(ctx).downcast::<FuncOp>().unwrap();
 
-        let allocs = analysis.allocations.values().copied().collect::<Vec<_>>();
+        let mut allocs = analysis.allocations.values().copied().collect::<Vec<_>>();
+        // HashMap order differs per process: sort so the generated kernel text is the same every run.
+        allocs.sort_by_key(|it| it.offset);
 
         if !analysis.allocations.is_empty() {
             let size = allocs.iter().map(|it| it.end(ctx)).max().unwrap();

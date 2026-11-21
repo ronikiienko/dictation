@@ -18,7 +18,12 @@ use wgpu::{
 };
 
 pub fn bindings(repr: &MslComputeKernel, args: &KernelArguments) -> (Vec<Visibility>, usize) {
-    let buffers = repr.buffers.iter().map(|it| {
+    bindings_from(&repr.buffers, args)
+}
+
+/// [`bindings`] from a kernel's buffer visibilities only, e.g. a kernel loaded from the MSL cache.
+pub fn bindings_from(buffers: &[Visibility], args: &KernelArguments) -> (Vec<Visibility>, usize) {
+    let buffers = buffers.iter().map(|it| {
         // When slices are shared, it needs to be read-write if ANY of the slices is read-write,
         // and since we can't be sure, we'll assume everything is read-write.
         if cubecl_server::memory_management::EXCLUSIVE_MEMORY_ONLY {

@@ -1831,8 +1831,6 @@ dependencies = [
 [[package]]
 name = "cubecl-cpp"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d89bf5c2b694af7e5316e37bc5fd9056a7c855b64772763aae0924bfcc3319e6"
 dependencies = [
  "bytemuck",
  "cubecl-common",
@@ -2093,8 +2091,6 @@ dependencies = [
 [[package]]
 name = "cubecl-opt"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "156c1d3b476cf1465680361d8b0eebe6ab76b4a944dc10ecccf53abaf8af6c75"
 dependencies = [
  "cubecl-common",
  "cubecl-core",
@@ -2218,8 +2214,6 @@ dependencies = [
 [[package]]
 name = "cubecl-wgpu"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413caaf7eaf52cb5922f1e9e766fea404fd1dd549d10f3500e22b61c70b63a10"
 dependencies = [
  "ash",
  "bytemuck",
@@ -2245,6 +2239,7 @@ dependencies = [
  "objc2-metal",
  "pliron",
  "sanitize-filename",
+ "serde",
  "thiserror 2.0.21",
  "tracel-ash",
  "wasm-bindgen-futures",

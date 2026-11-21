@@ -80,6 +80,17 @@ pub enum CompilerInfo {
     None,
 }
 
+/// A compiled MSL kernel as stored on disk: everything a launch needs without running CubeCL's compiler.
+/// CubeCL persists only SPIR-V (Vulkan); without this, every process regenerates every Metal kernel.
+#[cfg(all(feature = "msl", target_os = "macos"))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MslCacheEntry {
+    entrypoint_name: String,
+    source: String,
+    buffers: Vec<cubecl_core::prelude::Visibility>,
+    io: Option<Vec<BufferIOAttr>>,
+}
+
 /// Wgpu compute server.
 #[derive(Debug)]
 pub struct WgpuServer<C: WgpuCompiler> {
@@ -94,6 +105,15 @@ pub struct WgpuServer<C: WgpuCompiler> {
     pub(crate) spirv_cache: Option<Store<(u64, KernelCacheKey), cubecl_spirv::SpirvCacheEntry>>,
     #[cfg(feature = "spirv")]
     pub(crate) build_id: cubecl_common::hash::StableHash,
+    #[cfg(all(feature = "msl", target_os = "macos"))]
+    msl_cache: Option<
+        cubecl_environment::persistence::Store<
+            (u64, cubecl_server::compiler::KernelCacheKey),
+            MslCacheEntry,
+        >,
+    >,
+    #[cfg(all(feature = "msl", target_os = "macos"))]
+    msl_build_id: cubecl_common::hash::StableHash,
     pub compilation_options: WgpuCompilationOptions,
     pub(crate) backend: wgpu::Backend,
     pub(crate) utilities: Arc<ServerUtilities>,
@@ -143,6 +163,16 @@ impl<C: WgpuCompiler> WgpuServer<C> {
     ) -> Self {
         #[cfg(feature = "spirv")]
         let adapter_info = device.adapter_info();
+        #[cfg(all(feature = "msl", target_os = "macos"))]
+        let msl_cache = (backend == wgpu::Backend::Metal)
+            .then(|| {
+                let info = device.adapter_info();
+                cubecl_server::compiler::compilation_store(
+                    "metal",
+                    format!("msl_{}_{}", info.vendor, info.device),
+                )
+            })
+            .flatten();
         let backend_scheduler = ScheduledWgpuBackend::new(
             device.clone(),
             queue.clone(),
@@ -190,6 +220,10 @@ impl<C: WgpuCompiler> WgpuServer<C> {
             spirv_cache,
             #[cfg(feature = "spirv")]
             build_id: cubecl_server::compiler::build_id_hash(),
+            #[cfg(all(feature = "msl", target_os = "macos"))]
+            msl_cache,
+            #[cfg(all(feature = "msl", target_os = "macos"))]
+            msl_build_id: cubecl_server::compiler::build_id_hash(),
             backend,
             utilities: Arc::new(utilities),
             shared_bindings_pool: LeasePool::with_capacity(tasks_max * max_streams as usize),
@@ -250,6 +284,35 @@ impl<C: WgpuCompiler> WgpuServer<C> {
             self.pipelines.insert(kernel_id, pipeline.clone());
             recording.loaded();
             return Ok(pipeline);
+        }
+
+        // MSL from disk: skips CubeCL's compiler; the source text is the same as last time, so Metal's own
+        // shader cache serves the GPU code too. The key holds this binary's build id: a rebuild never reuses
+        // kernels written by another build.
+        #[cfg(all(feature = "msl", target_os = "macos"))]
+        let msl_key = match self.msl_cache.is_some() {
+            true => Some((
+                self.utilities.properties_hash,
+                cubecl_server::compiler::KernelCacheKey::new(&kernel_id, self.msl_build_id),
+            )),
+            false => None,
+        };
+        #[cfg(all(feature = "msl", target_os = "macos"))]
+        if let Some(key) = &msl_key
+            && let Some(entry) = self.msl_cache.as_mut().and_then(|c| c.remove(key))
+        {
+            let module = self.create_module(
+                &entry.entrypoint_name,
+                kernel_id.cube_dim.into(),
+                ModuleSource::Msl(&entry.source),
+                mode,
+            )?;
+            let info = crate::backend::metal::bindings_from(&entry.buffers, bindings);
+            let pipeline = self.create_pipeline_from(&entry.entrypoint_name, Some(info), module)?;
+            let loaded = (pipeline, CompilerInfo::Metal, entry.io.map(Arc::from));
+            self.pipelines.insert(kernel_id, loaded.clone());
+            recording.loaded();
+            return Ok(loaded);
         }
 
         validate_cube_dim(&self.utilities.properties, &kernel_id)?;
@@ -318,6 +381,22 @@ impl<C: WgpuCompiler> WgpuServer<C> {
 
         // Only a SPIR-V kernel is stored: any other build changes nothing.
         let stored = false;
+        #[cfg(all(feature = "msl", target_os = "macos"))]
+        let stored = match (msl_key, &auto_repr) {
+            (Some(key), Some(crate::AutoRepresentation::Msl(kernel))) => {
+                cubecl_server::compiler::store_compiled(
+                    self.msl_cache.as_mut().unwrap(),
+                    key,
+                    MslCacheEntry {
+                        entrypoint_name: compiled.entrypoint_name.clone(),
+                        source: compiled.source.clone(),
+                        buffers: kernel.buffers.clone(),
+                        io: io.as_deref().map(|io| io.to_vec()),
+                    },
+                )
+            }
+            _ => stored,
+        };
         #[cfg(feature = "spirv")]
         let stored = match (cached, auto_repr) {
             (Some(Err(key)), Some(crate::AutoRepresentation::SpirV(kernel))) => {

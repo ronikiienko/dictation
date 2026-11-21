@@ -269,7 +269,16 @@ impl<C: WgpuCompiler> WgpuServer<C> {
             Some(AutoRepresentationRef::SpirV(repr)) => Some(vulkan::bindings(repr, bindings)),
             _ => None,
         };
+        self.create_pipeline_from(entrypoint_name, bindings_info, module)
+    }
 
+    /// [`create_pipeline`](Self::create_pipeline) with the bindings already worked out.
+    pub(crate) fn create_pipeline_from(
+        &self,
+        entrypoint_name: &str,
+        bindings_info: Option<(Vec<Visibility>, usize)>,
+        module: ShaderModule,
+    ) -> Result<Arc<ComputePipeline>, CompilationError> {
         let create = || {
             let layout = bindings_info.map(|(bindings, immediate_size)| {
                 if !bindings.is_empty() {
