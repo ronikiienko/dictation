@@ -94,6 +94,13 @@ impl To16k {
     }
 }
 
+/// Mono samples at `rate` -> 16 kHz (also used for recordings).
+pub(crate) fn mono_to_16k(x: &[f32], rate: usize) -> Result<Vec<f32>, String> {
+    let mut c = To16k::new(rate)?;
+    c.push(x)?;
+    c.finish()
+}
+
 /// The file's first audio track as 16 kHz mono (channels averaged).
 pub fn read(path: &Path) -> Result<Vec<f32>, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;

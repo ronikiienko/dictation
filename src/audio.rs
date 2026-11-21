@@ -1,11 +1,9 @@
-//! Microphone capture (cpal, PulseAudio protocol -> PipeWire) and short sounds (rodio).
+//! Recording (microphone or system audio; cpal, PulseAudio protocol -> PipeWire on Linux) and short sounds (rodio).
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::{Arc, Mutex, mpsc};
 
 use crate::RATE;
 
-/// Frames per block requested from the sound server (50 ms at 16 kHz).
-const BLOCK: u32 = 800;
 /// Keep recording this long after stop is pressed, so the block in flight is delivered.
 const TAIL: std::time::Duration = std::time::Duration::from_millis(150);
 
@@ -98,19 +96,23 @@ fn open(device: &str, buf: Arc<Mutex<Vec<f32>>>) -> Result<(cpal::Stream, u32, u
     }
     .ok_or(if system { "no output device found" } else { "no microphone found" })?;
     let err = |e: cpal::Error| eprintln!("audio: {e}");
-    // Ask for exactly what the model wants; the sound server resamples. Fall back to the device's own format.
-    // Small fixed blocks (50 ms): with the default the server hands over audio in ~1 s blocks, and the block still
-    // filling when the stream closes was lost -> up to 1 s cut off the end of every take.
-    let want = cpal::StreamConfig { channels: 1, sample_rate: RATE as u32, buffer_size: cpal::BufferSize::Fixed(BLOCK) };
-    let b = buf.clone();
-    if let Ok(s) = dev.build_input_stream(want, move |d: &[f32], _: &_| b.lock().unwrap().extend_from_slice(d), err, None)
-    {
-        s.play().map_err(|e| e.to_string())?;
-        return Ok((s, RATE as u32, 1));
-    }
+    // Record in the format the device already runs at and convert in the app (to_16k_mono). Never ask for another
+    // format: on macOS cpal applies the requested rate to the device itself, for every app, and leaves it there
+    // (16 kHz on Bluetooth headphones = headset/call quality, even after the app quits).
     let def = if system { dev.default_output_config() } else { dev.default_input_config() }.map_err(|e| e.to_string())?;
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut cfg: cpal::StreamConfig = def.config();
-    cfg.buffer_size = cpal::BufferSize::Fixed(cfg.sample_rate / 20);
+    // Linux (PulseAudio protocol): the block size is a property of our stream only. Without it the server hands over
+    // ~1 s blocks and the block still filling when the stream closes was lost (up to 1 s cut off every take); ask
+    // for 50 ms. Elsewhere it can be a device setting (macOS) -> keep the device's own.
+    #[cfg(target_os = "linux")]
+    {
+        let mut frames = cfg.sample_rate / 20;
+        if let cpal::SupportedBufferSize::Range { min, max } = *def.buffer_size() {
+            frames = frames.clamp(min, max);
+        }
+        cfg.buffer_size = cpal::BufferSize::Fixed(frames);
+    }
     let (rate, ch) = (cfg.sample_rate, cfg.channels);
     let s = match def.sample_format() {
         cpal::SampleFormat::F32 => {
@@ -129,7 +131,8 @@ fn open(device: &str, buf: Arc<Mutex<Vec<f32>>>) -> Result<(cpal::Stream, u32, u
     Ok((s, rate, ch))
 }
 
-/// Downmix + linear resample (only used when the device can't give 16 kHz mono itself).
+/// Downmix (average of channels) + resample to 16 kHz (rubato, band-limited, so nothing above 8 kHz folds back
+/// into the speech band).
 fn to_16k_mono(x: &[f32], rate: u32, channels: u16) -> Vec<f32> {
     let ch = channels.max(1) as usize;
     let mono: Vec<f32> =
@@ -137,17 +140,10 @@ fn to_16k_mono(x: &[f32], rate: u32, channels: u16) -> Vec<f32> {
     if rate as usize == RATE || mono.is_empty() {
         return mono;
     }
-    let step = rate as f64 / RATE as f64;
-    let n = (mono.len() as f64 / step) as usize;
-    (0..n)
-        .map(|i| {
-            let p = i as f64 * step;
-            let (j, f) = (p as usize, (p.fract()) as f32);
-            let a = mono[j];
-            let b = *mono.get(j + 1).unwrap_or(&a);
-            a + (b - a) * f
-        })
-        .collect()
+    crate::media::mono_to_16k(&mono, rate as usize).unwrap_or_else(|e| {
+        eprintln!("audio: {e}");
+        Vec::new()
+    })
 }
 
 /// Start / stop cue. Generated in code, so the app needs no sound files.

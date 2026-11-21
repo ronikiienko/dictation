@@ -1046,7 +1046,10 @@ async fn main_loop(
                             audio::play(audio::Cue::Start);
                         }
                     }
-                    Err(e) => notice.show("Recording error", &e, "dialog-error").await,
+                    Err(e) => {
+                        eprintln!("recording error: {e}");
+                        notice.show("Recording error", &e, "dialog-error").await
+                    }
                 },
                 (_, Some(r)) => {
                     if cfg.sounds {
@@ -1074,7 +1077,10 @@ async fn main_loop(
                             state = State::Transcribing;
                         }
                         Ok(_) => notice.show("Too short, skipped", "", "dialog-information").await,
-                        Err(e) => notice.show("Recording error", &e, "dialog-error").await,
+                        Err(e) => {
+                        eprintln!("recording error: {e}");
+                        notice.show("Recording error", &e, "dialog-error").await
+                    }
                     }
                     live_on = false;
                     last_used = Instant::now();

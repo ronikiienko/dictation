@@ -72,6 +72,10 @@ debug = 1
 name = "check"
 path = "experiments/check.rs"
 
+[[example]]
+name = "rec"
+path = "experiments/rec.rs"
+
 # Our fixes to CubeCL 0.11.4 (Mac kernel cache), full crate copies; what and why: NOTES.md "Mac kernel cache fixed".
 # Remove an entry once upstream has the fix; on a CubeCL upgrade redo the changes on the new version.
 [patch.crates-io]
