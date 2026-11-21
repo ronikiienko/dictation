@@ -134,8 +134,33 @@ impl Notice {
         if !self.enabled {
             return;
         }
+        // macOS (temporary, until the app is a real Dictation.app): through osascript, so they show as Script
+        // Editor's. notify-rust's way there (mac-notification-sys: the old NSUserNotification API, posing as an app
+        // given by bundle id, as we have none) is accepted without error but never shown on macOS 26.
+        #[cfg(target_os = "macos")]
+        {
+            let _ = icon;
+            let (title, body) = (title.to_string(), body.to_string());
+            // Title and text as arguments, not pasted into the script: no quoting to get wrong.
+            let script = ["on run argv", "display notification (item 2 of argv) with title (item 1 of argv)", "end run"];
+            let run = move || {
+                let mut c = std::process::Command::new("/usr/bin/osascript");
+                for line in script {
+                    c.args(["-e", line]);
+                }
+                c.args([&title, &body]).output()
+            };
+            match tokio::task::spawn_blocking(run).await {
+                Ok(Ok(o)) if !o.status.success() => eprintln!("notification: {}", String::from_utf8_lossy(&o.stderr).trim()),
+                Ok(Err(e)) => eprintln!("notification: osascript: {e}"),
+                _ => {}
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
         use notify_rust::Notification;
+        #[cfg(not(target_os = "macos"))]
         let mut n = Notification::new();
+        #[cfg(not(target_os = "macos"))]
         n.appname("Dictation").summary(title).body(body);
         #[cfg(target_os = "linux")]
         {
@@ -149,19 +174,10 @@ impl Notice {
                 Err(e) => eprintln!("notification: {e}"),
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        // Windows: shown as PowerShell's (the library's default app id; ours needs an installed Start menu shortcut).
+        #[cfg(windows)]
         {
             let _ = icon;
-            // macOS shows a notification as some app's. Unset, the library asks AppleScript for an app named
-            // "use_default", which pops up a "Where is use_default?" chooser. Without our own .app bundle: Finder
-            // (what the library falls back to anyway).
-            #[cfg(target_os = "macos")]
-            {
-                static APP: std::sync::Once = std::sync::Once::new();
-                APP.call_once(|| {
-                    let _ = notify_rust::set_application("com.apple.Finder");
-                });
-            }
             // Only a blocking show() there: off the async thread.
             match tokio::task::spawn_blocking(move || n.show().map(|_| ())).await {
                 Ok(Err(e)) => eprintln!("notification: {e}"),
