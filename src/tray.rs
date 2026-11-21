@@ -255,8 +255,8 @@ mod imp {
             match event {
                 // macOS: the tray can only be made once the loop runs.
                 Event::NewEvents(StartCause::Init) => {
-                    // macOS convention: a click opens the menu. Windows: left click = activate, right = menu.
-                    match TrayIconBuilder::new().with_menu_on_left_click(cfg!(target_os = "macos")).build() {
+                    // Same as Linux everywhere: left click = activate (record), right click = menu.
+                    match TrayIconBuilder::new().with_menu_on_left_click(false).build() {
                         Ok(t) => tray = Some(t),
                         Err(e) => log::error!("tray icon: {e}"),
                     }
@@ -271,7 +271,7 @@ mod imp {
                 Event::UserEvent(Ev::Tray(TrayIconEvent::Click { button, button_state, .. })) => {
                     match button_state {
                         MouseButtonState::Down => model.menu_opening(),
-                        MouseButtonState::Up if button == MouseButton::Left && !cfg!(target_os = "macos") => model.activate(),
+                        MouseButtonState::Up if button == MouseButton::Left => model.activate(),
                         _ => {}
                     }
                 }
