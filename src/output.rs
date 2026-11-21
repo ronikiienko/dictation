@@ -149,6 +149,16 @@ impl Notice {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = icon;
+            // macOS shows a notification as some app's. Unset, the library asks AppleScript for an app named
+            // "use_default", which pops up a "Where is use_default?" chooser. Without our own .app bundle: Finder
+            // (what the library falls back to anyway).
+            #[cfg(target_os = "macos")]
+            {
+                static APP: std::sync::Once = std::sync::Once::new();
+                APP.call_once(|| {
+                    let _ = notify_rust::set_application("com.apple.Finder");
+                });
+            }
             // Only a blocking show() there: off the async thread.
             match tokio::task::spawn_blocking(move || n.show().map(|_| ())).await {
                 Ok(Err(e)) => eprintln!("notification: {e}"),

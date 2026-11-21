@@ -362,6 +362,17 @@ mod imp {
         icon: Option<Icon>,
         tooltip: String,
         menu: String,
+        /// The menu's shape (kinds and nesting, no texts or states) and its items in the order `add` made them.
+        shape: String,
+        items: Vec<Kept>,
+    }
+
+    /// A menu item we keep, to change it in place.
+    enum Kept {
+        Item(MenuItem),
+        Check(CheckMenuItem),
+        Sub(Submenu),
+        Separator,
     }
 
     fn refresh<M: Model>(t: &TrayIcon, m: &M, shown: &mut Shown, clicks: &mut HashMap<MenuId, Click>) {
@@ -385,13 +396,86 @@ mod imp {
         let mut key = String::new();
         fingerprint(&items, &mut key);
         if key != shown.menu {
-            let menu = Menu::new();
+            // Same shape: change texts and states in place. Replacing the menu closes it if it is open (macOS), and
+            // the status line changes while it is (download / optimizing progress).
+            let mut shape = String::new();
+            shape_of(&items, &mut shape);
             clicks.clear();
-            add(items, &|i| {
-                let _ = menu.append(i);
-            }, clicks);
-            t.set_menu(Some(Box::new(menu)));
+            if shape == shown.shape {
+                update(items, &mut shown.items.iter(), clicks);
+            } else {
+                let menu = Menu::new();
+                shown.items.clear();
+                add(items, &|i| {
+                    let _ = menu.append(i);
+                }, clicks, &mut shown.items);
+                t.set_menu(Some(Box::new(menu)));
+                shown.shape = shape;
+            }
             shown.menu = key;
+        }
+    }
+
+    /// The menu's shape: what `add` makes, without texts or states.
+    fn shape_of(items: &[Item], out: &mut String) {
+        for it in items {
+            match it {
+                Item::Label(_) | Item::Action { .. } => *out += "A",
+                Item::Separator => *out += "-",
+                Item::Check { .. } => *out += "C",
+                Item::Radio { options, .. } => *out += &"C".repeat(options.len()),
+                Item::Sub { items, .. } => {
+                    *out += "S[";
+                    shape_of(items, out);
+                    *out += "]";
+                }
+            }
+        }
+    }
+
+    /// Give the items `add` made (same shape) the new texts, states and clicks.
+    fn update<'a>(items: Vec<Item>, h: &mut impl Iterator<Item = &'a Kept>, clicks: &mut HashMap<MenuId, Click>) {
+        for it in items {
+            match it {
+                Item::Label(label) => {
+                    if let Some(Kept::Item(i)) = h.next() {
+                        i.set_text(label);
+                    }
+                }
+                Item::Separator => {
+                    h.next();
+                }
+                Item::Action { label, enabled, click } => {
+                    if let Some(Kept::Item(i)) = h.next() {
+                        i.set_text(label);
+                        i.set_enabled(enabled);
+                        clicks.insert(i.id().clone(), click);
+                    }
+                }
+                Item::Check { label, checked, enabled, click } => {
+                    if let Some(Kept::Check(i)) = h.next() {
+                        i.set_text(label);
+                        i.set_enabled(enabled);
+                        i.set_checked(checked);
+                        clicks.insert(i.id().clone(), click);
+                    }
+                }
+                Item::Radio { options, selected } => {
+                    for (n, (label, click)) in options.into_iter().enumerate() {
+                        if let Some(Kept::Check(i)) = h.next() {
+                            i.set_text(label);
+                            i.set_checked(n == selected);
+                            clicks.insert(i.id().clone(), click);
+                        }
+                    }
+                }
+                Item::Sub { label, items } => {
+                    if let Some(Kept::Sub(s)) = h.next() {
+                        s.set_text(label);
+                    }
+                    update(items, h, clicks);
+                }
+            }
         }
     }
 
@@ -416,21 +500,30 @@ mod imp {
         }
     }
 
-    /// Menu items through `push`.
-    fn add(items: Vec<Item>, push: &dyn Fn(&dyn IsMenuItem), clicks: &mut HashMap<MenuId, Click>) {
+    /// Menu items through `push`; each one also goes to `kept` (in order, a submenu before its items).
+    fn add(items: Vec<Item>, push: &dyn Fn(&dyn IsMenuItem), clicks: &mut HashMap<MenuId, Click>, kept: &mut Vec<Kept>) {
         for it in items {
             match it {
-                Item::Label(label) => push(&MenuItem::new(label, false, None)),
-                Item::Separator => push(&PredefinedMenuItem::separator()),
+                Item::Label(label) => {
+                    let i = MenuItem::new(label, false, None);
+                    push(&i);
+                    kept.push(Kept::Item(i));
+                }
+                Item::Separator => {
+                    push(&PredefinedMenuItem::separator());
+                    kept.push(Kept::Separator);
+                }
                 Item::Action { label, enabled, click } => {
                     let i = MenuItem::new(label, enabled, None);
                     clicks.insert(i.id().clone(), click);
                     push(&i);
+                    kept.push(Kept::Item(i));
                 }
                 Item::Check { label, checked, enabled, click } => {
                     let i = CheckMenuItem::new(label, enabled, checked, None);
                     clicks.insert(i.id().clone(), click);
                     push(&i);
+                    kept.push(Kept::Check(i));
                 }
                 // No radio items in muda: checkmarks, one checked.
                 Item::Radio { options, selected } => {
@@ -438,14 +531,18 @@ mod imp {
                         let i = CheckMenuItem::new(label, true, n == selected, None);
                         clicks.insert(i.id().clone(), click);
                         push(&i);
+                        kept.push(Kept::Check(i));
                     }
                 }
                 Item::Sub { label, items } => {
                     let s = Submenu::new(label, true);
+                    let at = kept.len();
+                    kept.push(Kept::Separator); // placeholder: the submenu goes before its items
                     add(items, &|i| {
                         let _ = s.append(i);
-                    }, clicks);
+                    }, clicks, kept);
                     push(&s);
+                    kept[at] = Kept::Sub(s);
                 }
             }
         }

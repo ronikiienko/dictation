@@ -223,7 +223,7 @@ impl Tray {
 
     fn mem_text(&self) -> String {
         if self.state == State::Optimizing {
-            return "Makes dictation faster on this GPU. Runs once; the computer may feel slow until it's done".into();
+            return "Makes dictation faster on this GPU".into();
         }
         match self.mem {
             Mem::Unloaded => "Model not loaded (loads when you start, ~1 s)".into(),
@@ -373,9 +373,12 @@ impl tray::Model for Tray {
             outputs.iter().position(|&(_, k)| k == self.cfg.paste_keys).unwrap_or(0)
         };
 
-        vec![
-            Label(self.status_text()),
-            Label(self.mem_text()),
+        let mut items = vec![Label(self.status_text()), Label(self.mem_text())];
+        if self.state == State::Optimizing {
+            // Own line: one long line made the whole menu too wide.
+            items.push(Label("Runs once; the computer may feel slow until it's done".into()));
+        }
+        items.extend([
             Separator,
             Action {
                 label: if recording { "Stop dictation" } else { "Start dictation" }.into(),
@@ -475,7 +478,8 @@ impl tray::Model for Tray {
             self.shortcut_item(),
             Separator,
             Action { label: "Quit".into(), enabled: true, click: self.send(|| Ev::Quit) },
-        ]
+        ]);
+        items
     }
 }
 
