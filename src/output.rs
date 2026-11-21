@@ -101,29 +101,45 @@ impl Clipboard {
     }
 }
 
-/// Short notifications (result, errors), each replacing the previous one. Recording state is shown by the tray icon
-/// and the start/stop sounds, not by notifications.
+/// Short notifications (result, errors). Recording state is shown by the tray icon and the start/stop sounds, not by
+/// notifications. Linux: each replaces the previous one, 4 s, not kept in history, theme icon. macOS/Windows: plain
+/// title + body (those features don't exist there: the OS decides how long, they stack, the icon is the app's).
 #[derive(Default)]
 pub struct Notice {
+    #[cfg(target_os = "linux")]
     pub id: Option<u32>,
     pub enabled: bool,
 }
 
 impl Notice {
+    /// `icon`: a theme icon name, Linux only.
     pub async fn show(&mut self, title: &str, body: &str, icon: &str) {
         if !self.enabled {
             return;
         }
-        use notify_rust::{Hint, Notification, Timeout};
+        use notify_rust::Notification;
         let mut n = Notification::new();
-        n.appname("Dictation").summary(title).body(body).icon(icon).timeout(Timeout::Milliseconds(4000));
-        n.hint(Hint::Transient(true));
-        if let Some(id) = self.id {
-            n.id(id);
+        n.appname("Dictation").summary(title).body(body);
+        #[cfg(target_os = "linux")]
+        {
+            use notify_rust::{Hint, Timeout};
+            n.icon(icon).timeout(Timeout::Milliseconds(4000)).hint(Hint::Transient(true));
+            if let Some(id) = self.id {
+                n.id(id);
+            }
+            match n.show_async().await {
+                Ok(h) => self.id = Some(h.id()),
+                Err(e) => eprintln!("notification: {e}"),
+            }
         }
-        match n.show_async().await {
-            Ok(h) => self.id = Some(h.id()),
-            Err(e) => eprintln!("notification: {e}"),
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = icon;
+            // Only a blocking show() there: off the async thread.
+            match tokio::task::spawn_blocking(move || n.show().map(|_| ())).await {
+                Ok(Err(e)) => eprintln!("notification: {e}"),
+                _ => {}
+            }
         }
     }
 }
