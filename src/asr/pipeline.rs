@@ -79,9 +79,14 @@ impl Model {
         Model { enc, vad, joint_enc, dec, tok, mel, lf, hop, dev }
     }
 
+    /// Padded with zero frames to a whole number of encoder frames (8 mel frames = 80 ms, plus the centre-padding
+    /// frame), so the GPU only ever sees lengths on the 80 ms grid: an off-grid length is a new kernel shape, which
+    /// means compiling (and tuning) during a take. Same result: the subsampler masks everything past the valid
+    /// length (`valid_lengths`, from the real sample count), and valid frames only read up to the last real one.
     fn mel_tensor(&self, pcm: &[f32]) -> Tensor<2> {
-        let m = self.mel.compute(pcm);
-        let frames = m.len() / self.mel.n_mels;
+        let mut m = self.mel.compute(pcm);
+        let frames = (m.len() / self.mel.n_mels - 1).div_ceil(8) * 8 + 1;
+        m.resize(frames * self.mel.n_mels, 0.0);
         Tensor::from_data(TensorData::new(m, [frames, self.mel.n_mels]), (&self.dev, DType::F32))
     }
 
@@ -118,6 +123,18 @@ impl Model {
         let x = self.enc.pre.fwd_chunked(self.mel_tensor(pcm), len, SCAN_CHUNK);
         let p = self.vad.fwd(x).into_data().convert::<f32>().try_into_vec::<f32>().unwrap();
         p[..p.len().min(len[3])].to_vec()
+    }
+
+    /// Pause scan of one block (any length, normally only run on takes over 30 s); the sweep uses it to tune the
+    /// pause head at short lengths (the last block of a take over 120 s).
+    pub fn scan(&self, pcm: &[f32]) {
+        let _ = self.speech_probs(pcm);
+    }
+
+    /// Audio just over 30 s: where its first piece ends (latest pause before 30 s, as for long takes). Runs the
+    /// pause scan over all of `pcm` (the sweep uses it for that).
+    pub fn first_cut(&self, pcm: &[f32]) -> usize {
+        self.segments(pcm).first().map_or(pcm.len(), |&(s, l)| s + l)
     }
 
     /// Pieces as (start sample, length); one piece for takes up to 30 s.

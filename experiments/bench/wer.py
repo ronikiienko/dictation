@@ -1,4 +1,4 @@
-"""Word error rate of each take in recordings/log.jsonl against a reference text.
+"""Word error rate of each take in ~/.local/share/dictation/recordings/log.jsonl against a reference text.
 usage: python3 experiments/bench/wer.py <reference.txt> [wav name, default: last take]"""
 import json, re, sys
 from pathlib import Path
@@ -18,7 +18,7 @@ def wer(ref, hyp):
     return d[len(h)] / len(r), len(r)
 
 ref = Path(sys.argv[1]).read_text()
-takes = [json.loads(l) for l in open(Path(__file__).resolve().parent.parent.parent / "recordings/log.jsonl")]
+takes = [json.loads(l) for l in open(Path.home() / ".local/share/dictation/recordings/log.jsonl")]
 take = next(t for t in takes if t["wav"] == sys.argv[2]) if len(sys.argv) > 2 else takes[-1]
 print(f'{take["wav"]}  {take["seconds"]}s  nemotron_lang={take["nemotron_lang"]}')
 for m in ("nemotron", "parakeet"):

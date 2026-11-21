@@ -1,4 +1,4 @@
-//! Model catalog and downloader (Hugging Face, resumable via .part files, SHA-256 checked).
+//! The model and its downloader (Hugging Face, resumable via .part files, SHA-256 checked).
 //! Models live in the OS's per-user app data folder (`directories` crate):
 //! Linux `~/.local/share/dictation/models`, macOS `~/Library/Application Support/dictation/models`,
 //! Windows `%APPDATA%\dictation\data\models`. Each model has its own folder `<models>/<id>/` with
@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub struct ModelInfo {
     pub id: &'static str,
     pub name: &'static str,
-    pub note: &'static str,
     /// File name of the download (a transcribe.cpp GGUF).
     pub file: &'static str,
     pub url: &'static str,
@@ -22,30 +21,19 @@ pub struct ModelInfo {
     pub sha256: &'static str,
 }
 
-pub const CATALOG: &[ModelInfo] = &[ModelInfo {
+/// The app's one model (src/asr is a port of exactly this architecture).
+pub const MODEL: ModelInfo = ModelInfo {
     id: "parakeet-ultra-q8",
     name: "Parakeet Ultra, 8-bit (Q8_0)",
-    note: "recommended: best accuracy, ~1 GB VRAM",
     file: "parakeet-ultra-Q8_0.gguf",
     url: "https://huggingface.co/handy-computer/parakeet-ultra-gguf/resolve/main/parakeet-ultra-Q8_0.gguf",
     size: 740_363_168,
     sha256: "007a59761e9258779f189df396b50d12b83bb5b79e66df4b955c230d2f2a0a59",
-}];
-
-pub fn find(id: &str) -> &'static ModelInfo {
-    CATALOG.iter().find(|m| m.id == id).unwrap_or(&CATALOG[0])
-}
+};
 
 /// Folder holding the downloaded models (not created here).
 pub fn dir() -> PathBuf {
-    directories::ProjectDirs::from("", "", "dictation").expect("no home directory").data_dir().join("models")
-}
-
-/// Show the models folder in the file manager (created first, so there is something to open).
-pub fn open_dir() -> Result<(), String> {
-    let d = dir();
-    std::fs::create_dir_all(&d).map_err(|e| format!("{}: {e}", d.display()))?;
-    open::that_detached(&d).map_err(|e| format!("open {}: {e}", d.display()))
+    crate::root().join("models")
 }
 
 impl ModelInfo {

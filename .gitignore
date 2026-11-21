@@ -4,7 +4,3 @@
 /.cache/
 /.venv*/
 __pycache__/
-# large / personal data
-/models/
-/recordings/
-/config.toml

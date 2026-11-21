@@ -7,6 +7,7 @@
 mod decoder;
 mod encoder;
 mod gguf;
+mod live;
 mod longform;
 mod mel;
 mod pipeline;
@@ -17,6 +18,7 @@ use burn::tensor::{Device, DeviceConfig, DeviceKind, FloatDType, Tensor};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
+pub use live::Live;
 pub use pipeline::Timing;
 pub use weights::{convert, is_current};
 
@@ -28,14 +30,116 @@ fn guard<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     })
 }
 
-/// Where CubeCL keeps its compiled-kernel cache (SPIR-V): a folder next to the model. Process-wide and only
-/// settable before the first GPU use; later calls are ignored (the first folder stays).
-pub fn set_kernel_cache(dir: &Path) {
+/// Where CubeCL keeps its kernel cache (compiled SPIR-V + autotune results): `kernels/<GPU name>/`, next to the
+/// model. One folder per GPU because CubeCL files autotune results under "the default device", not under the GPU:
+/// with one shared cache, a second GPU would reuse the first one's picks (an NVIDIA matmul pick crashed the AMD iGPU).
+/// Process-wide and only settable before the first GPU use; later calls are ignored (the first folder stays).
+pub fn set_kernel_cache(kernels: &Path) {
     use cubecl_runtime::config::{CubeClRuntimeConfig, RuntimeConfig, cache::CacheConfig};
     let mut c = CubeClRuntimeConfig::default();
     c.compilation.cache = true;
-    c.environment.path = CacheConfig::Directory(dir.to_path_buf());
+    c.environment.path = CacheConfig::Directory(gpu_dir(kernels));
     CubeClRuntimeConfig::try_set(c);
+}
+
+fn gpu_dir(kernels: &Path) -> std::path::PathBuf {
+    kernels.join(gpu().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>())
+}
+
+/// What a sweep's results depend on: the build (kernels, see build.rs) and whether it tunes.
+#[cfg(feature = "autotune")]
+const SWEEP_KEY: &str = concat!(env!("DICTATION_BUILD_KEY"), " tuned");
+#[cfg(not(feature = "autotune"))]
+const SWEEP_KEY: &str = env!("DICTATION_BUILD_KEY");
+
+/// Whether this GPU's kernel cache already holds a full sweep for this build (`Asr::sweep` + `mark_swept`).
+pub fn swept(kernels: &Path) -> bool {
+    std::fs::read_to_string(gpu_dir(kernels).join("swept")).is_ok_and(|s| s.trim() == SWEEP_KEY)
+}
+
+pub fn mark_swept(kernels: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(gpu_dir(kernels))?;
+    std::fs::write(gpu_dir(kernels).join("swept"), SWEEP_KEY)
+}
+
+/// A Vulkan adapter: its name and how to ask CubeCL for it.
+pub struct Gpu {
+    pub name: String,
+    /// "discrete", "integrated", ...
+    pub kind: &'static str,
+    /// `CUBECL_WGPU_DEFAULT_DEVICE` value selecting it, e.g. `IntegratedGpu(0)`.
+    selector: String,
+}
+
+fn instance() -> burn::backend::wgpu::wgpu::Instance {
+    use burn::backend::wgpu::wgpu;
+    wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::VULKAN,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    })
+}
+
+/// Every Vulkan adapter, in the order CubeCL counts them (each type from 0).
+pub fn gpus() -> Vec<Gpu> {
+    use burn::backend::wgpu::wgpu::{Backends, DeviceType};
+    let mut count = [0usize; 5];
+    block_on(instance().enumerate_adapters(Backends::VULKAN))
+        .into_iter()
+        .map(|a| a.get_info())
+        .map(|i| {
+            let (t, kind, sel) = match i.device_type {
+                DeviceType::DiscreteGpu => (0, "discrete", "DiscreteGpu"),
+                DeviceType::IntegratedGpu => (1, "integrated", "IntegratedGpu"),
+                DeviceType::VirtualGpu => (2, "virtual", "VirtualGpu"),
+                DeviceType::Cpu => (3, "CPU, slow", "Cpu"),
+                DeviceType::Other => (4, "other", "Other"),
+            };
+            let selector = if t == 3 { sel.to_string() } else { format!("{sel}({})", count[t]) };
+            count[t] += 1;
+            Gpu { name: i.name, kind, selector }
+        })
+        .collect()
+}
+
+/// Use the GPU with this name instead of the default one ("" or not found: the default). Call at startup, before
+/// any other thread runs (it sets the process environment CubeCL reads), and before `gpu()`.
+pub fn choose_gpu(name: &str) {
+    if let Some(g) = gpus().into_iter().find(|g| !name.is_empty() && g.name == name) {
+        // SAFETY: called first thing in main, while the process is single-threaded.
+        unsafe { std::env::set_var("CUBECL_WGPU_DEFAULT_DEVICE", g.selector) };
+    }
+}
+
+/// Name of the GPU `Device::vulkan(DefaultDevice)` uses. Same choice as CubeCL: the `CUBECL_WGPU_DEFAULT_DEVICE`
+/// override (`DiscreteGpu(n)`, `IntegratedGpu(n)`, `VirtualGpu(n)`, `Cpu`) if set, else the adapter wgpu offers
+/// for "high performance" on Vulkan.
+pub fn gpu() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        use burn::backend::wgpu::wgpu;
+        let name = match std::env::var("CUBECL_WGPU_DEFAULT_DEVICE") {
+            Ok(sel) => gpus().into_iter().find(|g| g.selector == sel).map(|g| g.name),
+            Err(_) => block_on(instance().request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                ..Default::default()
+            }))
+            .ok()
+            .map(|a| a.get_info().name),
+        };
+        name.unwrap_or_else(|| "unknown GPU".into())
+    })
+}
+
+/// wgpu's native adapter futures are ready at once; poll until done.
+fn block_on<T>(f: impl Future<Output = T>) -> T {
+    let mut f = std::pin::pin!(f);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let std::task::Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+            return v;
+        }
+        std::thread::yield_now();
+    }
 }
 
 /// A loaded model. 16 kHz mono f32 in, text out. Dropping it frees the GPU memory it used.
@@ -55,6 +159,79 @@ impl Asr {
             let _ = Tensor::<1>::zeros([1], &dev).into_data(); // wait for the uploads
             Ok(Asr { model: Some(model), dev })
         })
+    }
+
+    /// Compiles (and tunes) ahead of time what real takes will need, so no take waits for it. Content doesn't
+    /// matter, only shapes: synthetic noise (3 s loud, 3 s quiet, so long takes find pauses). Results go to the
+    /// kernel cache, per build (build.rs) and GPU (`set_kernel_cache`).
+    ///
+    /// Which lengths (measured 2026-11-20, NOTES "sweep"): new work only shows up right after certain sizes (encoder
+    /// frames of 80 ms near 32, 48, 64, 96, 112, 128, 192, 256, 288, 320, and the last 1.2 s), so lengths <= 30 s
+    /// run on a 0.4 s grid plus the full 80 ms grid in those places (only 80 ms steps exist: takes are padded to
+    /// them, see `pipeline::Model::mel_tensor`). Takes over 30 s only add the pause scan over the whole take (their
+    /// pieces are <= 30 s): pause scan alone at every second 31..120 s (a few lengths missed ~1 s of compiling on
+    /// 41-52 s takes) and 240 s, and at the same short lengths as above (a take over
+    /// 120 s is scanned in 120 s blocks, its last block can be short). `full`: every 80 ms up to 30 s (full model
+    /// and pause scan) and full takes 31..120 s (the old sweep; to check that the short one misses nothing).
+    /// `progress(done 0..1, seconds of audio, ms)` after every run; "done" is weighted by the expected cost.
+    pub fn sweep(&mut self, full: bool, mut progress: impl FnMut(f64, f64, f64)) -> Result<(), String> {
+        let rate = 16_000;
+        let mut seed = 1u32;
+        let x: Vec<f32> = (0..240 * rate)
+            .map(|i| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let on = (i / (rate * 3)) % 2 == 0; // 3 s "speech", 3 s quiet
+                (seed >> 8) as f32 / (1u32 << 24) as f32 * if on { 0.2 } else { 0.002 } - if on { 0.1 } else { 0.001 }
+            })
+            .collect();
+        let step = rate * 8 / 100; // 80 ms = one encoder frame
+        let frames = 30 * rate / step; // 375
+        let near = |f: usize| {
+            [32, 48, 64, 96, 112, 128, 192, 256, 288, 320].iter().any(|&b| f + 1 >= b && f <= b + if b >= 128 { 16 } else { 8 })
+        };
+        let wanted = |f: usize| full || f <= 24 || f % 5 == 0 || near(f) || f + 16 > frames;
+        #[derive(Clone, Copy, PartialEq)]
+        enum Run {
+            Full,  // the whole pipeline, as a take
+            Take,  // pause scan over a take over 30 s, in 120 s blocks (no text)
+            Block, // pause scan of one block
+        }
+        let mut runs: Vec<(usize, Run)> = vec![(30 * rate + step, Run::Take)]; // live mode's window end
+        runs.extend((1..=frames).filter(|&f| wanted(f)).map(|f| (f * step, Run::Full)));
+        runs.extend((1..=frames).filter(|&f| wanted(f)).map(|f| (f * step, Run::Block)));
+        if full {
+            runs.extend((31..=120).map(|s| (s * rate, Run::Full)));
+        } else {
+            runs.extend((31..=120).chain([240]).map(|s| (s * rate, Run::Take)));
+        }
+        // Cost of one run, roughly: compiling/tuning (fixed) + running (grows with length; pause scan ~10x cheaper).
+        let cost = |&(n, r): &(usize, Run)| {
+            let secs = n as f64 / rate as f64;
+            0.1 + if r == Run::Full { secs / 100.0 } else { secs / 1000.0 } + if n == 30 * rate + step { 10.0 } else { 0.0 }
+        };
+        let total: f64 = runs.iter().map(cost).sum();
+        let mut done = 0.0;
+        for r in &runs {
+            let t = std::time::Instant::now();
+            let x = &x[..r.0];
+            match r.1 {
+                Run::Full => drop(self.run(x)?),
+                Run::Take => drop(self.first_cut(x)?),
+                Run::Block => {
+                    let m = self.model.as_ref().ok_or("model not loaded")?;
+                    guard(|| Ok(m.scan(x)))?
+                }
+            }
+            done += cost(r);
+            progress(done / total, r.0 as f64 / rate as f64, t.elapsed().as_secs_f64() * 1e3);
+        }
+        Ok(())
+    }
+
+    /// Audio just over 30 s: where its first piece ends (latest pause before 30 s). Live mode's window end.
+    pub fn first_cut(&mut self, pcm: &[f32]) -> Result<usize, String> {
+        let m = self.model.as_ref().ok_or("model not loaded")?;
+        guard(|| Ok(m.first_cut(pcm)))
     }
 
     pub fn run(&mut self, pcm: &[f32]) -> Result<(String, Timing), String> {

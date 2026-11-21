@@ -3,8 +3,14 @@ name = "dictation"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# GPU kernel tuning (~40% faster encoder on the RTX 3050, 2.1x on the AMD iGPU), done once per GPU by the app's
+# one-time optimization. `--no-default-features` builds without it.
+default = ["autotune"]
+autotune = ["burn/autotune"]
+
 [dependencies]
-# Speech-to-text (src/asr). No "autotune" (NOTES "burn autotune": no tuning delays or VRAM spikes); "persistence"
+# Speech-to-text (src/asr). "autotune" comes from our feature of that name; "persistence"
 # keeps compiled GPU kernels on disk (cache folder set in asr::set_kernel_cache). cubecl-runtime only for that config.
 burn = { version = "0.22.1", default-features = false, features = ["std", "vulkan", "fusion", "persistence"] }
 cubecl-runtime = { version = "0.11.4", default-features = false }

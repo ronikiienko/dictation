@@ -1,19 +1,20 @@
-//! Settings, stored as TOML. For now inside the project (`config.toml` in the project root), like everything else here;
-//! a packaged build would use ~/.config/dictation/config.toml.
+//! Settings, stored as TOML in the app folder (`config.toml` next to models/ and recordings/, see `crate::root`).
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct Config {
-    /// Speech model id from models::CATALOG.
-    pub model: String,
+    /// GPU (Vulkan adapter name), or "" for the default: the fastest one ("high performance").
+    pub gpu: String,
     /// Microphone: cpal device id, or "" for the system default.
     pub microphone: String,
     /// What happens with the text.
     pub output: Output,
     /// Keys pressed to paste.
     pub paste_keys: PasteKeys,
+    /// Paste words while speaking (Output::Paste only), instead of the whole take after stop.
+    pub live: bool,
     /// Start / stop sounds.
     pub sounds: bool,
     /// Desktop notifications (recording, transcribing, result).
@@ -69,10 +70,11 @@ pub enum PasteKeys {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            model: "parakeet-ultra-q8".into(),
+            gpu: String::new(),
             microphone: String::new(),
             output: Output::Paste,
             paste_keys: PasteKeys::CtrlV,
+            live: false,
             sounds: true,
             notifications: true,
             save_recordings: false,
@@ -102,6 +104,7 @@ impl Config {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
+        std::fs::create_dir_all(crate::root())?;
         let tmp = path().with_extension("toml.tmp");
         std::fs::write(&tmp, toml::to_string_pretty(self).expect("serialize config"))?;
         std::fs::rename(tmp, path())
