@@ -167,7 +167,7 @@ impl Block {
         let bd = (q + self.bias_v.clone()).matmul(p.swap_dims(1, 2)); // [H, T, 2T-1]
         // rel_shift: pad one zero column in front, view as [H, P+1, T], drop the first row, view back, keep T cols.
         let dev = bd.device();
-        let bd = Tensor::cat(vec![Tensor::zeros([H, t, 1], &dev), bd], 2)
+        let bd = Tensor::cat(vec![Tensor::zeros([H, t, 1], (&dev, bd.dtype())), bd], 2)
             .reshape([H, p_len + 1, t])
             .narrow(1, 1, p_len)
             .reshape([H, t, p_len])
@@ -286,8 +286,8 @@ impl PreEncode {
     }
 }
 
-/// NeMo RelPositionalEncoding: positions T-1 .. -(T-1), sin on even, cos on odd features.
-pub fn pos_emb(t: usize, dev: &Device) -> Tensor<2> {
+/// NeMo RelPositionalEncoding: positions T-1 .. -(T-1), sin on even, cos on odd features; in the activations' dtype.
+pub fn pos_emb(t: usize, dev: &Device, dt: DType) -> Tensor<2> {
     let n = 2 * t - 1;
     let mut v = vec![0f32; n * D];
     for r in 0..n {
@@ -298,7 +298,7 @@ pub fn pos_emb(t: usize, dev: &Device) -> Tensor<2> {
             v[r * D + i + 1] = (pos * div).cos() as f32;
         }
     }
-    Tensor::from_data(TensorData::new(v, [n, D]), dev)
+    Tensor::from_data(TensorData::new(v, [n, D]), (dev, dt))
 }
 
 pub struct Encoder {
@@ -319,7 +319,7 @@ impl Encoder {
         if t < x.dims()[0] {
             x = x.narrow(0, 0, t);
         }
-        let pos = pos_emb(t, &x.device());
+        let pos = pos_emb(t, &x.device(), x.dtype());
         for b in &self.blocks {
             x = b.fwd(x, pos.clone());
         }

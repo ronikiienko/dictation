@@ -21,7 +21,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         models::download(m, &std::sync::Arc::new(models::Progress::default()))?;
         eprintln!("model prepared in {:.1}s", t.elapsed().as_secs_f64());
     }
-    asr::set_kernel_cache(&m.kernel_cache());
+    // KERNELS=<dir>: use another kernel cache folder (tests that would otherwise add entries to the app's own).
+    asr::set_kernel_cache(&std::env::var("KERNELS").map(std::path::PathBuf::from).unwrap_or(m.kernel_cache()));
     let t = Instant::now();
     let mut a = asr::Asr::load(&m.weights())?;
     a.run(&vec![0.0; RATE])?;

@@ -43,7 +43,9 @@ impl Model {
     /// Weights go to the GPU as f16 activations with int8 (Q8_0) matrices; the encoder's weights as persistent
     /// allocations (own buffers, not pages of the dynamic pool).
     pub fn load(g: &Weights, dev: Device) -> Model {
-        let l = Ld { g, dev: &dev, low: FloatDType::F16, q8: true };
+        // Test only: F32=1 f32 activations, DEQ=1 weights dequantized (no int8 kernels), to see what f16 + int8 cost.
+        let f32 = std::env::var("F32").is_ok();
+        let l = Ld { g, dev: &dev, low: if f32 { FloatDType::F32 } else { FloatDType::F16 }, q8: std::env::var("DEQ").is_err() };
         let enc = dev.memory_persistent_allocations(&l, |l| Encoder::load(l));
         let vad = Vad::load(&l);
         let joint_enc = (l.lin("joint.enc.weight"), l.row("joint.enc.bias"));
