@@ -587,6 +587,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Another GPU: CubeCL picks the GPU and its kernel cache once per process, so start over.
         let exe = std::env::current_exe().ok().filter(|p| p.exists()).unwrap_or_else(|| std::env::args().next().unwrap_or_default().into());
         let mut cmd = std::process::Command::new(exe);
+        // The GPU we chose (asr::choose_gpu) is in our environment; without this, "Automatic" after a named GPU
+        // would inherit it and stay on that GPU. The new process picks again from config.toml.
+        cmd.env_remove("CUBECL_WGPU_DEFAULT_DEVICE");
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
