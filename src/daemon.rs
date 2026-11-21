@@ -15,8 +15,20 @@ use crate::{RATE, asr, audio, models, tray};
 
 pub const APP_ID: &str = "local.dictation.Dictation";
 
+/// Linux/macOS: the control socket's file, in the user's own runtime/temp folder.
 pub fn socket_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap_or("/tmp".into())).join("dictation.sock")
+    std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, Into::into).join("dictation.sock")
+}
+
+/// Where the running app listens (interprocess "local socket"): Linux/macOS the socket file above, Windows a named
+/// pipe (pipe names are machine-wide: per user).
+fn socket_name() -> std::io::Result<interprocess::local_socket::Name<'static>> {
+    use interprocess::local_socket::{GenericFilePath, GenericNamespaced, ToFsName, ToNsName};
+    if cfg!(windows) {
+        format!("dictation-{}", std::env::var("USERNAME").unwrap_or_default()).to_ns_name::<GenericNamespaced>()
+    } else {
+        socket_path().to_fs_name::<GenericFilePath>()
+    }
 }
 
 pub enum Ev {
@@ -555,18 +567,18 @@ fn ensure_desktop_file() -> Result<bool, String> {
 // ---------------------------------------------------------------- control socket (`dictation toggle`; `status` = single-instance check)
 
 async fn socket_task(tx: mpsc::UnboundedSender<Ev>, status: tokio::sync::watch::Receiver<String>) {
-    let path = socket_path();
-    let _ = std::fs::remove_file(&path);
-    let listener = match tokio::net::UnixListener::bind(&path) {
+    use interprocess::local_socket::ListenerOptions;
+    use interprocess::local_socket::tokio::prelude::*;
+    // A leftover socket file from a crash is replaced (run() already checked no other copy answers).
+    let listener = match socket_name().and_then(|n| ListenerOptions::new().name(n).try_overwrite(true).create_tokio()) {
         Ok(l) => l,
-        Err(e) => return eprintln!("socket {}: {e}", path.display()),
+        Err(e) => return eprintln!("control socket: {e}"),
     };
-    while let Ok((conn, _)) = listener.accept().await {
+    while let Ok(conn) = listener.accept().await {
         let (tx, status) = (tx.clone(), status.clone());
         tokio::spawn(async move {
-            let (r, mut w) = conn.into_split();
             let mut line = String::new();
-            if BufReader::new(r).read_line(&mut line).await.is_err() {
+            if BufReader::new(&conn).read_line(&mut line).await.is_err() {
                 return;
             }
             let reply = match line.trim() {
@@ -575,19 +587,21 @@ async fn socket_task(tx: mpsc::UnboundedSender<Ev>, status: tokio::sync::watch::
                 _ => Ok("unknown command".to_string()),
             }
             .unwrap_or_else(|_| "shutting down".into());
-            let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
+            let _ = (&conn).write_all(format!("{reply}\n").as_bytes()).await;
         });
     }
 }
 
 /// Send one command to a running app. -> reply line.
 pub fn send(cmd: &str) -> std::io::Result<String> {
+    use interprocess::local_socket::{Stream, prelude::*};
     use std::io::{BufRead, Write};
-    let mut s = std::os::unix::net::UnixStream::connect(socket_path())?;
-    s.set_read_timeout(Some(Duration::from_secs(2)))?;
-    s.write_all(format!("{cmd}\n").as_bytes())?;
+    let s = Stream::connect(socket_name()?)?;
+    s.set_recv_timeout(Some(Duration::from_secs(2)))?;
+    let mut s = std::io::BufReader::new(s);
+    s.get_mut().write_all(format!("{cmd}\n").as_bytes())?;
     let mut line = String::new();
-    std::io::BufReader::new(s).read_line(&mut line)?;
+    s.read_line(&mut line)?;
     Ok(line.trim().to_string())
 }
 
@@ -1055,6 +1069,7 @@ async fn main_loop(
     if let Some(r) = rec {
         let _ = r.stop();
     }
+    #[cfg(unix)]
     let _ = std::fs::remove_file(socket_path());
     Ok(restart)
 }
