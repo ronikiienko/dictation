@@ -25,8 +25,8 @@ pub enum Item {
 
 /// The app's side: what to show, built from its state whenever the backend needs it.
 pub trait Model: Send + 'static {
-    /// freedesktop icon name.
-    fn icon(&self) -> &'static str;
+    /// The tray icon (drawn in code, `icons`).
+    fn icon(&self) -> crate::icons::Icon;
     /// Ask for attention (recording).
     fn attention(&self) -> bool;
     /// (title, description).
@@ -139,8 +139,16 @@ mod imp {
         fn title(&self) -> String {
             "Dictation".into()
         }
-        fn icon_name(&self) -> String {
-            self.0.icon().into()
+        fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+            let icon = self.0.icon();
+            [22, 32, 48, 64]
+                .into_iter()
+                .map(|size| {
+                    // RGBA -> ARGB (network byte order), as the StatusNotifierItem spec wants.
+                    let data = icon.rgba(size as u32).chunks_exact(4).flat_map(|p| [p[3], p[0], p[1], p[2]]).collect();
+                    ksni::Icon { width: size, height: size, data }
+                })
+                .collect()
         }
         fn status(&self) -> ksni::Status {
             if self.0.attention() { ksni::Status::NeedsAttention } else { ksni::Status::Active }

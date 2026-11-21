@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::config::{Config, KeepLoaded, Output, PasteKeys};
 use crate::output::{Keyboard, Notice};
+use crate::icons::Icon;
 use crate::{RATE, asr, audio, models, tray};
 
 pub const APP_ID: &str = "local.dictation.Dictation";
@@ -255,14 +256,14 @@ impl Tray {
 }
 
 impl tray::Model for Tray {
-    fn icon(&self) -> &'static str {
+    fn icon(&self) -> Icon {
         match self.state {
-            State::Recording => "media-record",
-            _ if self.download.is_some() => "download",
-            State::Transcribing => "view-refresh",
-            State::Optimizing => "system-run",
-            State::NoModel => "dialog-warning",
-            State::Idle => "audio-input-microphone",
+            State::Recording => Icon::Recording,
+            _ if self.download.is_some() => Icon::Downloading,
+            State::Transcribing => Icon::Transcribing,
+            State::Optimizing => Icon::Optimizing,
+            State::NoModel => Icon::Warning,
+            State::Idle => Icon::Idle,
         }
     }
     fn attention(&self) -> bool {
