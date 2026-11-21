@@ -17,9 +17,15 @@ fn host() -> cpal::Host {
     cpal::default_host()
 }
 
-/// (id, human name) of every input device; id "" = system default.
+/// Device id meaning "record what the computer plays" (the default output device) instead of a microphone.
+pub const SYSTEM_AUDIO: &str = "system-audio";
+
+/// (id, human name) of every input device; id "" = system default. On macOS and Windows also SYSTEM_AUDIO (on
+/// Linux the sound server already lists "Monitor of …" sources for that).
 pub fn input_devices() -> Vec<(String, String)> {
     let mut out = vec![(String::new(), "System default".to_string())];
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    out.push((SYSTEM_AUDIO.to_string(), "System audio (what's playing)".to_string()));
     if let Ok(devs) = host().input_devices() {
         for d in devs {
             let (Ok(id), Ok(desc)) = (d.id(), d.description()) else { continue };
@@ -80,12 +86,17 @@ impl Recorder {
 
 fn open(device: &str, buf: Arc<Mutex<Vec<f32>>>) -> Result<(cpal::Stream, u32, u16), String> {
     let host = host();
-    let dev = if device.is_empty() {
+    // System audio: an input stream on the output device. cpal records it with a Core Audio process tap on macOS
+    // (14.6+, asks for "System Audio Recording" permission; denied = silence, not an error), WASAPI loopback on Windows.
+    let system = device == SYSTEM_AUDIO;
+    let dev = if system {
+        host.default_output_device()
+    } else if device.is_empty() {
         host.default_input_device()
     } else {
         device.parse().ok().and_then(|id| host.device_by_id(&id)).or_else(|| host.default_input_device())
     }
-    .ok_or("no microphone found")?;
+    .ok_or(if system { "no output device found" } else { "no microphone found" })?;
     let err = |e: cpal::Error| eprintln!("audio: {e}");
     // Ask for exactly what the model wants; the sound server resamples. Fall back to the device's own format.
     // Small fixed blocks (50 ms): with the default the server hands over audio in ~1 s blocks, and the block still
@@ -97,7 +108,7 @@ fn open(device: &str, buf: Arc<Mutex<Vec<f32>>>) -> Result<(cpal::Stream, u32, u
         s.play().map_err(|e| e.to_string())?;
         return Ok((s, RATE as u32, 1));
     }
-    let def = dev.default_input_config().map_err(|e| e.to_string())?;
+    let def = if system { dev.default_output_config() } else { dev.default_input_config() }.map_err(|e| e.to_string())?;
     let mut cfg: cpal::StreamConfig = def.config();
     cfg.buffer_size = cpal::BufferSize::Fixed(cfg.sample_rate / 20);
     let (rate, ch) = (cfg.sample_rate, cfg.channels);

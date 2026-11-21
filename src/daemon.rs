@@ -452,7 +452,7 @@ impl tray::Model for Tray {
                 ],
             },
             Sub {
-                label: "Microphone".into(),
+                label: "Source".into(),
                 items: vec![Radio {
                     options: self
                         .mics
@@ -1046,7 +1046,7 @@ async fn main_loop(
                             audio::play(audio::Cue::Start);
                         }
                     }
-                    Err(e) => notice.show("Microphone error", &e, "dialog-error").await,
+                    Err(e) => notice.show("Recording error", &e, "dialog-error").await,
                 },
                 (_, Some(r)) => {
                     if cfg.sounds {
@@ -1054,6 +1054,15 @@ async fn main_loop(
                     }
                     state = if busy > 0 { State::Transcribing } else { State::Idle };
                     match r.stop() {
+                        Ok(x) if !live_on && cfg.microphone == audio::SYSTEM_AUDIO && x.iter().all(|&v| v == 0.0) => {
+                            notice
+                                .show(
+                                    "System audio was silent",
+                                    "Nothing was playing, or the app may not record system audio: System Settings → Privacy & Security → Screen & System Audio Recording.",
+                                    "dialog-information",
+                                )
+                                .await
+                        }
                         Ok(x) if live_on => {
                             busy += 1;
                             let _ = jobs.send(Job::LiveFinish(x));
@@ -1065,7 +1074,7 @@ async fn main_loop(
                             state = State::Transcribing;
                         }
                         Ok(_) => notice.show("Too short, skipped", "", "dialog-information").await,
-                        Err(e) => notice.show("Microphone error", &e, "dialog-error").await,
+                        Err(e) => notice.show("Recording error", &e, "dialog-error").await,
                     }
                     live_on = false;
                     last_used = Instant::now();
