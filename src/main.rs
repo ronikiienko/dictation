@@ -1,4 +1,4 @@
-//! dictation — offline dictation for KDE Wayland (Parakeet Ultra, own Rust port on burn/Vulkan). Settings are in the tray menu.
+//! dictation — offline dictation for KDE Wayland (Parakeet Ultra, own Rust port on burn: Vulkan, macOS Metal). Settings are in the tray menu.
 //!   dictation            run the tray app
 //!   dictation toggle     start / stop a take in the running app (for a custom shortcut or scripts)
 //!   dictation sweep      compile (and tune, if enabled) GPU kernels for every take length ahead of time. The tray

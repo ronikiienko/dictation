@@ -1,5 +1,5 @@
 //! Speech-to-text: Parakeet Ultra in Rust. Mel and the TDT decoder run on the CPU, the encoder and the pause head on
-//! the GPU (burn on CubeCL, Vulkan). Ported from transcribe.cpp (MIT, (c) 2026 The transcribe.cpp authors); the
+//! the GPU (burn on CubeCL; Vulkan, macOS: Metal). Ported from transcribe.cpp (MIT, (c) 2026 The transcribe.cpp authors); the
 //! research and every measurement behind it are in experiments/burn and NOTES.md ("burn pipeline").
 //!
 //! The model comes as transcribe.cpp's GGUF and is converted once into our weights file (weights.rs), which loads
@@ -32,7 +32,7 @@ fn guard<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
 
 /// Test only: what the GPU allocator holds (in use / reserved, per pool), in MB.
 pub fn mem_report() -> String {
-    let d = Device::vulkan(DeviceKind::DefaultDevice);
+    let d = device();
     let mb = |b: u64| b as f64 / 1e6;
     let u = d.memory_pool_usage().unwrap_or_default();
     let pools: Vec<String> = d.memory_pool_report().unwrap_or_default().iter()
@@ -74,7 +74,7 @@ pub fn mark_swept(kernels: &Path) -> std::io::Result<()> {
     std::fs::write(gpu_dir(kernels).join("swept"), SWEEP_KEY)
 }
 
-/// A Vulkan adapter: its name and how to ask CubeCL for it.
+/// A GPU adapter (Vulkan; macOS: Metal): its name and how to ask CubeCL for it.
 pub struct Gpu {
     pub name: String,
     /// "discrete", "integrated", ...
@@ -83,19 +83,32 @@ pub struct Gpu {
     selector: String,
 }
 
+/// The GPU API: Metal on macOS (it has no Vulkan), Vulkan elsewhere. Either way CubeCL writes the kernels in that
+/// API's own language (MSL / SPIR-V), not WGSL.
+const BACKENDS: burn::backend::wgpu::wgpu::Backends =
+    if cfg!(target_os = "macos") { burn::backend::wgpu::wgpu::Backends::METAL } else { burn::backend::wgpu::wgpu::Backends::VULKAN };
+
+/// The default GPU on that API (`gpu()` says which one).
+fn device() -> Device {
+    #[cfg(target_os = "macos")]
+    return Device::metal(DeviceKind::DefaultDevice);
+    #[cfg(not(target_os = "macos"))]
+    return Device::vulkan(DeviceKind::DefaultDevice);
+}
+
 fn instance() -> burn::backend::wgpu::wgpu::Instance {
     use burn::backend::wgpu::wgpu;
     wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::VULKAN,
+        backends: BACKENDS,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     })
 }
 
-/// Every Vulkan adapter, in the order CubeCL counts them (each type from 0).
+/// Every adapter (Vulkan; macOS: Metal), in the order CubeCL counts them (each type from 0).
 pub fn gpus() -> Vec<Gpu> {
-    use burn::backend::wgpu::wgpu::{Backends, DeviceType};
+    use burn::backend::wgpu::wgpu::DeviceType;
     let mut count = [0usize; 5];
-    block_on(instance().enumerate_adapters(Backends::VULKAN))
+    block_on(instance().enumerate_adapters(BACKENDS))
         .into_iter()
         .map(|a| a.get_info())
         .map(|i| {
@@ -122,9 +135,9 @@ pub fn choose_gpu(name: &str) {
     }
 }
 
-/// Name of the GPU `Device::vulkan(DefaultDevice)` uses. Same choice as CubeCL: the `CUBECL_WGPU_DEFAULT_DEVICE`
+/// Name of the GPU `device()` uses. Same choice as CubeCL: the `CUBECL_WGPU_DEFAULT_DEVICE`
 /// override (`DiscreteGpu(n)`, `IntegratedGpu(n)`, `VirtualGpu(n)`, `Cpu`) if set, else the adapter wgpu offers
-/// for "high performance" on Vulkan.
+/// for "high performance" on that API.
 pub fn gpu() -> &'static str {
     static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     NAME.get_or_init(|| {
@@ -164,8 +177,8 @@ impl Asr {
     pub fn load(weights_file: &Path) -> Result<Asr, String> {
         guard(|| {
             let w = weights::Weights::open(weights_file).map_err(|e| e.to_string())?;
-            // The best GPU Vulkan offers (wgpu prefers "high power" ones). f16 activations.
-            let mut dev = Device::vulkan(DeviceKind::DefaultDevice);
+            // The best GPU (wgpu prefers "high power" ones). f16 activations.
+            let mut dev = device();
             let _ = dev.configure(DeviceConfig::default().float_dtype(FloatDType::F16)); // fails if already set
             let model = pipeline::Model::load(&w, dev.clone());
             let _ = Tensor::<1>::zeros([1], &dev).into_data(); // wait for the uploads

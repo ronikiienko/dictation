@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct Config {
-    /// GPU (Vulkan adapter name), or "" for the default: the fastest one ("high performance").
+    /// GPU (adapter name), or "" for the default: the fastest one ("high performance").
     pub gpu: String,
     /// Microphone: cpal device id, or "" for the system default.
     pub microphone: String,

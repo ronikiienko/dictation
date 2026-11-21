@@ -13,7 +13,7 @@ autotune = ["burn/autotune"]
 buildid = { version = "1.1.0", features = ["buildid-custom-inject"] } # see lib.rs build_id__get
 # Speech-to-text (src/asr). "autotune" comes from our feature of that name; "persistence"
 # keeps compiled GPU kernels on disk (cache folder set in asr::set_kernel_cache). cubecl-runtime only for that config.
-burn = { version = "0.22.1", default-features = false, features = ["std", "vulkan", "fusion", "persistence"] }
+burn = { version = "0.22.1", default-features = false, features = ["std", "fusion", "persistence"] }
 cubecl-runtime = { version = "0.11.4", default-features = false }
 bytemuck = "1"
 bytes = "1"
@@ -38,6 +38,14 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "
 toml = "1.2.1"
 ureq = "3.5.2"
 interprocess = { version = "2.4.9", features = ["tokio"] }
+
+# GPU API (asr::device): Vulkan, except macOS (no Vulkan there): Metal. Both get kernels in their own language
+# (SPIR-V / MSL), not WGSL.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+burn = { version = "0.22.1", default-features = false, features = ["vulkan"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+burn = { version = "0.22.1", default-features = false, features = ["metal"] }
 
 # Linux: global shortcut via the desktop portal (ashpd), tray via D-Bus (ksni), paste via its own virtual keyboard
 # (evdev, /dev/uinput); all work on X11 and Wayland. Elsewhere: global-hotkey, tray-icon on tao, enigo.
