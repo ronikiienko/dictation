@@ -38,6 +38,9 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "
 toml = "1.2.1"
 ureq = "3.5.2"
 interprocess = { version = "2.4.9", features = ["tokio"] }
+symphonia = { version = "0.6.1", features = ["all"] }
+rubato = "5.1.0"
+rfd = "0.18.0"
 
 # GPU API (asr::device): Vulkan, except macOS (no Vulkan there): Metal. Both get kernels in their own language
 # (SPIR-V / MSL), not WGSL.
