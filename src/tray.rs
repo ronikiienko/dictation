@@ -1,5 +1,7 @@
 //! Tray icon + menu: described once here, shown by a per-platform backend. Linux: ksni (StatusNotifierItem over
-//! D-Bus: the desktop draws the menu itself; no GTK, works on X11 and Wayland). macOS/Windows later: tray-icon + muda.
+//! D-Bus: the desktop draws the menu itself; no GTK, works on X11 and Wayland). macOS/Windows: tray-icon + muda (its
+//! menus) on a tao event loop; built into those OSes, nothing to install (on Linux tray-icon would need
+//! libayatana-appindicator, hence ksni there).
 //!
 //! The tray owns the main thread on every platform (`run`) and the app runs on another one: macOS only allows
 //! on-screen things (the menu-bar icon included) on the main thread, Windows wants them on the thread that made them.
@@ -64,7 +66,7 @@ mod imp {
 
     impl<M: Model> Handle<M> {
         /// Change the model; the tray redraws. None once the tray is gone.
-        pub async fn update<R>(&self, f: impl FnOnce(&mut M) -> R) -> Option<R> {
+        pub async fn update<R: Send + 'static>(&self, f: impl FnOnce(&mut M) -> R + Send + 'static) -> Option<R> {
             self.0.update(|k| f(&mut k.0)).await
         }
     }
@@ -165,6 +167,223 @@ mod imp {
         }
         fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
             convert(self.0.menu())
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod imp {
+    use super::{Click, Item, Model};
+    use crate::icons::Icon;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tao::event::{Event, StartCause};
+    use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
+    use tao::platform::run_return::EventLoopExtRunReturn;
+    use tray_icon::menu::{CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
+    use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+
+    /// Tray icon size in pixels (the OS scales it; macOS menu bar is 22 pt = 44 px on Retina).
+    const SIZE: u32 = if cfg!(target_os = "macos") { 44 } else { 32 };
+
+    /// What reaches the main thread's event loop.
+    pub enum Ev<M> {
+        Update(Box<dyn FnOnce(&mut M) + Send>),
+        Tray(TrayIconEvent),
+        Menu(MenuEvent),
+        /// The app thread is done: stop the loop.
+        Done,
+    }
+
+    /// Updates the tray from any thread (by sending the change to the main thread).
+    pub struct Handle<M: Model>(Arc<Mutex<EventLoopProxy<Ev<M>>>>);
+
+    impl<M: Model> Clone for Handle<M> {
+        fn clone(&self) -> Self {
+            Handle(self.0.clone())
+        }
+    }
+
+    impl<M: Model> Handle<M> {
+        /// Change the model; the tray redraws. None once the tray is gone.
+        pub async fn update<R: Send + 'static>(&self, f: impl FnOnce(&mut M) -> R + Send + 'static) -> Option<R> {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if !self.send(Ev::Update(Box::new(move |m| {
+                let _ = tx.send(f(m));
+            }))) {
+                return None;
+            }
+            rx.await.ok()
+        }
+
+        fn send(&self, ev: Ev<M>) -> bool {
+            self.0.lock().is_ok_and(|p| p.send_event(ev).is_ok())
+        }
+    }
+
+    pub fn run<M: Model, R: Send + 'static>(
+        mut model: M,
+        app: impl FnOnce(Handle<M>) -> R + Send + 'static,
+    ) -> Result<R, Box<dyn std::error::Error>> {
+        let mut el = EventLoopBuilder::<Ev<M>>::with_user_event().build();
+        #[cfg(target_os = "macos")]
+        {
+            use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
+            el.set_activation_policy(ActivationPolicy::Accessory); // menu-bar icon only, no Dock icon
+        }
+        let h = Handle(Arc::new(Mutex::new(el.create_proxy())));
+        let ht = h.clone();
+        TrayIconEvent::set_event_handler(Some(move |e| {
+            ht.send(Ev::Tray(e));
+        }));
+        let hm = h.clone();
+        MenuEvent::set_event_handler(Some(move |e| {
+            hm.send(Ev::Menu(e));
+        }));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new().name("app".into()).spawn(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app(h.clone())));
+            let _ = done_tx.send(r);
+            h.send(Ev::Done);
+        })?;
+
+        let mut tray: Option<TrayIcon> = None;
+        let mut shown = Shown::default();
+        let mut clicks: HashMap<MenuId, Click> = HashMap::new();
+        el.run_return(|event, _, flow| {
+            *flow = ControlFlow::Wait;
+            match event {
+                // macOS: the tray can only be made once the loop runs.
+                Event::NewEvents(StartCause::Init) => {
+                    // macOS convention: a click opens the menu. Windows: left click = activate, right = menu.
+                    match TrayIconBuilder::new().with_menu_on_left_click(cfg!(target_os = "macos")).build() {
+                        Ok(t) => tray = Some(t),
+                        Err(e) => log::error!("tray icon: {e}"),
+                    }
+                }
+                Event::UserEvent(Ev::Update(f)) => f(&mut model),
+                Event::UserEvent(Ev::Menu(e)) => {
+                    if let Some(c) = clicks.get(&e.id) {
+                        c();
+                    }
+                    shown.menu.clear(); // the OS may have toggled a checkmark itself: redraw from the model
+                }
+                Event::UserEvent(Ev::Tray(TrayIconEvent::Click { button, button_state, .. })) => {
+                    match button_state {
+                        MouseButtonState::Down => model.menu_opening(),
+                        MouseButtonState::Up if button == MouseButton::Left && !cfg!(target_os = "macos") => model.activate(),
+                        _ => {}
+                    }
+                }
+                Event::UserEvent(Ev::Done) => {
+                    *flow = ControlFlow::Exit;
+                    return;
+                }
+                _ => return,
+            }
+            if let Some(t) = &tray {
+                refresh(t, &model, &mut shown, &mut clicks);
+            }
+        });
+        drop(tray);
+        match done_rx.recv() {
+            Ok(Ok(r)) => Ok(r),
+            _ => Err("app thread panicked".into()),
+        }
+    }
+
+    /// What the tray shows now, to only redraw what changed.
+    #[derive(Default)]
+    struct Shown {
+        icon: Option<Icon>,
+        tooltip: String,
+        menu: String,
+    }
+
+    fn refresh<M: Model>(t: &TrayIcon, m: &M, shown: &mut Shown, clicks: &mut HashMap<MenuId, Click>) {
+        let icon = m.icon();
+        if shown.icon != Some(icon) {
+            match tray_icon::Icon::from_rgba(icon.rgba(SIZE), SIZE, SIZE) {
+                Ok(i) => {
+                    let _ = t.set_icon(Some(i));
+                }
+                Err(e) => log::error!("tray icon: {e}"),
+            }
+            shown.icon = Some(icon);
+        }
+        let (title, description) = m.tooltip();
+        let tooltip = if description.is_empty() { title } else { format!("{title}\n{description}") };
+        if tooltip != shown.tooltip {
+            let _ = t.set_tooltip(Some(&tooltip));
+            shown.tooltip = tooltip;
+        }
+        let items = m.menu();
+        let mut key = String::new();
+        fingerprint(&items, &mut key);
+        if key != shown.menu {
+            let menu = Menu::new();
+            clicks.clear();
+            add(items, &|i| {
+                let _ = menu.append(i);
+            }, clicks);
+            t.set_menu(Some(Box::new(menu)));
+            shown.menu = key;
+        }
+    }
+
+    /// The menu as text (labels and states), to tell whether it changed.
+    fn fingerprint(items: &[Item], out: &mut String) {
+        for it in items {
+            match it {
+                Item::Label(l) => *out += &format!("L{l}\n"),
+                Item::Separator => *out += "-\n",
+                Item::Action { label, enabled, .. } => *out += &format!("A{label}{enabled}\n"),
+                Item::Check { label, checked, enabled, .. } => *out += &format!("C{label}{checked}{enabled}\n"),
+                Item::Radio { options, selected } => {
+                    *out += &format!("R{selected}\n");
+                    options.iter().for_each(|(l, _)| *out += &format!("{l}\n"));
+                }
+                Item::Sub { label, items, .. } => {
+                    *out += &format!("S{label}[\n");
+                    fingerprint(items, out);
+                    *out += "]\n";
+                }
+            }
+        }
+    }
+
+    /// Menu items through `push`. Menu item icons (theme names) are Linux-only for now: not shown here.
+    fn add(items: Vec<Item>, push: &dyn Fn(&dyn IsMenuItem), clicks: &mut HashMap<MenuId, Click>) {
+        for it in items {
+            match it {
+                Item::Label(label) => push(&MenuItem::new(label, false, None)),
+                Item::Separator => push(&PredefinedMenuItem::separator()),
+                Item::Action { label, enabled, click, .. } => {
+                    let i = MenuItem::new(label, enabled, None);
+                    clicks.insert(i.id().clone(), click);
+                    push(&i);
+                }
+                Item::Check { label, checked, enabled, click } => {
+                    let i = CheckMenuItem::new(label, enabled, checked, None);
+                    clicks.insert(i.id().clone(), click);
+                    push(&i);
+                }
+                // No radio items in muda: checkmarks, one checked.
+                Item::Radio { options, selected } => {
+                    for (n, (label, click)) in options.into_iter().enumerate() {
+                        let i = CheckMenuItem::new(label, true, n == selected, None);
+                        clicks.insert(i.id().clone(), click);
+                        push(&i);
+                    }
+                }
+                Item::Sub { label, items, .. } => {
+                    let s = Submenu::new(label, true);
+                    add(items, &|i| {
+                        let _ = s.append(i);
+                    }, clicks);
+                    push(&s);
+                }
+            }
         }
     }
 }

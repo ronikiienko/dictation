@@ -45,6 +45,8 @@ evdev = "0.13.2"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 enigo = "0.6.1"
+tao = "0.37.3"
+tray-icon = "0.26.1"
 
 [profile.release]
 debug = 1
