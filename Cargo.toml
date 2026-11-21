@@ -23,7 +23,6 @@ arboard = { version = "3.7.0", default-features = false, features = ["wayland-da
 ashpd = { version = "0.14.1", default-features = false, features = ["tokio", "global_shortcuts"] }
 cpal = { version = "0.18.2", features = ["pulseaudio"] }
 directories = "6.0.0"
-evdev = "0.13.2"
 futures-util = "0.3.34"
 hound = "3"
 jiff = "1.0.1"
@@ -39,6 +38,13 @@ sha2 = "0.11.1"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
 toml = "1.2.1"
 ureq = "3.5.2"
+
+# Paste keys: Linux uses its own virtual keyboard (/dev/uinput, works on X11 and Wayland); elsewhere enigo.
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.13.2"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+enigo = "0.6.1"
 
 [profile.release]
 debug = 1

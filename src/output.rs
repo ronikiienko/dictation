@@ -1,41 +1,84 @@
 //! Getting text into the focused window: clipboard via arboard (cross-platform; on Wayland the data-control
-//! protocol, on X11/Windows/macOS their native clipboards), paste keys via a virtual keyboard on /dev/uinput
-//! (Linux; KDE gives the logged-in user write access). Plus desktop notifications.
-use evdev::{AttributeSet, EventType, InputEvent, KeyCode, uinput::VirtualDevice};
-use std::time::Duration;
+//! protocol, on X11/Windows/macOS their native clipboards), paste keys via a virtual keyboard: on Linux our own on
+//! /dev/uinput (works on X11 and Wayland; KDE gives the logged-in user write access), elsewhere enigo. Plus desktop
+//! notifications.
+pub use keyboard::Keyboard;
 
-use crate::config::PasteKeys;
+#[cfg(target_os = "linux")]
+mod keyboard {
+    use crate::config::PasteKeys;
+    use evdev::{AttributeSet, EventType, InputEvent, KeyCode, uinput::VirtualDevice};
+    use std::time::Duration;
 
-pub struct Keyboard(VirtualDevice);
+    pub struct Keyboard(VirtualDevice);
 
-impl Keyboard {
-    pub fn new() -> std::io::Result<Keyboard> {
-        let mut keys = AttributeSet::<KeyCode>::new();
-        for k in [KeyCode::KEY_LEFTCTRL, KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_V, KeyCode::KEY_INSERT] {
-            keys.insert(k);
+    impl Keyboard {
+        pub fn new() -> std::io::Result<Keyboard> {
+            let mut keys = AttributeSet::<KeyCode>::new();
+            for k in [KeyCode::KEY_LEFTCTRL, KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_V, KeyCode::KEY_INSERT] {
+                keys.insert(k);
+            }
+            let dev = VirtualDevice::builder()?.name("dictation-keyboard").with_keys(&keys)?.build()?;
+            Ok(Keyboard(dev))
         }
-        let dev = VirtualDevice::builder()?.name("dictation-keyboard").with_keys(&keys)?.build()?;
-        Ok(Keyboard(dev))
+
+        fn key(&mut self, k: KeyCode, down: bool) -> std::io::Result<()> {
+            self.0.emit(&[InputEvent::new(EventType::KEY.0, k.code(), down as i32)])
+        }
+
+        pub fn paste(&mut self, keys: PasteKeys) -> std::io::Result<()> {
+            let combo: &[KeyCode] = match keys {
+                PasteKeys::CtrlV => &[KeyCode::KEY_LEFTCTRL, KeyCode::KEY_V],
+                PasteKeys::CtrlShiftV => &[KeyCode::KEY_LEFTCTRL, KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_V],
+                PasteKeys::ShiftInsert => &[KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_INSERT],
+            };
+            for &k in combo {
+                self.key(k, true)?;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            for &k in combo.iter().rev() {
+                self.key(k, false)?;
+            }
+            Ok(())
+        }
     }
+}
 
-    fn key(&mut self, k: KeyCode, down: bool) -> std::io::Result<()> {
-        self.0.emit(&[InputEvent::new(EventType::KEY.0, k.code(), down as i32)])
-    }
+#[cfg(not(target_os = "linux"))]
+mod keyboard {
+    use crate::config::PasteKeys;
+    use enigo::{Direction, Enigo, Key, Keyboard as _, Settings};
+    use std::time::Duration;
 
-    pub fn paste(&mut self, keys: PasteKeys) -> std::io::Result<()> {
-        let combo: &[KeyCode] = match keys {
-            PasteKeys::CtrlV => &[KeyCode::KEY_LEFTCTRL, KeyCode::KEY_V],
-            PasteKeys::CtrlShiftV => &[KeyCode::KEY_LEFTCTRL, KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_V],
-            PasteKeys::ShiftInsert => &[KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_INSERT],
-        };
-        for &k in combo {
-            self.key(k, true)?;
+    pub struct Keyboard(Enigo);
+
+    impl Keyboard {
+        pub fn new() -> std::io::Result<Keyboard> {
+            Enigo::new(&Settings::default()).map(Keyboard).map_err(std::io::Error::other)
         }
-        std::thread::sleep(Duration::from_millis(20));
-        for &k in combo.iter().rev() {
-            self.key(k, false)?;
+
+        pub fn paste(&mut self, keys: PasteKeys) -> std::io::Result<()> {
+            // macOS: Cmd+V pastes everywhere, terminals included (and there is no Insert key).
+            #[cfg(target_os = "macos")]
+            let combo: &[Key] = {
+                let _ = keys;
+                &[Key::Meta, Key::Unicode('v')]
+            };
+            #[cfg(not(target_os = "macos"))]
+            let combo: &[Key] = match keys {
+                PasteKeys::CtrlV => &[Key::Control, Key::Unicode('v')],
+                PasteKeys::CtrlShiftV => &[Key::Control, Key::Shift, Key::Unicode('v')],
+                PasteKeys::ShiftInsert => &[Key::Shift, Key::Insert],
+            };
+            for &k in combo {
+                self.0.key(k, Direction::Press).map_err(std::io::Error::other)?;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            for &k in combo.iter().rev() {
+                self.0.key(k, Direction::Release).map_err(std::io::Error::other)?;
+            }
+            Ok(())
         }
-        Ok(())
     }
 }
 
