@@ -1063,16 +1063,12 @@ async fn main_loop(
                                 }
                             }
                         }
-                        let body = if t.text.chars().count() > 200 { t.text.chars().take(200).collect::<String>() + "…" } else { t.text.clone() };
-                        let title = match (t.text.is_empty(), cfg.output) {
-                            (true, _) => "Nothing recognized",
-                            (false, Output::Paste) => "Pasted",
-                            (false, Output::Clipboard) => "Copied to clipboard",
-                        };
+                        // Only when something needs attention: a working take shows its result by itself (pasted or
+                        // on the clipboard), a notification on every take was just noise (user, 2026-11-20).
                         if let Some((title, body)) = problem {
                             notice.show(title, &body, "dialog-error").await;
-                        } else if state != State::Recording {
-                            notice.show(title, &body, if t.text.is_empty() { "dialog-information" } else { "dialog-ok" }).await;
+                        } else if t.text.is_empty() && state != State::Recording {
+                            notice.show("Nothing recognized", "", "dialog-information").await;
                         }
                         println!("{:.1}s audio, {:.0} ms: {}", t.audio.len() as f64 / RATE as f64, t.ms, t.text);
                         if cfg.save_recordings {

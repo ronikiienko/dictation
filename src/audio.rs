@@ -167,11 +167,18 @@ fn cue_samples(cue: Cue) -> Vec<f32> {
     note(a, 0.07).chain(std::iter::repeat_n(0.0, CUE_RATE as usize / 50)).chain(note(b, 0.09)).collect()
 }
 
-/// Play a cue without blocking (the output device is opened only while it plays).
+/// Play a cue without blocking (the output device is opened only while it plays). If rodio's default (a fixed buffer
+/// of ~50 ms, 2048 frames at 44.1 kHz) is refused, the device picks its own buffer size: Bluetooth headphones in
+/// headset mode (switched to it as soon as their mic records, so at every start cue) allow 14..=1024 frames.
 pub fn play(cue: Cue) {
     std::thread::spawn(move || {
+        let open = || {
+            rodio::DeviceSinkBuilder::open_default_sink().or_else(|_| {
+                rodio::DeviceSinkBuilder::from_default_device()?.with_buffer_size(cpal::BufferSize::Default).open_stream()
+            })
+        };
         let run = || -> Result<(), Box<dyn std::error::Error>> {
-            let mut sink = rodio::DeviceSinkBuilder::open_default_sink()?;
+            let mut sink = open()?;
             sink.log_on_drop(false);
             let player = rodio::Player::connect_new(sink.mixer());
             let rate = std::num::NonZero::new(CUE_RATE).unwrap();
@@ -180,7 +187,13 @@ pub fn play(cue: Cue) {
             Ok(())
         };
         if let Err(e) = run() {
-            eprintln!("sound {cue:?}: {e}");
+            let mut msg = e.to_string();
+            let mut src = e.source();
+            while let Some(s) = src {
+                msg += &format!(": {s}");
+                src = s.source();
+            }
+            eprintln!("sound {cue:?}: {msg}");
         }
     });
 }
