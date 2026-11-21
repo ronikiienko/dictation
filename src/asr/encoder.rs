@@ -206,6 +206,12 @@ pub struct PreEncode {
     low: FloatDType,
 }
 
+/// The subsampler runs this many mel frames (5 s) at a time, everywhere (pieces and the pause scan). Same result as
+/// all at once (each output frame sees only nearby mel frames); its largest buffer, the first conv's f32 output
+/// (256 ch x 64 freq per 20 ms), is ~18 MB instead of ~100 MB for a 30 s piece. Measured 2026-11-20: peak VRAM over
+/// 8 takes 1092 -> 951 MiB, texts identical, same speed on NVIDIA and the AMD iGPU.
+pub const PRE_CHUNK: usize = 500;
+
 /// Output length of a k=3, s=2, p=1 conv.
 pub fn stride2(l: usize) -> usize {
     (l - 1) / 2 + 1
@@ -314,7 +320,7 @@ impl Encoder {
     /// subsampler, which equals transcribe.cpp's key-padding + conv masks (relative positions don't depend on T).
     pub fn fwd(&self, mel: Tensor<2>, n_samples: usize) -> Tensor<2> {
         let len = valid_lengths(n_samples, 160);
-        let mut x = self.pre.fwd(mel, len);
+        let mut x = self.pre.fwd_chunked(mel, len, PRE_CHUNK);
         let t = x.dims()[0].min(len[3]);
         if t < x.dims()[0] {
             x = x.narrow(0, 0, t);

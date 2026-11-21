@@ -1,17 +1,13 @@
 //! Whole pipeline: pcm (16 kHz mono f32) -> text. Mel and decoder on the CPU, encoder + pause head on the GPU.
 //! Order of steps follows transcribe.cpp `src/arch/parakeet/model.cpp` (MIT, (c) 2026 The transcribe.cpp authors).
 use super::decoder::Decoder;
-use super::encoder::{valid_lengths, Encoder, Ld, Vad};
+use super::encoder::{valid_lengths, Encoder, Ld, Vad, PRE_CHUNK};
 use super::weights::Weights;
 use super::longform::{self, Params};
 use super::mel::Mel;
 use super::tokenizer::Tokenizer;
 use burn::tensor::{DType, Device, FloatDType, Tensor, TensorData};
 use std::time::Instant;
-
-/// Pause scan: the subsampler runs this many mel frames (30 s) at a time inside a 120 s scan block. Same result as
-/// the whole block at once, ~600 MB less VRAM at the peak.
-const SCAN_CHUNK: usize = 3000;
 
 pub struct Model {
     dev: Device,
@@ -122,7 +118,7 @@ impl Model {
     /// Speech probability per encoder frame for one block (subsampler + pause head only).
     fn speech_probs(&self, pcm: &[f32]) -> Vec<f32> {
         let len = valid_lengths(pcm.len(), self.hop);
-        let x = self.enc.pre.fwd_chunked(self.mel_tensor(pcm), len, SCAN_CHUNK);
+        let x = self.enc.pre.fwd_chunked(self.mel_tensor(pcm), len, PRE_CHUNK);
         let p = self.vad.fwd(x).into_data().convert::<f32>().try_into_vec::<f32>().unwrap();
         p[..p.len().min(len[3])].to_vec()
     }

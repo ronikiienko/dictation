@@ -30,6 +30,16 @@ fn guard<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     })
 }
 
+/// Test only: what the GPU allocator holds (in use / reserved, per pool), in MB.
+pub fn mem_report() -> String {
+    let d = Device::vulkan(DeviceKind::DefaultDevice);
+    let mb = |b: u64| b as f64 / 1e6;
+    let u = d.memory_pool_usage().unwrap_or_default();
+    let pools: Vec<String> = d.memory_pool_report().unwrap_or_default().iter()
+        .map(|p| format!("{}x{:.1}(peak {}, max alloc {:.1})", p.pages, mb(p.page_size), p.pages_peak, mb(p.largest_alloc))).collect();
+    format!("in use {:.0} reserved {:.0} allocs {} | pools {}", mb(u.bytes_in_use), mb(u.bytes_reserved), u.number_allocs, pools.join(" "))
+}
+
 /// Where CubeCL keeps its kernel cache (compiled SPIR-V + autotune results): `kernels/<GPU name>/`, next to the
 /// model. One folder per GPU because CubeCL files autotune results under "the default device", not under the GPU:
 /// with one shared cache, a second GPU would reuse the first one's picks (an NVIDIA matmul pick crashed the AMD iGPU).
@@ -46,11 +56,13 @@ fn gpu_dir(kernels: &Path) -> std::path::PathBuf {
     kernels.join(gpu().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>())
 }
 
-/// What a sweep's results depend on: the build (kernels, see build.rs) and whether it tunes.
+/// What a sweep's results depend on: the build (kernels, see build.rs), the tensor shapes our code produces (the
+/// "shapes N" version: bump it when they change, e.g. a new chunk size, so the new shapes get compiled and tuned
+/// once instead of during takes) and whether it tunes.
 #[cfg(feature = "autotune")]
-const SWEEP_KEY: &str = concat!(env!("DICTATION_BUILD_KEY"), " tuned");
+const SWEEP_KEY: &str = concat!(env!("DICTATION_BUILD_KEY"), " shapes ", "2", " tuned");
 #[cfg(not(feature = "autotune"))]
-const SWEEP_KEY: &str = env!("DICTATION_BUILD_KEY");
+const SWEEP_KEY: &str = concat!(env!("DICTATION_BUILD_KEY"), " shapes ", "2");
 
 /// Whether this GPU's kernel cache already holds a full sweep for this build (`Asr::sweep` + `mark_swept`).
 pub fn swept(kernels: &Path) -> bool {

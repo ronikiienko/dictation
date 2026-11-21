@@ -44,6 +44,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let t = Instant::now();
         let (text, s) = a.run(&x)?;
+        if std::env::var("MEMSTEP").is_ok() {
+            // MEMSTEP=1: this process's VRAM (nvidia-smi) and the GPU pool after each take.
+            let smi = std::process::Command::new("nvidia-smi").args(["--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"]).output().unwrap();
+            let me = String::from_utf8_lossy(&smi.stdout).lines().find(|l| l.starts_with(&format!("{},", std::process::id()))).map(|l| l.split(',').nth(1).unwrap().trim().to_string());
+            eprintln!("{:6.1} s take -> VRAM {} MiB | {}", x.len() as f64 / RATE as f64, me.unwrap_or_default(), asr::mem_report());
+        }
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         println!("{}", json!({"wav": path.file_name().unwrap().to_string_lossy(), "seconds": x.len() as f64 / RATE as f64,
             "asr_ms": ms.round(), "mel_ms": s.mel.round(), "pauses_ms": s.vad.round(), "encoder_ms": s.enc.round(),
@@ -55,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let smi = std::process::Command::new("nvidia-smi").args(["--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"]).output().unwrap();
             let me = String::from_utf8_lossy(&smi.stdout).lines().find(|l| l.starts_with(&format!("{},", std::process::id()))).map(|l| l.to_string());
             let pm = std::fs::read_to_string("/sys/bus/pci/devices/0000:01:00.0/power/runtime_status").unwrap_or_default();
-            format!("VRAM of this process: {:?} MiB; GPU power: {}", me.map(|l| l.split(',').nth(1).unwrap().trim().to_string()), pm.trim())
+            format!("VRAM of this process: {:?} MiB; GPU power: {}\n    pool: {}", me.map(|l| l.split(',').nth(1).unwrap().trim().to_string()), pm.trim(), asr::mem_report())
         };
         eprintln!("loaded:        {}", status());
         drop(a);
