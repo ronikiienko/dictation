@@ -191,8 +191,9 @@ impl Decoder {
         }
     }
 
-    /// Greedy TDT over `enc_proj` = [T][joint_h] (encoder frames already through joint.enc). Returns token ids.
-    pub fn decode(&self, enc_proj: &[f32], t_enc: usize) -> Vec<usize> {
+    /// Greedy TDT over `enc_proj` = [T][joint_h] (encoder frames already through joint.enc). Returns token ids, each
+    /// with the encoder frame it was emitted at (its time: frame x 80 ms; for subtitles).
+    pub fn decode(&self, enc_proj: &[f32], t_enc: usize) -> Vec<(usize, usize)> {
         let (h, jh) = (self.hidden, self.joint_h);
         let n_out = self.out_b.len();
         let zero = State { h: vec![vec![0.0; h]; self.lstm.len()], c: vec![vec![0.0; h]; self.lstm.len()] };
@@ -225,7 +226,7 @@ impl Decoder {
             let duration = self.durations[argmax(&logits[self.vocab..])];
             let blank = tok == self.blank;
             if !blank {
-                out.push(tok);
+                out.push((tok, step));
                 last = Some(tok);
                 std::mem::swap(&mut state, &mut next);
                 dirty = true;

@@ -19,7 +19,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
 pub use live::Live;
-pub use pipeline::Timing;
+pub use pipeline::{Timing, Word};
 pub use weights::{convert, is_current};
 
 /// burn reports GPU failures (out of memory, lost device, ...) by panicking: turn them into errors.
@@ -257,6 +257,15 @@ impl Asr {
     pub fn first_cut(&mut self, pcm: &[f32]) -> Result<usize, String> {
         let m = self.model.as_ref().ok_or("model not loaded")?;
         guard(|| Ok(m.first_cut(pcm)))
+    }
+
+    /// `run` with each word's time (subtitles).
+    pub fn run_words(&mut self, pcm: &[f32]) -> Result<(Vec<Word>, Timing), String> {
+        if pcm.is_empty() {
+            return Ok((Vec::new(), Timing::default()));
+        }
+        let m = self.model.as_ref().ok_or("model not loaded")?;
+        guard(|| Ok(m.transcribe_words(pcm)))
     }
 
     pub fn run(&mut self, pcm: &[f32]) -> Result<(String, Timing), String> {

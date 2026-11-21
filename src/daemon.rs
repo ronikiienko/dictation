@@ -50,12 +50,12 @@ pub enum Ev {
     ShortcutFailed(String),
     EngineLoaded(Result<String, String>),
     Done(Result<Take, String>),
-    /// `dictation transcribe <file>`: the file's audio (media::read) -> text back to the command.
-    File(Vec<f32>, tokio::sync::oneshot::Sender<Result<String, String>>),
+    /// A file's audio (media::read) -> its text, or subtitles (.srt content) if `srt`, back to the sender.
+    File(Vec<f32>, bool, tokio::sync::oneshot::Sender<Result<String, String>>),
     /// A file's text was sent back.
     FileDone,
-    /// Tray "Transcribe a file…": pick files, each one's text saved next to it.
-    PickFiles,
+    /// Tray "Transcribe a file": pick files, each one's text (or subtitles if true) saved next to it.
+    PickFiles(bool),
     /// One picked file done: (file name, the .txt written) or what went wrong.
     FileSaved(Result<(String, std::path::PathBuf), String>),
     /// Every 300 ms: in live mode, re-transcribe if enough new audio is in.
@@ -103,8 +103,8 @@ enum Job {
     Sweep { weights: std::path::PathBuf, kernels: std::path::PathBuf },
     Unload,
     Transcribe(Vec<f32>),
-    /// A file (`dictation transcribe`): the text goes straight back to the command, then Ev::FileDone.
-    File(Vec<f32>, tokio::sync::oneshot::Sender<Result<String, String>>),
+    /// A file: the text (`srt`: subtitles) goes straight back to the sender, then Ev::FileDone.
+    File(Vec<f32>, bool, tokio::sync::oneshot::Sender<Result<String, String>>),
     /// Live mode (paste while speaking): a take starts.
     LiveStart,
     /// Live mode: everything recorded so far -> Ev::Live with newly agreed words.
@@ -172,9 +172,10 @@ fn engine(jobs: std_mpsc::Receiver<Job>, ev: mpsc::UnboundedSender<Ev>) {
                 }
                 let _ = ev.send(Ev::Done(r.map(|(text, _)| Take { audio: x, paste: text.clone(), text, ms })));
             }
-            Job::File(x, reply) => {
+            Job::File(x, srt, reply) => {
                 let t = Instant::now();
                 let r = match model.as_mut() {
+                    Some(a) if srt => a.run_words(&x).map(|(w, s)| (crate::subtitles::srt(&w), s)),
                     Some(a) => a.run(&x),
                     None => Err("model not loaded".into()),
                 };
@@ -410,10 +411,20 @@ impl tray::Model for Tray {
                 enabled: matches!(self.state, State::Idle | State::Recording | State::Transcribing),
                 click: self.send(|| Ev::Toggle),
             },
-            Action {
-                label: "Transcribe a file…".into(),
-                enabled: matches!(self.state, State::Idle | State::Recording | State::Transcribing),
-                click: self.send(|| Ev::PickFiles),
+            Sub {
+                label: "Transcribe a file".into(),
+                items: vec![
+                    Action {
+                        label: "As text (.txt)…".into(),
+                        enabled: matches!(self.state, State::Idle | State::Recording | State::Transcribing),
+                        click: self.send(|| Ev::PickFiles(false)),
+                    },
+                    Action {
+                        label: "As subtitles (.srt)…".into(),
+                        enabled: matches!(self.state, State::Idle | State::Recording | State::Transcribing),
+                        click: self.send(|| Ev::PickFiles(true)),
+                    },
+                ],
             },
             Separator,
             Sub {
@@ -618,13 +629,14 @@ async fn socket_task(tx: mpsc::UnboundedSender<Ev>, status: tokio::sync::watch::
             let reply = match line.trim() {
                 "toggle" => tx.send(Ev::Toggle).map(|_| "ok".to_string()),
                 "status" => Ok(status.borrow().clone()),
-                // -> {"text": ...} or {"error": ...}
-                l if l.starts_with("transcribe ") => {
-                    let path = std::path::PathBuf::from(&l["transcribe ".len()..]);
+                // "transcribe <path>" / "subtitles <path>" -> {"text": ...} (.srt content for subtitles) or {"error": ...}
+                l if l.starts_with("transcribe ") || l.starts_with("subtitles ") => {
+                    let (cmd, path) = l.split_once(' ').unwrap();
+                    let (srt, path) = (cmd == "subtitles", std::path::PathBuf::from(path));
                     let r = match tokio::task::spawn_blocking(move || crate::media::read(&path)).await {
                         Ok(Ok(x)) => {
                             let (reply, back) = tokio::sync::oneshot::channel();
-                            match tx.send(Ev::File(x, reply)) {
+                            match tx.send(Ev::File(x, srt, reply)) {
                                 Ok(()) => back.await.unwrap_or_else(|_| Err("the app stopped".into())),
                                 Err(_) => Err("the app is shutting down".into()),
                             }
@@ -649,12 +661,12 @@ async fn socket_task(tx: mpsc::UnboundedSender<Ev>, status: tokio::sync::watch::
 /// Extensions offered in the file picker (media::read reads by content; "All files" is offered too).
 const MEDIA_EXT: &[&str] = &["wav", "mp3", "flac", "ogg", "oga", "m4a", "aac", "mp4", "m4v", "mov", "mkv", "webm", "aif", "aiff", "caf"];
 
-/// Tray "Transcribe a file…": the system's file picker, then each file in turn: decoded here, transcribed by the
-/// engine (Ev::File, as `dictation transcribe`), the text saved as <name>.txt next to it (never over an existing
-/// file) and opened in the default text editor.
-async fn pick_files(tx: mpsc::UnboundedSender<Ev>) {
+/// Tray "Transcribe a file": the system's file picker, then each file in turn: decoded here, transcribed by the
+/// engine (Ev::File, as `dictation transcribe`), saved next to it (never over an existing file): text as <name>.txt,
+/// opened in the default editor; subtitles as <name>.srt (what video players look for), shown in the file manager.
+async fn pick_files(tx: mpsc::UnboundedSender<Ev>, srt: bool) {
     let picked = rfd::AsyncFileDialog::new()
-        .set_title("Transcribe audio or video")
+        .set_title(if srt { "Make subtitles for audio or video" } else { "Transcribe audio or video" })
         .add_filter("Audio and video", MEDIA_EXT)
         .add_filter("All files", &["*"])
         .pick_files()
@@ -666,7 +678,7 @@ async fn pick_files(tx: mpsc::UnboundedSender<Ev>) {
         let r = match tokio::task::spawn_blocking(move || crate::media::read(&p)).await {
             Ok(Ok(x)) => {
                 let (reply, back) = tokio::sync::oneshot::channel();
-                if tx.send(Ev::File(x, reply)).is_err() {
+                if tx.send(Ev::File(x, srt, reply)).is_err() {
                     return;
                 }
                 back.await.unwrap_or_else(|_| Err("the app stopped".into()))
@@ -675,15 +687,26 @@ async fn pick_files(tx: mpsc::UnboundedSender<Ev>) {
             Err(e) => Err(e.to_string()),
         };
         let r = r.and_then(|text| {
-            let txt = free_name(&path.with_extension("txt"));
-            std::fs::write(&txt, format!("{text}\n")).map_err(|e| format!("{}: {e}", txt.display()))?;
-            if let Err(e) = open::that_detached(&txt) {
+            let txt = free_name(&path.with_extension(if srt { "srt" } else { "txt" }));
+            let body = if srt { text } else { format!("{text}\n") };
+            std::fs::write(&txt, body).map_err(|e| format!("{}: {e}", txt.display()))?;
+            if let Err(e) = if srt { reveal(&txt) } else { open::that_detached(&txt) } {
                 eprintln!("open {}: {e}", txt.display());
             }
             Ok((name.clone(), txt))
         });
         let _ = tx.send(Ev::FileSaved(r.map_err(|e| format!("{name}: {e}"))));
     }
+}
+
+/// Show a file in the file manager (selected where the OS can: macOS Finder, Windows Explorer; Linux: its folder).
+fn reveal(p: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    return std::process::Command::new("/usr/bin/open").arg("-R").arg(p).spawn().map(drop);
+    #[cfg(windows)]
+    return std::process::Command::new("explorer").arg(format!("/select,{}", p.display())).spawn().map(drop);
+    #[cfg(not(any(target_os = "macos", windows)))]
+    open::that_detached(p.parent().unwrap_or(p))
 }
 
 /// `p`, or "<stem> (2).txt", "(3)", ... if taken.
@@ -1061,7 +1084,7 @@ async fn main_loop(
                     Err(e) => notice.show("Transcription failed", &e, "dialog-error").await,
                 }
             }
-            Ev::File(x, reply) => {
+            Ev::File(x, srt, reply) => {
                 if matches!(state, State::NoModel | State::Optimizing) {
                     let why = if state == State::NoModel { "no model yet: download it from the tray menu" } else { "still tuning for the GPU (see the tray menu); try again when it's done" };
                     let _ = reply.send(Err(why.into()));
@@ -1071,15 +1094,15 @@ async fn main_loop(
                         load(&mut mem);
                     }
                     busy += 1;
-                    let _ = jobs.send(Job::File(x, reply));
+                    let _ = jobs.send(Job::File(x, srt, reply));
                     if state == State::Idle {
                         state = State::Transcribing;
                     }
                     last_used = Instant::now();
                 }
             }
-            Ev::PickFiles => {
-                tokio::spawn(pick_files(tx.clone()));
+            Ev::PickFiles(srt) => {
+                tokio::spawn(pick_files(tx.clone(), srt));
             }
             Ev::FileSaved(r) => match r {
                 Ok((name, txt)) => {
@@ -1087,7 +1110,10 @@ async fn main_loop(
                     let shown = txt.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
                     notice.show(&format!("Transcribed {name}"), &format!("Saved as {shown}"), "dialog-ok").await;
                 }
-                Err(e) => notice.show("File not transcribed", &e, "dialog-error").await,
+                Err(e) => {
+                    eprintln!("file: {e}");
+                    notice.show("File not transcribed", &e, "dialog-error").await
+                }
             },
             Ev::FileDone => {
                 busy = busy.saturating_sub(1);

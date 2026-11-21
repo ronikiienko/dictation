@@ -1,8 +1,8 @@
 //! dictation — offline dictation for KDE Wayland (Parakeet Ultra, own Rust port on burn: Vulkan, macOS Metal). Settings are in the tray menu.
 //!   dictation            run the tray app
 //!   dictation toggle     start / stop a take in the running app (for a custom shortcut or scripts)
-//!   dictation transcribe <file>...   text of audio/video files on stdout (by the running app if there is one,
-//!                        else loads the model itself)
+//!   dictation transcribe [--srt] <file>...   text (or subtitles, .srt format) of audio/video files on stdout (by
+//!                        the running app if there is one, else loads the model itself)
 //!   dictation sweep      compile (and tune, if enabled) GPU kernels for every take length ahead of time. The tray
 //!                        app does this by itself (once per GPU, again only after Cargo.lock or rustc change)
 // Windows: a tray app, not a console program (no black console window next to it; closing that would kill the app).
@@ -30,7 +30,7 @@ fn sweep(full: bool) -> Result<(), String> {
 
 /// Each file's text on stdout (a `# name` line before each if there are several); progress and errors on stderr.
 /// The running app does the work if it's there (its model, maybe loaded already; no second copy in memory).
-fn transcribe(files: &[&str]) -> Result<(), String> {
+fn transcribe(files: &[&str], srt: bool) -> Result<(), String> {
     let mut paths = Vec::new();
     for f in files {
         let p = Path::new(f).canonicalize().map_err(|e| format!("{f}: {e}"))?;
@@ -45,14 +45,16 @@ fn transcribe(files: &[&str]) -> Result<(), String> {
         if files.len() > 1 {
             println!("# {f}");
         }
-        let r = match daemon::request(&format!("transcribe {}", p.display()), None) {
+        let cmd = if srt { "subtitles" } else { "transcribe" };
+        let r = match daemon::request(&format!("{cmd} {}", p.display()), None) {
             Ok(line) => serde_json::from_str::<serde_json::Value>(&line).map_err(|e| e.to_string()).and_then(|v| match v["text"].as_str() {
                 Some(t) => Ok(t.to_string()),
                 None => Err(v["error"].as_str().unwrap_or(&line).to_string()),
             }),
-            Err(_) => run_here(p, &mut local),
+            Err(_) => run_here(p, srt, &mut local),
         };
         match r {
+            Ok(t) if srt => print!("{t}"),
             Ok(t) => println!("{t}"),
             Err(e) => {
                 eprintln!("{e}");
@@ -68,7 +70,7 @@ fn transcribe(files: &[&str]) -> Result<(), String> {
 }
 
 /// The app isn't running: decode and transcribe in this process (model loaded on the first file).
-fn run_here(p: &PathBuf, local: &mut Option<asr::Asr>) -> Result<String, String> {
+fn run_here(p: &PathBuf, srt: bool, local: &mut Option<asr::Asr>) -> Result<String, String> {
     let x = media::read(p)?;
     let a = match local {
         Some(a) => a,
@@ -82,7 +84,7 @@ fn run_here(p: &PathBuf, local: &mut Option<asr::Asr>) -> Result<String, String>
         }
     };
     let t = std::time::Instant::now();
-    let (text, _) = a.run(&x)?;
+    let text = if srt { dictation::subtitles::srt(&a.run_words(&x)?.0) } else { a.run(&x)?.0 };
     eprintln!("{:.1} s of audio in {:.1} s", x.len() as f64 / RATE as f64, t.elapsed().as_secs_f64());
     Ok(text)
 }
@@ -100,8 +102,9 @@ fn main() {
         },
         ["sweep"] => sweep(false).map_err(Into::into),
         ["sweep", "full"] => sweep(true).map_err(Into::into),
-        ["transcribe", files @ ..] if !files.is_empty() => transcribe(files).map_err(Into::into),
-        _ => Err("usage: dictation [toggle | sweep | transcribe <file>...]".into()),
+        ["transcribe", "--srt", files @ ..] if !files.is_empty() => transcribe(files, true).map_err(Into::into),
+        ["transcribe", files @ ..] if !files.is_empty() => transcribe(files, false).map_err(Into::into),
+        _ => Err("usage: dictation [toggle | sweep | transcribe [--srt] <file>...]".into()),
     };
     if let Err(e) = r {
         if !e.to_string().is_empty() {

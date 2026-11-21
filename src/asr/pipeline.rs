@@ -21,6 +21,15 @@ pub struct Model {
     hop: usize,
 }
 
+/// A recognized word and when it was said (seconds from the start of the audio; `end` = start of its last piece +
+/// one 80 ms frame).
+#[derive(Debug, Clone)]
+pub struct Word {
+    pub text: String,
+    pub start: f64,
+    pub end: f64,
+}
+
 /// Time spent per stage, milliseconds.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct Timing {
@@ -102,17 +111,48 @@ impl Model {
         (v, n)
     }
 
-    /// One piece (<= 30 s).
-    fn one_shot(&self, pcm: &[f32], t: &mut Timing) -> String {
+    /// One piece (<= 30 s) -> tokens with their encoder frames.
+    fn one_shot_tokens(&self, pcm: &[f32], t: &mut Timing) -> Vec<(usize, usize)> {
         if pcm.len() < self.lf.min_feature_samples {
-            return String::new();
+            return Vec::new();
         }
         let (proj, n) = self.encode(pcm, t);
         let t0 = Instant::now();
-        let ids = self.dec.decode(&proj, n);
-        let text = self.tok.decode(&ids);
+        let toks = self.dec.decode(&proj, n);
         t.dec += t0.elapsed().as_secs_f64() * 1e3;
-        text
+        toks
+    }
+
+    /// One piece (<= 30 s).
+    fn one_shot(&self, pcm: &[f32], t: &mut Timing) -> String {
+        let ids: Vec<usize> = self.one_shot_tokens(pcm, t).into_iter().map(|(id, _)| id).collect();
+        self.tok.decode(&ids)
+    }
+
+    /// Like `transcribe`, but words with times (for subtitles). Same pieces, so the same text.
+    pub fn transcribe_words(&self, pcm: &[f32]) -> (Vec<Word>, Timing) {
+        let mut t = Timing::default();
+        let segs = if self.lf.fits_one_segment(pcm.len()) {
+            vec![(0, pcm.len())]
+        } else {
+            let t0 = Instant::now();
+            let s = self.segments(pcm);
+            t.vad = t0.elapsed().as_secs_f64() * 1e3;
+            s
+        };
+        let (rate, frame) = (self.lf.sample_rate as f64, self.lf.frame_seconds);
+        let mut words = Vec::new();
+        for (start, len) in segs {
+            let at = start as f64 / rate;
+            let toks = self.one_shot_tokens(&pcm[start..start + len], &mut t);
+            words.extend(self.tok.words(&toks).into_iter().map(|(text, a, b)| Word {
+                text,
+                start: at + a as f64 * frame,
+                end: at + (b + 1) as f64 * frame,
+            }));
+        }
+        self.dev.memory_cleanup();
+        (words, t)
     }
 
     /// Speech probability per encoder frame for one block (subsampler + pause head only).

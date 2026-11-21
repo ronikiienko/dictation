@@ -33,20 +33,54 @@ impl Tokenizer {
         Tokenizer { pieces, strip }
     }
 
+    /// A piece's bytes ("<0xHH>" -> that byte, U+2581 -> space); None for special pieces.
+    fn bytes(&self, id: usize) -> Option<Vec<u8>> {
+        if id >= self.pieces.len() || self.strip[id] {
+            return None;
+        }
+        let p = &self.pieces[id];
+        if p.len() == 6 && p.starts_with("<0x") && p.ends_with('>') {
+            if let Ok(b) = u8::from_str_radix(&p[3..5], 16) {
+                return Some(vec![b]);
+            }
+        }
+        Some(p.replace('\u{2581}', " ").into_bytes())
+    }
+
+    /// Words with the encoder frames of their first and last piece: a word starts at a piece beginning with U+2581
+    /// (space); punctuation pieces stay with the word before but don't move its end (the model often emits a full
+    /// stop only when the next speech starts). Same text as `decode`, split at its spaces.
+    pub fn words(&self, toks: &[(usize, usize)]) -> Vec<(String, usize, usize)> {
+        let mut out: Vec<(String, usize, usize)> = Vec::new();
+        let (mut cur, mut first, mut last) = (Vec::<u8>::new(), 0, 0);
+        let mut flush = |cur: &mut Vec<u8>, first, last| {
+            let w = String::from_utf8_lossy(cur).trim().to_string();
+            if !w.is_empty() {
+                out.push((w, first, last));
+            }
+            cur.clear();
+        };
+        for &(id, frame) in toks {
+            let Some(b) = self.bytes(id) else { continue };
+            if b.first() == Some(&b' ') && !cur.iter().all(|&c| c == b' ') {
+                flush(&mut cur, first, last);
+            }
+            if cur.iter().all(|&c| c == b' ') {
+                first = frame;
+            }
+            cur.extend_from_slice(&b);
+            if last < first || String::from_utf8_lossy(&b).chars().any(char::is_alphanumeric) {
+                last = frame;
+            }
+        }
+        flush(&mut cur, first, last);
+        out
+    }
+
     pub fn decode(&self, ids: &[usize]) -> String {
         let mut bytes = Vec::new();
         for &id in ids {
-            if id >= self.pieces.len() || self.strip[id] {
-                continue;
-            }
-            let p = &self.pieces[id];
-            if p.len() == 6 && p.starts_with("<0x") && p.ends_with('>') {
-                if let Ok(b) = u8::from_str_radix(&p[3..5], 16) {
-                    bytes.push(b);
-                    continue;
-                }
-            }
-            bytes.extend_from_slice(p.replace('\u{2581}', " ").as_bytes());
+            bytes.extend(self.bytes(id).unwrap_or_default());
         }
         let s = String::from_utf8_lossy(&bytes);
         let mut out = String::with_capacity(s.len());
