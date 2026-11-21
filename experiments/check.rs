@@ -48,7 +48,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // MEMSTEP=1: this process's VRAM (nvidia-smi) and the GPU pool after each take.
             let smi = std::process::Command::new("nvidia-smi").args(["--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"]).output().unwrap();
             let me = String::from_utf8_lossy(&smi.stdout).lines().find(|l| l.starts_with(&format!("{},", std::process::id()))).map(|l| l.split(',').nth(1).unwrap().trim().to_string());
-            eprintln!("{:6.1} s take -> VRAM {} MiB | {}", x.len() as f64 / RATE as f64, me.unwrap_or_default(), asr::mem_report());
+            // No NVIDIA entry (AMD etc.): the kernel's per-client counters, /proc/self/fdinfo drm-memory-vram, once per client.
+            let me = me.unwrap_or_else(|| {
+                let mut seen = std::collections::HashSet::new();
+                let (mut kib, mut gtt) = (0u64, 0u64);
+                for e in std::fs::read_dir("/proc/self/fdinfo").into_iter().flatten().flatten() {
+                    let t = std::fs::read_to_string(e.path()).unwrap_or_default();
+                    let field = |k: &str| t.lines().find(|l| l.starts_with(k)).map(|l| l[k.len()..].trim().to_string());
+                    let num = |v: Option<String>| v.map_or(0, |v| v.trim_end_matches("KiB").trim().parse::<u64>().unwrap_or(0));
+                    if let Some(id) = field("drm-client-id:") {
+                        if field("drm-memory-vram:").is_some() && seen.insert(id) {
+                            kib += num(field("drm-memory-vram:"));
+                            gtt += num(field("drm-memory-gtt:"));
+                        }
+                    }
+                }
+                format!("{} (+ GTT {})", kib / 1024, gtt / 1024)
+            });
+            eprintln!("{:6.1} s take -> VRAM {} MiB | {}", x.len() as f64 / RATE as f64, me, asr::mem_report());
         }
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         println!("{}", json!({"wav": path.file_name().unwrap().to_string_lossy(), "seconds": x.len() as f64 / RATE as f64,
