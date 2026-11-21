@@ -13,7 +13,24 @@ fn read_wav(path: &std::path::Path) -> Result<Vec<f32>, hound::Error> {
     r.samples::<i16>().map(|v| v.map(|v| v as f32 / 32768.0)).collect()
 }
 
+/// LOG=1: CubeCL's log records (debug and up) on stderr.
+struct Log;
+impl log::Log for Log {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        true
+    }
+    fn log(&self, r: &log::Record) {
+        if r.target().starts_with("cubecl") {
+            eprintln!("{} {}: {}", r.level(), r.target(), r.args());
+        }
+    }
+    fn flush(&self) {}
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("LOG").is_ok() {
+        let _ = log::set_logger(&Log).map(|_| log::set_max_level(log::LevelFilter::Debug));
+    }
     let m = &models::MODEL;
     if !m.installed() {
         // Same as the app: finish the download (or take an older version's GGUF), check, convert.
