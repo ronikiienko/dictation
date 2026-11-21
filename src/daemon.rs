@@ -311,14 +311,12 @@ impl tray::Model for Tray {
             Separator,
             Action {
                 label: if recording { "Stop dictation" } else { "Start dictation" }.into(),
-                icon: if recording { "media-playback-stop" } else { "media-record" },
                 enabled: matches!(self.state, State::Idle | State::Recording | State::Transcribing),
                 click: self.send(|| Ev::Toggle),
             },
             Separator,
             Sub {
                 label: "GPU".into(),
-                icon: "video-display",
                 items: vec![
                     Radio { options: gpu_options, selected: gpu_selected },
                     Separator,
@@ -328,7 +326,6 @@ impl tray::Model for Tray {
             },
             Sub {
                 label: "Keep model loaded".into(),
-                icon: "memory",
                 items: vec![
                     Radio {
                         options: KEEP.iter().map(|&(k, l)| (l.to_string(), self.setting(move |c| c.keep_loaded = k))).collect(),
@@ -337,7 +334,6 @@ impl tray::Model for Tray {
                     Separator,
                     Action {
                         label: "Unload now".into(),
-                        icon: "",
                         enabled: self.mem == Mem::Loaded && self.state == State::Idle,
                         click: self.send(|| Ev::UnloadNow),
                     },
@@ -345,7 +341,6 @@ impl tray::Model for Tray {
             },
             Sub {
                 label: "Microphone".into(),
-                icon: "audio-input-microphone",
                 items: vec![Radio {
                     options: self
                         .mics
@@ -360,7 +355,6 @@ impl tray::Model for Tray {
             },
             Sub {
                 label: "Output".into(),
-                icon: "edit-paste",
                 items: vec![
                     Radio {
                         options: outputs
@@ -403,7 +397,6 @@ impl tray::Model for Tray {
             },
             Action {
                 label: "Open app folder…".into(),
-                icon: "folder-open",
                 enabled: true,
                 click: tray::click(|| {
                     if let Err(e) = crate::open_root() {
@@ -413,12 +406,11 @@ impl tray::Model for Tray {
             },
             Action {
                 label: if self.shortcut.is_empty() { "Set shortcut…".into() } else { format!("Change shortcut ({})…", self.shortcut) },
-                icon: "configure-shortcuts",
                 enabled: true,
                 click: self.send(|| Ev::ConfigureShortcut),
             },
             Separator,
-            Action { label: "Quit".into(), icon: "application-exit", enabled: true, click: self.send(|| Ev::Quit) },
+            Action { label: "Quit".into(), enabled: true, click: self.send(|| Ev::Quit) },
         ]
     }
 }

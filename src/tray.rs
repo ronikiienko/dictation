@@ -18,11 +18,11 @@ pub enum Item {
     /// A greyed-out line of text.
     Label(String),
     Separator,
-    Action { label: String, icon: &'static str, enabled: bool, click: Click },
+    Action { label: String, enabled: bool, click: Click },
     Check { label: String, checked: bool, enabled: bool, click: Click },
     /// One of several (each option: label, what choosing it does).
     Radio { options: Vec<(String, Click)>, selected: usize },
-    Sub { label: String, icon: &'static str, items: Vec<Item> },
+    Sub { label: String, items: Vec<Item> },
 }
 
 /// The app's side: what to show, built from its state whenever the backend needs it.
@@ -100,9 +100,8 @@ mod imp {
             .map(|it| match it {
                 Item::Label(label) => StandardItem { label, enabled: false, ..Default::default() }.into(),
                 Item::Separator => MenuItem::Separator,
-                Item::Action { label, icon, enabled, click } => StandardItem {
+                Item::Action { label, enabled, click } => StandardItem {
                     label,
-                    icon_name: icon.into(),
                     enabled,
                     activate: Box::new(move |_: &mut Ksni<M>| click()),
                     ..Default::default()
@@ -127,8 +126,8 @@ mod imp {
                     }
                     .into()
                 }
-                Item::Sub { label, icon, items } => {
-                    SubMenu { label, icon_name: icon.into(), submenu: convert(items), ..Default::default() }.into()
+                Item::Sub { label, items } => {
+                    SubMenu { label, submenu: convert(items), ..Default::default() }.into()
                 }
             })
             .collect()
@@ -352,13 +351,13 @@ mod imp {
         }
     }
 
-    /// Menu items through `push`. Menu item icons (theme names) are Linux-only for now: not shown here.
+    /// Menu items through `push`.
     fn add(items: Vec<Item>, push: &dyn Fn(&dyn IsMenuItem), clicks: &mut HashMap<MenuId, Click>) {
         for it in items {
             match it {
                 Item::Label(label) => push(&MenuItem::new(label, false, None)),
                 Item::Separator => push(&PredefinedMenuItem::separator()),
-                Item::Action { label, enabled, click, .. } => {
+                Item::Action { label, enabled, click } => {
                     let i = MenuItem::new(label, enabled, None);
                     clicks.insert(i.id().clone(), click);
                     push(&i);
@@ -376,7 +375,7 @@ mod imp {
                         push(&i);
                     }
                 }
-                Item::Sub { label, items, .. } => {
+                Item::Sub { label, items } => {
                     let s = Submenu::new(label, true);
                     add(items, &|i| {
                         let _ = s.append(i);
