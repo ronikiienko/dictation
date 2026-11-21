@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 use futures_util::StreamExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;

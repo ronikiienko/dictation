@@ -3,6 +3,8 @@
 //!   dictation toggle     start / stop a take in the running app (for a custom shortcut or scripts)
 //!   dictation sweep      compile (and tune, if enabled) GPU kernels for every take length ahead of time. The tray
 //!                        app does this by itself (once per GPU, again only after Cargo.lock or rustc change)
+// Windows: a tray app, not a console program (no black console window next to it; closing that would kill the app).
+#![cfg_attr(windows, windows_subsystem = "windows")]
 use dictation::{asr, config::Config, daemon, models};
 
 /// `full`: the old exhaustive sweep (every 80 ms to 30 s, full takes to 120 s), to check the short one misses nothing.
