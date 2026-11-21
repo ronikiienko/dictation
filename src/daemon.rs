@@ -419,7 +419,27 @@ impl tray::Model for Tray {
 
 async fn shortcut_task(tx: mpsc::UnboundedSender<Ev>, mut configure: mpsc::UnboundedReceiver<()>) -> ashpd::Result<()> {
     use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut, Shortcut};
-    ashpd::register_host_app(APP_ID.try_into()?).await?;
+    // The portal identifies the app by its .desktop file: make sure it exists and points here.
+    let written = match ensure_desktop_file() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("desktop file: {e}");
+            false
+        }
+    };
+    // A just-written file may take the desktop a moment to notice: retry for a few seconds then.
+    let mut tries = if written { 10 } else { 1 };
+    loop {
+        match ashpd::register_host_app(APP_ID.try_into()?).await {
+            Ok(()) => break,
+            Err(e) if tries > 1 => {
+                tries -= 1;
+                eprintln!("register app id: {e}; retrying");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
     let gs = GlobalShortcuts::new().await?;
     let session = gs.create_session(Default::default()).await?;
     let wanted = [NewShortcut::new("toggle", "Start / stop dictation").preferred_trigger("Meta+Y")];
@@ -447,6 +467,35 @@ async fn shortcut_task(tx: mpsc::UnboundedSender<Ev>, mut configure: mpsc::Unbou
         }
     }
     Ok(())
+}
+
+/// The app's `.desktop` file (`~/.local/share/applications/<APP_ID>.desktop`; the desktop's app list and what the
+/// shortcut portal identifies us by), pointing at this program. Written when missing or different (e.g. the program
+/// moved). -> whether it was written.
+fn ensure_desktop_file() -> Result<bool, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // Exec: quoted, with the characters the spec wants escaped inside quotes.
+    let mut quoted = String::from("\"");
+    for c in exe.to_string_lossy().chars() {
+        if matches!(c, '"' | '`' | '$' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    let text = format!(
+        "[Desktop Entry]\nType=Application\nName=Dictation\nComment=Offline speech-to-text\nExec={quoted}\n\
+         Icon=audio-input-microphone\nTerminal=false\nCategories=Utility;\n"
+    );
+    let dir = directories::BaseDirs::new().ok_or("no home directory")?.data_dir().join("applications");
+    let path = dir.join(format!("{APP_ID}.desktop"));
+    if std::fs::read_to_string(&path).is_ok_and(|t| t == text) {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+    println!("wrote {}", path.display());
+    Ok(true)
 }
 
 // ---------------------------------------------------------------- control socket (`dictation toggle`; `status` = single-instance check)
