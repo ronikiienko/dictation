@@ -44,7 +44,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut a = asr::Asr::load(&m.weights())?;
     a.run(&vec![0.0; RATE])?;
     eprintln!("ready {:.2}s", t.elapsed().as_secs_f64());
+    // GAP=<seconds>: idle this long before each take (GPU clocking down between takes vs back-to-back).
+    let gap = std::env::var("GAP").ok().and_then(|g| g.parse::<f64>().ok());
     for arg in std::env::args().skip(1) {
+        if let Some(g) = gap {
+            std::thread::sleep(std::time::Duration::from_secs_f64(g));
+        }
         let path = std::path::Path::new(&arg);
         let x = read_wav(path)?;
         if std::env::var("LIVE").is_ok() {
