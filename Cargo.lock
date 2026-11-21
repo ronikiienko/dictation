@@ -2575,6 +2575,7 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "ashpd",
+ "buildid",
  "burn",
  "bytemuck",
  "bytes",

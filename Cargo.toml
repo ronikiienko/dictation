@@ -10,6 +10,7 @@ default = ["autotune"]
 autotune = ["burn/autotune"]
 
 [dependencies]
+buildid = { version = "1.1.0", features = ["buildid-custom-inject"] } # see lib.rs build_id__get
 # Speech-to-text (src/asr). "autotune" comes from our feature of that name; "persistence"
 # keeps compiled GPU kernels on disk (cache folder set in asr::set_kernel_cache). cubecl-runtime only for that config.
 burn = { version = "0.22.1", default-features = false, features = ["std", "vulkan", "fusion", "persistence"] }
