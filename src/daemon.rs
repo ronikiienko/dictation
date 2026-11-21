@@ -5,13 +5,12 @@ use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use ksni::TrayMethods;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::config::{Config, KeepLoaded, Output, PasteKeys};
 use crate::output::{Keyboard, Notice};
-use crate::{RATE, asr, audio, models};
+use crate::{RATE, asr, audio, models, tray};
 
 pub const APP_ID: &str = "local.dictation.Dictation";
 
@@ -216,13 +215,6 @@ impl Tray {
             Mem::Loaded => format!("Model loaded: {}", self.detail),
         }
     }
-
-    /// Send a changed copy of the settings to the main loop.
-    fn set(&self, f: impl FnOnce(&mut Config)) {
-        let mut c = self.cfg.clone();
-        f(&mut c);
-        let _ = self.tx.send(Ev::Set(c));
-    }
 }
 
 /// "Keep model loaded" choices.
@@ -242,14 +234,28 @@ fn output_label(o: Output, k: PasteKeys) -> &'static str {
     }
 }
 
-impl ksni::Tray for Tray {
-    fn id(&self) -> String {
-        "dictation".into()
+impl Tray {
+    /// A menu click that sends this event.
+    fn send(&self, ev: impl Fn() -> Ev + Send + Sync + 'static) -> tray::Click {
+        let tx = self.tx.clone();
+        tray::click(move || {
+            let _ = tx.send(ev());
+        })
     }
-    fn title(&self) -> String {
-        "Dictation".into()
+
+    /// A menu click that changes a setting.
+    fn setting(&self, f: impl Fn(&mut Config) + Send + Sync + 'static) -> tray::Click {
+        let (tx, cfg) = (self.tx.clone(), self.cfg.clone());
+        tray::click(move || {
+            let mut c = cfg.clone();
+            f(&mut c);
+            let _ = tx.send(Ev::Set(c));
+        })
     }
-    fn icon_name(&self) -> String {
+}
+
+impl tray::Model for Tray {
+    fn icon(&self) -> &'static str {
         match self.state {
             State::Recording => "media-record",
             _ if self.download.is_some() => "download",
@@ -258,51 +264,34 @@ impl ksni::Tray for Tray {
             State::NoModel => "dialog-warning",
             State::Idle => "audio-input-microphone",
         }
-        .into()
     }
-    fn status(&self) -> ksni::Status {
-        if self.state == State::Recording { ksni::Status::NeedsAttention } else { ksni::Status::Active }
+    fn attention(&self) -> bool {
+        self.state == State::Recording
     }
-    fn tool_tip(&self) -> ksni::ToolTip {
-        ksni::ToolTip { title: format!("Dictation: {}", self.status_text()), description: self.mem_text(), ..Default::default() }
+    fn tooltip(&self) -> (String, String) {
+        (format!("Dictation: {}", self.status_text()), self.mem_text())
     }
-    fn activate(&mut self, _x: i32, _y: i32) {
+    fn activate(&self) {
         if self.state == State::NoModel && self.download.is_none() {
             let _ = self.tx.send(Ev::Download);
         } else {
             let _ = self.tx.send(Ev::Toggle);
         }
     }
-    fn menu_about_to_show(&mut self) {
+    fn menu_opening(&mut self) {
         self.mics = audio::input_devices(); // pick up newly plugged microphones
     }
-    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        use ksni::menu::*;
+    fn menu(&self) -> Vec<tray::Item> {
+        use tray::Item::*;
         let recording = self.state == State::Recording;
 
-        let gpu_names: Vec<String> = self.gpus.iter().map(|g| g.0.clone()).collect();
-        let gpu_selected = gpu_names.iter().position(|n| *n == self.cfg.gpu).map_or(0, |i| i + 1);
-        let gpu_items = vec![
-            RadioGroup {
-                selected: gpu_selected,
-                select: Box::new(move |t: &mut Self, i| {
-                    let name = if i == 0 { String::new() } else { gpu_names[i - 1].clone() };
-                    t.set(|c| c.gpu = name);
-                }),
-                options: std::iter::once("Automatic (fastest)".to_string())
-                    .chain(self.gpus.iter().map(|(n, k)| format!("{n} ({k})")))
-                    .map(|label| RadioItem { label, ..Default::default() })
-                    .collect(),
-                ..Default::default()
-            }
-            .into(),
-            MenuItem::Separator,
-            StandardItem { label: format!("In use: {}", self.gpu), enabled: false, ..Default::default() }.into(),
-            StandardItem { label: "Switching restarts the app".into(), enabled: false, ..Default::default() }.into(),
-        ];
+        let mut gpu_options = vec![("Automatic (fastest)".to_string(), self.setting(|c| c.gpu = String::new()))];
+        for (name, kind) in &self.gpus {
+            let n = name.clone();
+            gpu_options.push((format!("{name} ({kind})"), self.setting(move |c| c.gpu = n.clone())));
+        }
+        let gpu_selected = self.gpus.iter().position(|g| g.0 == self.cfg.gpu).map_or(0, |i| i + 1);
 
-        let mic_selected = self.mics.iter().position(|(id, _)| *id == self.cfg.microphone).unwrap_or(0);
-        let mic_ids: Vec<String> = self.mics.iter().map(|m| m.0.clone()).collect();
         let outputs = [
             (Output::Paste, PasteKeys::CtrlV),
             (Output::Paste, PasteKeys::CtrlShiftV),
@@ -316,150 +305,119 @@ impl ksni::Tray for Tray {
         };
 
         vec![
-            StandardItem { label: self.status_text(), enabled: false, ..Default::default() }.into(),
-            StandardItem { label: self.mem_text(), enabled: false, ..Default::default() }.into(),
-            MenuItem::Separator,
-            StandardItem {
+            Label(self.status_text()),
+            Label(self.mem_text()),
+            Separator,
+            Action {
                 label: if recording { "Stop dictation" } else { "Start dictation" }.into(),
-                icon_name: if recording { "media-playback-stop" } else { "media-record" }.into(),
+                icon: if recording { "media-playback-stop" } else { "media-record" },
                 enabled: matches!(self.state, State::Idle | State::Recording | State::Transcribing),
-                activate: Box::new(|t: &mut Self| {
-                    let _ = t.tx.send(Ev::Toggle);
-                }),
-                ..Default::default()
-            }
-            .into(),
-            MenuItem::Separator,
-            SubMenu { label: "GPU".into(), icon_name: "video-display".into(), submenu: gpu_items, ..Default::default() }.into(),
-            SubMenu {
+                click: self.send(|| Ev::Toggle),
+            },
+            Separator,
+            Sub {
+                label: "GPU".into(),
+                icon: "video-display",
+                items: vec![
+                    Radio { options: gpu_options, selected: gpu_selected },
+                    Separator,
+                    Label(format!("In use: {}", self.gpu)),
+                    Label("Switching restarts the app".into()),
+                ],
+            },
+            Sub {
                 label: "Keep model loaded".into(),
-                icon_name: "memory".into(),
-                submenu: vec![
-                    RadioGroup {
+                icon: "memory",
+                items: vec![
+                    Radio {
+                        options: KEEP.iter().map(|&(k, l)| (l.to_string(), self.setting(move |c| c.keep_loaded = k))).collect(),
                         selected: KEEP.iter().position(|&(k, _)| k == self.cfg.keep_loaded).unwrap_or(1),
-                        select: Box::new(|t: &mut Self, i| t.set(|c| c.keep_loaded = KEEP[i].0)),
-                        options: KEEP.iter().map(|&(_, l)| RadioItem { label: l.into(), ..Default::default() }).collect(),
-                        ..Default::default()
-                    }
-                    .into(),
-                    MenuItem::Separator,
-                    StandardItem {
+                    },
+                    Separator,
+                    Action {
                         label: "Unload now".into(),
+                        icon: "",
                         enabled: self.mem == Mem::Loaded && self.state == State::Idle,
-                        activate: Box::new(|t: &mut Self| {
-                            let _ = t.tx.send(Ev::UnloadNow);
-                        }),
-                        ..Default::default()
-                    }
-                    .into(),
+                        click: self.send(|| Ev::UnloadNow),
+                    },
                 ],
-                ..Default::default()
-            }
-            .into(),
-            SubMenu {
+            },
+            Sub {
                 label: "Microphone".into(),
-                icon_name: "audio-input-microphone".into(),
-                submenu: vec![
-                    RadioGroup {
-                        selected: mic_selected,
-                        select: Box::new(move |t: &mut Self, i| {
-                            if let Some(id) = mic_ids.get(i).cloned() {
-                                t.set(|c| c.microphone = id);
-                            }
-                        }),
-                        options: self.mics.iter().map(|(_, name)| RadioItem { label: name.clone(), ..Default::default() }).collect(),
-                        ..Default::default()
-                    }
-                    .into(),
-                ],
-                ..Default::default()
-            }
-            .into(),
-            SubMenu {
+                icon: "audio-input-microphone",
+                items: vec![Radio {
+                    options: self
+                        .mics
+                        .iter()
+                        .map(|(id, name)| {
+                            let id = id.clone();
+                            (name.clone(), self.setting(move |c| c.microphone = id.clone()))
+                        })
+                        .collect(),
+                    selected: self.mics.iter().position(|(id, _)| *id == self.cfg.microphone).unwrap_or(0),
+                }],
+            },
+            Sub {
                 label: "Output".into(),
-                icon_name: "edit-paste".into(),
-                submenu: vec![
-                    RadioGroup {
+                icon: "edit-paste",
+                items: vec![
+                    Radio {
+                        options: outputs
+                            .iter()
+                            .map(|&(o, k)| {
+                                let set = self.setting(move |c| {
+                                    c.output = o;
+                                    c.paste_keys = k;
+                                });
+                                (output_label(o, k).to_string(), set)
+                            })
+                            .collect(),
                         selected: out_selected,
-                        select: Box::new(move |t: &mut Self, i| {
-                            let (o, k) = outputs[i];
-                            t.set(|c| {
-                                c.output = o;
-                                c.paste_keys = k;
-                            });
-                        }),
-                        options: outputs.iter().map(|&(o, k)| RadioItem { label: output_label(o, k).into(), ..Default::default() }).collect(),
-                        ..Default::default()
-                    }
-                    .into(),
-                    MenuItem::Separator,
-                    CheckmarkItem {
+                    },
+                    Separator,
+                    Check {
                         label: "Paste while speaking".into(),
                         checked: self.cfg.live,
                         enabled: self.cfg.output == Output::Paste,
-                        activate: Box::new(|t: &mut Self| t.set(|c| c.live = !c.live)),
-                        ..Default::default()
-                    }
-                    .into(),
+                        click: self.setting(|c| c.live = !c.live),
+                    },
                     // Live words are pasted once two passes agree, with only ~1-2 s of audio after them; pasted text
                     // is never corrected. Without live mode the whole take is transcribed at once (full context).
-                    StandardItem { label: "Slightly less accurate: words are pasted".into(), enabled: false, ..Default::default() }.into(),
-                    StandardItem { label: "before the model hears what follows".into(), enabled: false, ..Default::default() }.into(),
+                    Label("Slightly less accurate: words are pasted".into()),
+                    Label("before the model hears what follows".into()),
                 ],
-                ..Default::default()
-            }
-            .into(),
-            CheckmarkItem {
-                label: "Sounds".into(),
-                checked: self.cfg.sounds,
-                activate: Box::new(|t: &mut Self| t.set(|c| c.sounds = !c.sounds)),
-                ..Default::default()
-            }
-            .into(),
-            CheckmarkItem {
+            },
+            Check { label: "Sounds".into(), checked: self.cfg.sounds, enabled: true, click: self.setting(|c| c.sounds = !c.sounds) },
+            Check {
                 label: "Notifications".into(),
                 checked: self.cfg.notifications,
-                activate: Box::new(|t: &mut Self| t.set(|c| c.notifications = !c.notifications)),
-                ..Default::default()
-            }
-            .into(),
-            CheckmarkItem {
+                enabled: true,
+                click: self.setting(|c| c.notifications = !c.notifications),
+            },
+            Check {
                 label: "Keep recordings".into(),
                 checked: self.cfg.save_recordings,
-                activate: Box::new(|t: &mut Self| t.set(|c| c.save_recordings = !c.save_recordings)),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
+                enabled: true,
+                click: self.setting(|c| c.save_recordings = !c.save_recordings),
+            },
+            Action {
                 label: "Open app folder…".into(),
-                icon_name: "folder-open".into(),
-                activate: Box::new(|_: &mut Self| {
+                icon: "folder-open",
+                enabled: true,
+                click: tray::click(|| {
                     if let Err(e) = crate::open_root() {
                         eprintln!("{e}");
                     }
                 }),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
+            },
+            Action {
                 label: if self.shortcut.is_empty() { "Set shortcut…".into() } else { format!("Change shortcut ({})…", self.shortcut) },
-                icon_name: "configure-shortcuts".into(),
-                activate: Box::new(|t: &mut Self| {
-                    let _ = t.tx.send(Ev::ConfigureShortcut);
-                }),
-                ..Default::default()
-            }
-            .into(),
-            MenuItem::Separator,
-            StandardItem {
-                label: "Quit".into(),
-                icon_name: "application-exit".into(),
-                activate: Box::new(|t: &mut Self| {
-                    let _ = t.tx.send(Ev::Quit);
-                }),
-                ..Default::default()
-            }
-            .into(),
+                icon: "configure-shortcuts",
+                enabled: true,
+                click: self.send(|| Ev::ConfigureShortcut),
+            },
+            Separator,
+            Action { label: "Quit".into(), icon: "application-exit", enabled: true, click: self.send(|| Ev::Quit) },
         ]
     }
 }
@@ -584,9 +542,29 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     if send("status").is_ok() {
         return Err("Dictation is already running (see the tray).".into());
     }
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
-    let restart = rt.block_on(main_loop())?;
-    rt.shutdown_background();
+    let cfg = Config::load();
+    let (tx, rx) = mpsc::unbounded_channel::<Ev>();
+    let state = if models::MODEL.installed() { State::Idle } else { State::NoModel };
+    let model = Tray {
+        state,
+        mem: Mem::Unloaded,
+        shortcut: String::new(),
+        detail: String::new(),
+        cfg: cfg.clone(),
+        mics: audio::input_devices(),
+        download: None,
+        gpu: asr::gpu().to_string(),
+        gpus: asr::gpus().into_iter().map(|g| (g.name, g.kind)).collect(),
+        sweep: 0,
+        tx: tx.clone(),
+    };
+    // The tray on this (main) thread, everything else on the app thread's runtime.
+    let restart = tray::run(model, move |tray| -> Result<bool, String> {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().map_err(|e| e.to_string())?;
+        let r = rt.block_on(main_loop(cfg, state, tx, rx, tray)).map_err(|e| e.to_string());
+        rt.shutdown_background();
+        r
+    })??;
     if restart {
         // Another GPU: CubeCL picks the GPU and its kernel cache once per process, so start over.
         let exe = std::env::current_exe().ok().filter(|p| p.exists()).unwrap_or_else(|| std::env::args().next().unwrap_or_default().into());
@@ -605,7 +583,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn start_download(tx: &mpsc::UnboundedSender<Ev>, tray: &ksni::Handle<Tray>) {
+fn start_download(tx: &mpsc::UnboundedSender<Ev>, tray: &tray::Handle<Tray>) {
     let p = Arc::new(models::Progress::default());
     {
         let (p, tx) = (p.clone(), tx.clone());
@@ -634,31 +612,19 @@ fn start_download(tx: &mpsc::UnboundedSender<Ev>, tray: &ksni::Handle<Tray>) {
 }
 
 /// -> whether to restart (another GPU was chosen).
-async fn main_loop() -> Result<bool, Box<dyn std::error::Error>> {
-    let mut cfg = Config::load();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+async fn main_loop(
+    mut cfg: Config,
+    mut state: State,
+    tx: mpsc::UnboundedSender<Ev>,
+    mut rx: mpsc::UnboundedReceiver<Ev>,
+    tray: tray::Handle<Tray>,
+) -> Result<bool, Box<dyn std::error::Error>> {
     let (jobs, jobs_rx) = std_mpsc::channel::<Job>();
     {
         let tx = tx.clone();
         std::thread::Builder::new().name("engine".into()).spawn(move || engine(jobs_rx, tx))?;
     }
     let installed = || models::MODEL.installed();
-    let mut state = if installed() { State::Idle } else { State::NoModel };
-    let tray = Tray {
-        state,
-        mem: Mem::Unloaded,
-        shortcut: String::new(),
-        detail: String::new(),
-        cfg: cfg.clone(),
-        mics: audio::input_devices(),
-        download: None,
-        gpu: asr::gpu().to_string(),
-        gpus: asr::gpus().into_iter().map(|g| (g.name, g.kind)).collect(),
-        sweep: 0,
-        tx: tx.clone(),
-    }
-    .spawn()
-    .await?;
     let (status_tx, status_rx) = tokio::sync::watch::channel(String::new());
     tokio::spawn(socket_task(tx.clone(), status_rx));
     let (configure_tx, configure_rx) = mpsc::unbounded_channel();
@@ -989,7 +955,6 @@ async fn main_loop() -> Result<bool, Box<dyn std::error::Error>> {
         let _ = r.stop();
     }
     let _ = std::fs::remove_file(socket_path());
-    tray.shutdown().await;
     Ok(restart)
 }
 
