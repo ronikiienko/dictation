@@ -2639,6 +2639,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "symphonia",
+ "symphonia-opus",
  "tao",
  "tokio",
  "toml 1.2.1+spec-1.1.0",
@@ -7428,6 +7429,17 @@ dependencies = [
  "regex-lite",
  "smallvec",
  "symphonia-core",
+]
+
+[[package]]
+name = "symphonia-opus"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5af6bc6d58f41f4f5107f0b58c2f128fd24531b104bc3ef13e1e50785994c63c"
+dependencies = [
+ "log",
+ "symphonia-core",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

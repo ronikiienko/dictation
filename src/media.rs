@@ -1,18 +1,30 @@
 //! Audio and video files -> 16 kHz mono f32 for asr (`dictation transcribe`). symphonia (pure Rust) reads the file's
-//! audio track: wav, mp3, flac, ogg/vorbis, m4a/aac, alac, aiff, caf, and the sound of mp4/mov/mkv/webm videos
-//! (the picture is skipped). Not covered: Opus (most .webm, voice messages), AC-3, .avi -> an error naming the codec.
+//! audio track: wav, mp3, flac, ogg/vorbis, opus, m4a/aac, alac, aiff, caf, and the sound of mp4/mov/mkv/webm videos
+//! (the picture is skipped). Opus (most .webm, voice messages) via symphonia-opus (pure Rust; symphonia has none
+//! yet). Not covered: AC-3, .avi -> an error naming the problem.
 //! rubato's FFT resampler converts to 16 kHz while decoding, so a long 48 kHz stereo file never sits in memory at its
 //! own rate (1 h at 16 kHz mono = 230 MB).
 use crate::RATE;
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Indexing, Resampler};
 use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::codecs::registry::CodecRegistry;
+use symphonia::core::common::Tier;
 use symphonia::core::errors::Error;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use std::path::Path;
+use std::sync::LazyLock;
+
+/// symphonia's codecs plus Opus. At the fallback tier, so a future symphonia Opus decoder takes over by itself.
+static CODECS: LazyLock<CodecRegistry> = LazyLock::new(|| {
+    let mut r = CodecRegistry::new();
+    symphonia::default::register_enabled_codecs(&mut r);
+    r.register_audio_decoder_at_tier::<symphonia_opus::OpusDecoder>(Tier::Fallback);
+    r
+});
 
 /// Mono samples at the file's rate in, 16 kHz out, chunk by chunk.
 struct To16k {
@@ -90,16 +102,16 @@ pub fn read(path: &Path) -> Result<Vec<f32>, String> {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
     }
-    let unsupported = |what: &str| format!("{}: {what} (supported: wav, mp3, flac, ogg, m4a/aac, mp4, mov, mkv, webm without Opus)", path.display());
+    let unsupported = |what: &str| format!("{}: {what} (supported: wav, mp3, flac, ogg, m4a/aac, opus, mp4, mov, mkv, webm)", path.display());
     let mut format = symphonia::default::get_probe()
         .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
         .map_err(|_| unsupported("not a format this app reads"))?;
     let track = format.default_track(TrackType::Audio).ok_or_else(|| unsupported("no audio track"))?;
     let params = track.codec_params.as_ref().and_then(|p| p.audio()).ok_or_else(|| unsupported("no audio track"))?;
     let track_id = track.id;
-    let mut decoder = symphonia::default::get_codecs()
+    let mut decoder = CODECS
         .make_audio_decoder(params, &AudioDecoderOptions::default())
-        .map_err(|_| unsupported("its sound codec is not supported (Opus, AC-3, ...)"))?;
+        .map_err(|_| unsupported("its sound codec is not supported (AC-3, ...)"))?;
     let mut conv: Option<To16k> = None;
     let (mut inter, mut mono) = (Vec::<f32>::new(), Vec::<f32>::new());
     loop {

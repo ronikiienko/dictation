@@ -659,21 +659,31 @@ async fn socket_task(tx: mpsc::UnboundedSender<Ev>, status: tokio::sync::watch::
 }
 
 /// Extensions offered in the file picker (media::read reads by content; "All files" is offered too).
-const MEDIA_EXT: &[&str] = &["wav", "mp3", "flac", "ogg", "oga", "m4a", "aac", "mp4", "m4v", "mov", "mkv", "webm", "aif", "aiff", "caf"];
+const MEDIA_EXT: &[&str] = &["wav", "mp3", "flac", "ogg", "oga", "opus", "m4a", "aac", "mp4", "m4v", "mov", "mkv", "webm", "aif", "aiff", "caf"];
 
 /// Tray "Transcribe a file": the system's file picker, then each file in turn: decoded here, transcribed by the
 /// engine (Ev::File, as `dictation transcribe`), saved next to it (never over an existing file): text as <name>.txt,
 /// opened in the default editor; subtitles as <name>.srt (what video players look for), shown in the file manager.
+/// A file dialog, waited for off the async thread. rfd's blocking dialogs, not its async ones: on macOS those attach
+/// as a sheet to the app's first window, which in a tray app is an invisible one in the menu bar, so the dialog hung
+/// from the top of the screen, cut off and unmovable. The blocking ones are free-standing windows (rfd shows them on
+/// the main thread itself).
+async fn dialog<T: Send + 'static>(show: impl FnOnce() -> Option<T> + Send + 'static) -> Option<T> {
+    tokio::task::spawn_blocking(show).await.ok().flatten()
+}
+
 async fn pick_files(tx: mpsc::UnboundedSender<Ev>, srt: bool) {
-    let picked = rfd::AsyncFileDialog::new()
+    use std::path::PathBuf;
+    let picker = rfd::FileDialog::new()
         .set_title(if srt { "Make subtitles for audio or video" } else { "Transcribe audio or video" })
         .add_filter("Audio and video", MEDIA_EXT)
-        .add_filter("All files", &["*"])
-        .pick_files()
-        .await;
-    for f in picked.unwrap_or_default() {
-        let path = f.path().to_path_buf();
-        let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+        .add_filter("All files", &["*"]);
+    let files = dialog(move || picker.pick_files()).await.unwrap_or_default();
+    let ext = if srt { "srt" } else { "txt" };
+    let file_name = |p: &std::path::Path| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
+    // Transcribe all first; failures are reported as they happen.
+    let mut done: Vec<(PathBuf, String)> = Vec::new();
+    for path in files.iter().cloned() {
         let p = path.clone();
         let r = match tokio::task::spawn_blocking(move || crate::media::read(&p)).await {
             Ok(Ok(x)) => {
@@ -686,16 +696,46 @@ async fn pick_files(tx: mpsc::UnboundedSender<Ev>, srt: bool) {
             Ok(Err(e)) => Err(e),
             Err(e) => Err(e.to_string()),
         };
-        let r = r.and_then(|text| {
-            let txt = free_name(&path.with_extension(if srt { "srt" } else { "txt" }));
-            let body = if srt { text } else { format!("{text}\n") };
-            std::fs::write(&txt, body).map_err(|e| format!("{}: {e}", txt.display()))?;
-            if let Err(e) = if srt { reveal(&txt) } else { open::that_detached(&txt) } {
-                eprintln!("open {}: {e}", txt.display());
+        match r {
+            Ok(text) => done.push((path, text)),
+            Err(e) => {
+                let _ = tx.send(Ev::FileSaved(Err(format!("{}: {e}", file_name(&path)))));
             }
-            Ok((name.clone(), txt))
-        });
-        let _ = tx.send(Ev::FileSaved(r.map_err(|e| format!("{name}: {e}"))));
+        }
+    }
+    let Some((first, _)) = done.first() else { return };
+    // Then where to save: the dialog popping up is also the "done" signal. One file -> a save dialog (its folder and
+    // name preset; the dialog asks before replacing), several -> a folder (" (2)" added if a name is taken).
+    // Cancel -> not saved.
+    let start = first.parent().map(PathBuf::from).unwrap_or_default();
+    let out_name = |p: &std::path::Path| file_name(&p.with_extension(ext));
+    let dest: Vec<PathBuf> = if let [(one, _)] = done.as_slice() {
+        let saver = rfd::FileDialog::new()
+            .set_title(if srt { "Subtitles ready: save as" } else { "Text ready: save as" })
+            .set_directory(&start)
+            .set_file_name(out_name(one))
+            .add_filter(if srt { "Subtitles" } else { "Text" }, &[ext]);
+        match dialog(move || saver.save_file()).await {
+            Some(t) => vec![t],
+            None => return eprintln!("file: not saved (cancelled)"),
+        }
+    } else {
+        let folder = rfd::FileDialog::new()
+            .set_title(format!("{} {} ready: choose a folder", done.len(), if srt { "subtitle files" } else { "texts" }))
+            .set_directory(&start);
+        let Some(dir) = dialog(move || folder.pick_folder()).await else { return eprintln!("file: not saved (cancelled)") };
+        done.iter().map(|(p, _)| free_name(&dir.join(out_name(p)))).collect()
+    };
+    for ((path, text), out) in done.into_iter().zip(dest) {
+        let name = file_name(&path);
+        let body = if srt { text } else { format!("{text}\n") };
+        let r = std::fs::write(&out, body).map_err(|e| format!("{name}: {}: {e}", out.display()));
+        if r.is_ok() {
+            if let Err(e) = if srt { reveal(&out) } else { open::that_detached(&out) } {
+                eprintln!("open {}: {e}", out.display());
+            }
+        }
+        let _ = tx.send(Ev::FileSaved(r.map(|_| (name, out))));
     }
 }
 
