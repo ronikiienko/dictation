@@ -401,6 +401,10 @@ impl ksni::Tray for Tray {
                         ..Default::default()
                     }
                     .into(),
+                    // Live words are pasted once two passes agree, with only ~1-2 s of audio after them; pasted text
+                    // is never corrected. Without live mode the whole take is transcribed at once (full context).
+                    StandardItem { label: "Slightly less accurate: words are pasted".into(), enabled: false, ..Default::default() }.into(),
+                    StandardItem { label: "before the model hears what follows".into(), enabled: false, ..Default::default() }.into(),
                 ],
                 ..Default::default()
             }
