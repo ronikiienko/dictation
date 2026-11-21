@@ -605,6 +605,18 @@ pub fn send(cmd: &str) -> std::io::Result<String> {
     Ok(line.trim().to_string())
 }
 
+/// Press the paste keys, making the virtual keyboard first if it isn't there yet (e.g. permission granted since).
+fn press_paste(kb: &mut Option<Keyboard>, keys: PasteKeys) -> Result<(), String> {
+    if kb.is_none() {
+        *kb = Some(Keyboard::new(false).map_err(|e| e.to_string())?);
+    }
+    let r = kb.as_mut().map_or(Ok(()), |k| k.paste(keys)).map_err(|e| e.to_string());
+    if r.is_err() {
+        *kb = None;
+    }
+    r
+}
+
 // ---------------------------------------------------------------- recordings (wav + one JSON line per take)
 
 fn save_take(t: &Take) -> std::io::Result<()> {
@@ -780,7 +792,8 @@ async fn main_loop(
         });
     }
     let mut clipboard = crate::output::Clipboard::default();
-    let mut kb = Keyboard::new().map_err(|e| format!("virtual keyboard (/dev/uinput): {e}"))?;
+    // Without it the app still works, the text just stays on the clipboard (press_paste retries, notices say why).
+    let mut kb = Keyboard::new(true).map_err(|e| eprintln!("virtual keyboard: {e}")).ok();
     let mut notice = Notice { enabled: cfg.notifications, ..Default::default() };
     let mut rec: Option<audio::Recorder> = None;
     let mut shortcut = String::new();
@@ -831,7 +844,7 @@ async fn main_loop(
                 if let Some(p) = piece {
                     if let Err(e) = clipboard.set(&p) {
                         eprintln!("clipboard: {e}");
-                    } else if let Err(e) = kb.paste(cfg.paste_keys) {
+                    } else if let Err(e) = press_paste(&mut kb, cfg.paste_keys) {
                         eprintln!("paste: {e}");
                     }
                 }
@@ -902,12 +915,16 @@ async fn main_loop(
                 }
                 match r {
                     Ok(t) => {
+                        // (title, body) of a notice about what went wrong.
+                        let mut problem: Option<(&str, String)> = None;
                         if !t.paste.is_empty() {
                             if let Err(e) = clipboard.set(&t.paste) {
                                 eprintln!("clipboard: {e}");
+                                problem = Some(("Couldn't copy the text", e.to_string()));
                             } else if cfg.output == Output::Paste {
-                                if let Err(e) = kb.paste(cfg.paste_keys) {
+                                if let Err(e) = press_paste(&mut kb, cfg.paste_keys) {
                                     eprintln!("paste: {e}");
+                                    problem = Some(("Not pasted: the text is on the clipboard", crate::output::PASTE_HELP.into()));
                                 }
                             }
                         }
@@ -917,7 +934,9 @@ async fn main_loop(
                             (false, Output::Paste) => "Pasted",
                             (false, Output::Clipboard) => "Copied to clipboard",
                         };
-                        if state != State::Recording {
+                        if let Some((title, body)) = problem {
+                            notice.show(title, &body, "dialog-error").await;
+                        } else if state != State::Recording {
                             notice.show(title, &body, if t.text.is_empty() { "dialog-information" } else { "dialog-ok" }).await;
                         }
                         println!("{:.1}s audio, {:.0} ms: {}", t.audio.len() as f64 / RATE as f64, t.ms, t.text);

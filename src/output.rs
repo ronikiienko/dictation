@@ -2,7 +2,7 @@
 //! protocol, on X11/Windows/macOS their native clipboards), paste keys via a virtual keyboard: on Linux our own on
 //! /dev/uinput (works on X11 and Wayland; KDE gives the logged-in user write access), elsewhere enigo. Plus desktop
 //! notifications.
-pub use keyboard::Keyboard;
+pub use keyboard::{Keyboard, PASTE_HELP};
 
 #[cfg(target_os = "linux")]
 mod keyboard {
@@ -12,8 +12,13 @@ mod keyboard {
 
     pub struct Keyboard(VirtualDevice);
 
+    /// Shown when the paste keys can't be pressed.
+    pub const PASTE_HELP: &str = "No write access to /dev/uinput, so the app can't press the paste keys. To allow it \
+        once (as root): a udev rule KERNEL==\"uinput\", TAG+=\"uaccess\", then log in again.";
+
     impl Keyboard {
-        pub fn new() -> std::io::Result<Keyboard> {
+        /// `_ask`: macOS only (permission prompt).
+        pub fn new(_ask: bool) -> std::io::Result<Keyboard> {
             let mut keys = AttributeSet::<KeyCode>::new();
             for k in [KeyCode::KEY_LEFTCTRL, KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_V, KeyCode::KEY_INSERT] {
                 keys.insert(k);
@@ -52,9 +57,18 @@ mod keyboard {
 
     pub struct Keyboard(Enigo);
 
+    /// Shown when the paste keys can't be pressed.
+    #[cfg(target_os = "macos")]
+    pub const PASTE_HELP: &str = "Allow Dictation (or the terminal it runs in) in System Settings -> Privacy & Security \
+        -> Accessibility, so it can press Cmd+V.";
+    #[cfg(not(target_os = "macos"))]
+    pub const PASTE_HELP: &str = "The system refused the simulated paste keys.";
+
     impl Keyboard {
-        pub fn new() -> std::io::Result<Keyboard> {
-            Enigo::new(&Settings::default()).map(Keyboard).map_err(std::io::Error::other)
+        /// `ask`: macOS: show the system's permission prompt if Accessibility isn't allowed yet (once, at start).
+        pub fn new(ask: bool) -> std::io::Result<Keyboard> {
+            let settings = Settings { open_prompt_to_get_permissions: ask, ..Default::default() };
+            Enigo::new(&settings).map(Keyboard).map_err(std::io::Error::other)
         }
 
         pub fn paste(&mut self, keys: PasteKeys) -> std::io::Result<()> {
