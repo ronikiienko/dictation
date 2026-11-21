@@ -72,11 +72,14 @@ mod keyboard {
         }
 
         pub fn paste(&mut self, keys: PasteKeys) -> std::io::Result<()> {
-            // macOS: Cmd+V pastes everywhere, terminals included (and there is no Insert key).
+            // macOS: Cmd+V pastes everywhere, terminals included (and there is no Insert key). V as the raw key code
+            // (kVK_ANSI_V = 9): Key::Unicode looks up the keyboard layout, which macOS allows only on the main thread
+            // (off it the app hung in TSMGetInputSourceProperty). Cmd shortcuts on non-Latin layouts (Ukrainian) use
+            // this key too; layouts that move V (Dvorak) would need the lookup.
             #[cfg(target_os = "macos")]
             let combo: &[Key] = {
                 let _ = keys;
-                &[Key::Meta, Key::Unicode('v')]
+                &[Key::Meta, Key::Other(9)]
             };
             #[cfg(not(target_os = "macos"))]
             let combo: &[Key] = match keys {
