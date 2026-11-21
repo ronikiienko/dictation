@@ -21,13 +21,11 @@ half = "2"
 memmap2 = "0.9"
 realfft = "3"
 arboard = { version = "3.7.0", default-features = false, features = ["wayland-data-control"] }
-ashpd = { version = "0.14.1", default-features = false, features = ["tokio", "global_shortcuts"] }
 cpal = { version = "0.18.2", features = ["pulseaudio"] }
 directories = "6.0.0"
 futures-util = "0.3.34"
 hound = "3"
 jiff = "1.0.1"
-ksni = "0.3.7"
 libc = "0.2.191"
 log = "0.4.35"
 notify-rust = { version = "4.19.0", default-features = false, features = ["z-with-tokio"] }
@@ -40,12 +38,16 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "
 toml = "1.2.1"
 ureq = "3.5.2"
 
-# Paste keys: Linux uses its own virtual keyboard (/dev/uinput, works on X11 and Wayland); elsewhere enigo.
+# Linux: global shortcut via the desktop portal (ashpd), tray via D-Bus (ksni), paste via its own virtual keyboard
+# (evdev, /dev/uinput); all work on X11 and Wayland. Elsewhere: global-hotkey, tray-icon on tao, enigo.
 [target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.14.1", default-features = false, features = ["tokio", "global_shortcuts"] }
 evdev = "0.13.2"
+ksni = "0.3.7"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 enigo = "0.6.1"
+global-hotkey = "0.10.0"
 tao = "0.37.3"
 tray-icon = "0.26.1"
 

@@ -1,7 +1,8 @@
 //! Tray icon + menu: described once here, shown by a per-platform backend. Linux: ksni (StatusNotifierItem over
 //! D-Bus: the desktop draws the menu itself; no GTK, works on X11 and Wayland). macOS/Windows: tray-icon + muda (its
 //! menus) on a tao event loop; built into those OSes, nothing to install (on Linux tray-icon would need
-//! libayatana-appindicator, hence ksni there).
+//! libayatana-appindicator, hence ksni there). The macOS/Windows global shortcut (global-hotkey) lives here too: it
+//! needs the same main-thread event loop.
 //!
 //! The tray owns the main thread on every platform (`run`) and the app runs on another one: macOS only allows
 //! on-screen things (the menu-bar icon included) on the main thread, Windows wants them on the thread that made them.
@@ -38,6 +39,14 @@ pub trait Model: Send + 'static {
     fn activate(&self);
     /// The menu is about to open (refresh what may have changed, e.g. microphones).
     fn menu_opening(&mut self) {}
+    /// macOS/Windows: the global shortcut to register, e.g. "Ctrl+Alt+Space" ("" = none). Not used on Linux: there
+    /// the desktop's portal owns shortcuts.
+    fn hotkey(&self) -> String {
+        String::new()
+    }
+    fn hotkey_pressed(&self) {}
+    /// Registering `hotkey()` worked, or why not (taken by another app, not a valid key).
+    fn hotkey_result(&self, _key: &str, _result: Result<(), String>) {}
 }
 
 /// Show the tray on this (the main) thread and run `app` on a new thread with a handle to update it. Returns when
@@ -181,6 +190,8 @@ mod imp {
     use tao::platform::run_return::EventLoopExtRunReturn;
     use tray_icon::menu::{CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
     use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+    use global_hotkey::hotkey::HotKey;
+    use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 
     /// Tray icon size in pixels (the OS scales it; macOS menu bar is 22 pt = 44 px on Retina).
     const SIZE: u32 = if cfg!(target_os = "macos") { 44 } else { 32 };
@@ -190,6 +201,7 @@ mod imp {
         Update(Box<dyn FnOnce(&mut M) + Send>),
         Tray(TrayIconEvent),
         Menu(MenuEvent),
+        HotKey(GlobalHotKeyEvent),
         /// The app thread is done: stop the loop.
         Done,
     }
@@ -239,6 +251,10 @@ mod imp {
         MenuEvent::set_event_handler(Some(move |e| {
             hm.send(Ev::Menu(e));
         }));
+        let hk = h.clone();
+        GlobalHotKeyEvent::set_event_handler(Some(move |e| {
+            hk.send(Ev::HotKey(e));
+        }));
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::Builder::new().name("app".into()).spawn(move || {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app(h.clone())));
@@ -247,6 +263,7 @@ mod imp {
         })?;
 
         let mut tray: Option<TrayIcon> = None;
+        let mut keys = Keys { manager: None, registered: None };
         let mut shown = Shown::default();
         let mut clicks: HashMap<MenuId, Click> = HashMap::new();
         el.run_return(|event, _, flow| {
@@ -259,6 +276,14 @@ mod imp {
                         Ok(t) => tray = Some(t),
                         Err(e) => log::error!("tray icon: {e}"),
                     }
+                    // Also main-thread only on macOS.
+                    keys.manager = Some(GlobalHotKeyManager::new().map_err(|e| e.to_string()));
+                }
+                Event::UserEvent(Ev::HotKey(e)) => {
+                    if e.state == HotKeyState::Pressed && keys.registered.is_some_and(|k| k.id() == e.id) {
+                        model.hotkey_pressed();
+                    }
+                    return;
                 }
                 Event::UserEvent(Ev::Update(f)) => f(&mut model),
                 Event::UserEvent(Ev::Menu(e)) => {
@@ -280,6 +305,7 @@ mod imp {
                 }
                 _ => return,
             }
+            keys.update(&model, &mut shown);
             if let Some(t) = &tray {
                 refresh(t, &model, &mut shown, &mut clicks);
             }
@@ -291,9 +317,48 @@ mod imp {
         }
     }
 
+    /// The global shortcut.
+    struct Keys {
+        /// Made once the loop runs; Err = the OS refused (no shortcuts then).
+        manager: Option<Result<GlobalHotKeyManager, String>>,
+        registered: Option<HotKey>,
+    }
+
+    impl Keys {
+        /// Register the model's key if it changed (and report how that went).
+        fn update<M: Model>(&mut self, m: &M, shown: &mut Shown) {
+            let Some(manager) = &self.manager else { return };
+            let want = m.hotkey();
+            if shown.hotkey.as_ref() == Some(&want) {
+                return;
+            }
+            shown.hotkey = Some(want.clone());
+            let manager = match manager {
+                Ok(manager) => manager,
+                Err(e) => return m.hotkey_result(&want, Err(format!("global shortcuts unavailable: {e}"))),
+            };
+            if let Some(old) = self.registered.take() {
+                let _ = manager.unregister(old);
+            }
+            if want.is_empty() {
+                return m.hotkey_result(&want, Ok(()));
+            }
+            let r = want
+                .parse::<HotKey>()
+                .map_err(|e| format!("\"{want}\" is not a valid shortcut ({e})"))
+                .and_then(|k| {
+                    manager.register(k).map_err(|e| format!("{want} is taken by another app ({e})"))?;
+                    self.registered = Some(k);
+                    Ok(())
+                });
+            m.hotkey_result(&want, r);
+        }
+    }
+
     /// What the tray shows now, to only redraw what changed.
     #[derive(Default)]
     struct Shown {
+        hotkey: Option<String>,
         icon: Option<Icon>,
         tooltip: String,
         menu: String,

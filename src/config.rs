@@ -24,6 +24,10 @@ pub struct Config {
     /// When to free the speech model (~0.7 GB VRAM). It is loaded again when the next take starts, while you speak
     /// (~1 s).
     pub keep_loaded: KeepLoaded,
+    /// macOS/Windows: the global shortcut, e.g. "Ctrl+Alt+Space" ("" = none). Linux: set in the desktop's settings
+    /// (portal), so not written to config.toml there.
+    #[cfg_attr(target_os = "linux", serde(skip_serializing))]
+    pub shortcut: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -79,6 +83,7 @@ impl Default for Config {
             notifications: true,
             save_recordings: false,
             keep_loaded: KeepLoaded::OneMinute,
+            shortcut: "Ctrl+Alt+Space".into(),
         }
     }
 }

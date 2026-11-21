@@ -31,7 +31,10 @@ pub enum Ev {
     /// Periodic check for the idle unload.
     Tick,
     UnloadNow,
+    /// The global shortcut now in effect ("" = none).
     Shortcut(String),
+    /// macOS/Windows: the chosen shortcut could not be registered (why).
+    ShortcutFailed(String),
     EngineLoaded(Result<String, String>),
     Done(Result<Take, String>),
     /// Every 300 ms: in live mode, re-transcribe if enough new audio is in.
@@ -218,6 +221,42 @@ impl Tray {
     }
 }
 
+/// macOS/Windows: the shortcut choices in the menu (any other: `shortcut` in config.toml).
+const SHORTCUTS: [&str; 4] = ["Ctrl+Alt+Space", "Ctrl+Shift+Space", "Ctrl+Alt+D", "F9"];
+
+impl Tray {
+    /// Linux: the desktop's shortcut settings (portal). macOS/Windows: pick from a list (no system place for it).
+    fn shortcut_item(&self) -> tray::Item {
+        if cfg!(target_os = "linux") {
+            return tray::Item::Action {
+                label: if self.shortcut.is_empty() { "Set shortcut…".into() } else { format!("Change shortcut ({})…", self.shortcut) },
+                enabled: true,
+                click: self.send(|| Ev::ConfigureShortcut),
+            };
+        }
+        let mut keys: Vec<String> = SHORTCUTS.iter().map(|k| k.to_string()).collect();
+        keys.push(String::new());
+        if !keys.contains(&self.cfg.shortcut) {
+            keys.insert(0, self.cfg.shortcut.clone()); // one typed into config.toml
+        }
+        let selected = keys.iter().position(|k| *k == self.cfg.shortcut).unwrap_or(0);
+        let options = keys
+            .into_iter()
+            .map(|k| {
+                let label = if k.is_empty() { "None".to_string() } else { k.clone() };
+                (label, self.setting(move |c| c.shortcut = k.clone()))
+            })
+            .collect();
+        tray::Item::Sub {
+            label: format!("Shortcut ({})", if self.shortcut.is_empty() { "none" } else { &self.shortcut }),
+            items: vec![
+                tray::Item::Radio { options, selected },
+                tray::Item::Label("Other keys: \"shortcut\" in config.toml".into()),
+            ],
+        }
+    }
+}
+
 /// "Keep model loaded" choices.
 const KEEP: [(KeepLoaded, &str); 4] = [
     (KeepLoaded::AfterTake, "Unload right after each take"),
@@ -281,6 +320,23 @@ impl tray::Model for Tray {
     }
     fn menu_opening(&mut self) {
         self.mics = audio::input_devices(); // pick up newly plugged microphones
+    }
+    fn hotkey(&self) -> String {
+        self.cfg.shortcut.clone()
+    }
+    fn hotkey_pressed(&self) {
+        let _ = self.tx.send(Ev::Toggle);
+    }
+    fn hotkey_result(&self, key: &str, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                let _ = self.tx.send(Ev::Shortcut(key.to_string()));
+            }
+            Err(e) => {
+                let _ = self.tx.send(Ev::Shortcut(String::new()));
+                let _ = self.tx.send(Ev::ShortcutFailed(e));
+            }
+        }
     }
     fn menu(&self) -> Vec<tray::Item> {
         use tray::Item::*;
@@ -404,11 +460,7 @@ impl tray::Model for Tray {
                     }
                 }),
             },
-            Action {
-                label: if self.shortcut.is_empty() { "Set shortcut…".into() } else { format!("Change shortcut ({})…", self.shortcut) },
-                enabled: true,
-                click: self.send(|| Ev::ConfigureShortcut),
-            },
+            self.shortcut_item(),
             Separator,
             Action { label: "Quit".into(), enabled: true, click: self.send(|| Ev::Quit) },
         ]
@@ -417,6 +469,7 @@ impl tray::Model for Tray {
 
 // ---------------------------------------------------------------- global shortcut (XDG portal)
 
+#[cfg(target_os = "linux")]
 async fn shortcut_task(tx: mpsc::UnboundedSender<Ev>, mut configure: mpsc::UnboundedReceiver<()>) -> ashpd::Result<()> {
     use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut, Shortcut};
     // The portal identifies the app by its .desktop file: make sure it exists and points here.
@@ -472,6 +525,7 @@ async fn shortcut_task(tx: mpsc::UnboundedSender<Ev>, mut configure: mpsc::Unbou
 /// The app's `.desktop` file (`~/.local/share/applications/<APP_ID>.desktop`; the desktop's app list and what the
 /// shortcut portal identifies us by), pointing at this program. Written when missing or different (e.g. the program
 /// moved). -> whether it was written.
+#[cfg(target_os = "linux")]
 fn ensure_desktop_file() -> Result<bool, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     // Exec: quoted, with the characters the spec wants escaped inside quotes.
@@ -670,6 +724,10 @@ async fn main_loop(
     let (status_tx, status_rx) = tokio::sync::watch::channel(String::new());
     tokio::spawn(socket_task(tx.clone(), status_rx));
     let (configure_tx, configure_rx) = mpsc::unbounded_channel();
+    // Linux: the portal. macOS/Windows: the tray backend registers `cfg.shortcut` (tray::Model::hotkey).
+    #[cfg(not(target_os = "linux"))]
+    drop(configure_rx);
+    #[cfg(target_os = "linux")]
     {
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -930,6 +988,7 @@ async fn main_loop(
             Ev::ConfigureShortcut => {
                 let _ = configure_tx.send(());
             }
+            Ev::ShortcutFailed(e) => notice.show("Shortcut not set", &format!("{e}. Pick another in the tray menu."), "dialog-error").await,
             Ev::Quit => break,
             Ev::LiveTick | Ev::Live(_) | Ev::SweepProgress(_) => unreachable!("handled above"),
         }
