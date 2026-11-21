@@ -46,6 +46,9 @@ impl Q8 {
             // SAFETY: the CPU supports the features enabled on q8_avx2.
             return unsafe { q8_avx2(self, x, b, y) };
         }
+        #[cfg(target_arch = "aarch64")]
+        return q8_neon(self, x, b, y); // NEON is in every 64-bit ARM CPU (Apple M chips included)
+        #[allow(unreachable_code)]
         q8_body(self, x, b, y)
     }
 }
@@ -75,6 +78,35 @@ unsafe fn q8_avx2(w: &Q8, x: &[f32], b: Option<&[f32]>, y: &mut [f32]) {
             let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
             let h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 1));
             *out = _mm_cvtss_f32(h) + b.map_or(0.0, |b| b[r]);
+        }
+    }
+}
+
+/// The same on ARM (NEON): 8 int8 -> two f32x4, fused multiply-add, one scale per block of 32.
+#[cfg(target_arch = "aarch64")]
+fn q8_neon(w: &Q8, x: &[f32], b: Option<&[f32]>, y: &mut [f32]) {
+    use std::arch::aarch64::*;
+    let nb = w.cols / 32;
+    assert!(x.len() >= nb * 32 && w.q.len() >= y.len() * w.cols && w.d.len() >= y.len() * nb);
+    for (r, out) in y.iter_mut().enumerate() {
+        // SAFETY: bounds asserted above; NEON is always present on aarch64.
+        unsafe {
+            let q = w.q.as_ptr().add(r * w.cols);
+            let mut total = vdupq_n_f32(0.0);
+            for blk in 0..nb {
+                let (mut lo_acc, mut hi_acc) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+                for j in 0..4 {
+                    let o = blk * 32 + j * 8;
+                    let q16 = vmovl_s8(vld1_s8(q.add(o)));
+                    let lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16)));
+                    let hi = vcvtq_f32_s32(vmovl_high_s16(q16));
+                    lo_acc = vfmaq_f32(lo_acc, lo, vld1q_f32(x.as_ptr().add(o)));
+                    hi_acc = vfmaq_f32(hi_acc, hi, vld1q_f32(x.as_ptr().add(o + 4)));
+                }
+                let d = vdupq_n_f32(*w.d.get_unchecked(r * nb + blk));
+                total = vfmaq_f32(total, vaddq_f32(lo_acc, hi_acc), d);
+            }
+            *out = vaddvq_f32(total) + b.map_or(0.0, |b| b[r]);
         }
     }
 }
