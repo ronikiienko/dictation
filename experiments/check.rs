@@ -1,7 +1,8 @@
 //! Check the app's transcription path on recorded takes: whole take in (long takes are cut at pauses inside asr),
 //! text out. One JSON line per take on stdout.
 //! usage: cargo run --release --example check -- <audio>...  (any format media.rs reads)   (uses the app's installed model)
-//! WEIGHTS=<file>: another weights file (e.g. Parakeet Redux converted by experiments/redux.rs).
+//! WEIGHTS=<file>: another weights file (e.g. Parakeet Redux converted by experiments/redux.rs). CPU=1: encoder on
+//! the CPU (src/asr/cpu.rs).
 //! LIVE=1: replay each take through the app's "paste while speaking" mode (asr::Live), audio fed in 300 ms steps.
 use dictation::*;
 use serde_json::json;
@@ -35,7 +36,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // KERNELS=<dir>: use another kernel cache folder (tests that would otherwise add entries to the app's own).
     asr::set_kernel_cache(&std::env::var("KERNELS").map(std::path::PathBuf::from).unwrap_or(m.kernel_cache()));
     let t = Instant::now();
-    let mut a = asr::Asr::load(&std::env::var("WEIGHTS").map(std::path::PathBuf::from).unwrap_or(m.weights()))?;
+    let w = std::env::var("WEIGHTS").map(std::path::PathBuf::from).unwrap_or(m.weights());
+    let mut a = if std::env::var("CPU").is_ok() { asr::Asr::load_cpu(&w)? } else { asr::Asr::load(&w)? };
     a.run(&vec![0.0; RATE])?;
     eprintln!("ready {:.2}s", t.elapsed().as_secs_f64());
     // GAP=<seconds>: idle this long before each take (GPU clocking down between takes vs back-to-back).
@@ -103,7 +105,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("unloaded {s:2} s: {}", status());
         }
         let t = Instant::now();
-        let mut a = asr::Asr::load(&std::env::var("WEIGHTS").map(std::path::PathBuf::from).unwrap_or(m.weights()))?;
+        let w = std::env::var("WEIGHTS").map(std::path::PathBuf::from).unwrap_or(m.weights());
+    let mut a = if std::env::var("CPU").is_ok() { asr::Asr::load_cpu(&w)? } else { asr::Asr::load(&w)? };
         a.run(&vec![0.0; RATE])?;
         eprintln!("reload + warm-up in {:.2}s: {}", t.elapsed().as_secs_f64(), status());
     }

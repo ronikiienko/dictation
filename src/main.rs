@@ -79,8 +79,12 @@ fn run_here(p: &PathBuf, srt: bool, local: &mut Option<asr::Asr>) -> Result<Stri
             if !m.installed() {
                 return Err("model not installed: start the app (`dictation`) and download it first".into());
             }
-            asr::set_kernel_cache(&m.kernel_cache());
-            local.insert(asr::Asr::load(&m.weights())?)
+            if Config::load().cpu {
+                local.insert(asr::Asr::load_cpu(&m.weights())?)
+            } else {
+                asr::set_kernel_cache(&m.kernel_cache());
+                local.insert(asr::Asr::load(&m.weights())?)
+            }
         }
     };
     let t = std::time::Instant::now();

@@ -292,8 +292,8 @@ impl PreEncode {
     }
 }
 
-/// NeMo RelPositionalEncoding: positions T-1 .. -(T-1), sin on even, cos on odd features; in the activations' dtype.
-pub fn pos_emb(t: usize, dev: &Device, dt: DType) -> Tensor<2> {
+/// NeMo RelPositionalEncoding: positions T-1 .. -(T-1), sin on even, cos on odd features: [2T-1][D].
+pub fn pos_emb_vec(t: usize) -> Vec<f32> {
     let n = 2 * t - 1;
     let mut v = vec![0f32; n * D];
     for r in 0..n {
@@ -304,7 +304,12 @@ pub fn pos_emb(t: usize, dev: &Device, dt: DType) -> Tensor<2> {
             v[r * D + i + 1] = (pos * div).cos() as f32;
         }
     }
-    Tensor::from_data(TensorData::new(v, [n, D]), (dev, dt))
+    v
+}
+
+/// `pos_emb_vec` as a tensor in the activations' dtype.
+pub fn pos_emb(t: usize, dev: &Device, dt: DType) -> Tensor<2> {
+    Tensor::from_data(TensorData::new(pos_emb_vec(t), [2 * t - 1, D]), (dev, dt))
 }
 
 pub struct Encoder {

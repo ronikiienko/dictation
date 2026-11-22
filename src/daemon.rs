@@ -98,7 +98,8 @@ enum Mem {
 // ---------------------------------------------------------------- engine: owns the model, runs on its own thread
 
 enum Job {
-    Load { weights: std::path::PathBuf, kernels: std::path::PathBuf },
+    /// `cpu`: the encoder on the CPU (no kernel cache used).
+    Load { weights: std::path::PathBuf, kernels: std::path::PathBuf, cpu: bool },
     /// Load + sweep (asr::Asr::sweep) + mark the GPU's kernel cache as swept. Progress -> Ev::SweepProgress.
     Sweep { weights: std::path::PathBuf, kernels: std::path::PathBuf },
     Unload,
@@ -122,12 +123,16 @@ fn engine(jobs: std_mpsc::Receiver<Job>, ev: mpsc::UnboundedSender<Ev>) {
     let mut live: Option<asr::Live> = None;
     for job in jobs {
         match job {
-            Job::Load { weights, kernels } => {
+            Job::Load { weights, kernels, cpu } => {
                 model = None; // free the old model first (VRAM)
-                asr::set_kernel_cache(&kernels);
                 let t = Instant::now();
                 let r = (|| -> Result<String, String> {
-                    let mut a = asr::Asr::load(&weights)?;
+                    let mut a = if cpu {
+                        asr::Asr::load_cpu(&weights)?
+                    } else {
+                        asr::set_kernel_cache(&kernels);
+                        asr::Asr::load(&weights)?
+                    };
                     a.run(&vec![0.0; RATE])?; // warm-up (the first run of new kernels compiles them, then cached)
                     model = Some(a);
                     Ok(format!("loaded in {:.1} s", t.elapsed().as_secs_f64()))
@@ -379,12 +384,31 @@ impl tray::Model for Tray {
         use tray::Item::*;
         let recording = self.state == State::Recording;
 
-        let mut gpu_options = vec![("Automatic (fastest)".to_string(), self.setting(|c| c.gpu = String::new()))];
+        // GPUs, then the CPU. Picking a GPU also turns the CPU off; picking the CPU keeps the GPU choice in
+        // config.toml for when you switch back.
+        let mut gpu_options = vec![(
+            "Automatic (fastest)".to_string(),
+            self.setting(|c| {
+                c.gpu = String::new();
+                c.cpu = false;
+            }),
+        )];
         for (name, kind) in &self.gpus {
             let n = name.clone();
-            gpu_options.push((format!("{name} ({kind})"), self.setting(move |c| c.gpu = n.clone())));
+            gpu_options.push((
+                format!("{name} ({kind})"),
+                self.setting(move |c| {
+                    c.gpu = n.clone();
+                    c.cpu = false;
+                }),
+            ));
         }
-        let gpu_selected = self.gpus.iter().position(|g| g.0 == self.cfg.gpu).map_or(0, |i| i + 1);
+        gpu_options.push(("CPU (no GPU)".to_string(), self.setting(|c| c.cpu = true)));
+        let gpu_selected = if self.cfg.cpu {
+            gpu_options.len() - 1
+        } else {
+            self.gpus.iter().position(|g| g.0 == self.cfg.gpu).map_or(0, |i| i + 1)
+        };
 
         let outputs = [
             (Output::Paste, PasteKeys::CtrlV),
@@ -428,11 +452,11 @@ impl tray::Model for Tray {
             },
             Separator,
             Sub {
-                label: "GPU".into(),
+                label: "Processor".into(),
                 items: vec![
                     Radio { options: gpu_options, selected: gpu_selected },
                     Separator,
-                    Label(format!("In use: {}", self.gpu)),
+                    Label(if self.cfg.cpu { "In use: CPU".into() } else { format!("In use: {}", self.gpu) }),
                     Label("Switching restarts the app".into()),
                 ],
             },
@@ -831,10 +855,22 @@ impl log::Log for StderrLog {
     fn flush(&self) {}
 }
 
+/// Set on the new process when the app restarts itself (another GPU / the CPU chosen).
+const RESTARTED: &str = "DICTATION_RESTARTED";
+
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     static LOG: StderrLog = StderrLog;
     if log::set_logger(&LOG).is_ok() {
         log::set_max_level(log::LevelFilter::Warn);
+    }
+    if std::env::var_os(RESTARTED).is_some() {
+        // Started by the old instance as it quits (see the end of `run`): give it time to go.
+        // SAFETY: still single-threaded here (main thread, before the tray and runtime start).
+        unsafe { std::env::remove_var(RESTARTED) };
+        let t = Instant::now();
+        while send("status").is_ok() && t.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
     if send("status").is_ok() {
         return Err("Dictation is already running (see the tray).".into());
@@ -869,13 +905,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         // The GPU we chose (asr::choose_gpu) is in our environment; without this, "Automatic" after a named GPU
         // would inherit it and stay on that GPU. The new process picks again from config.toml.
         cmd.env_remove("CUBECL_WGPU_DEFAULT_DEVICE");
-        #[cfg(unix)]
+        // Linux: replace this process. Elsewhere a new process (it waits for this one to quit): on macOS an exec'd
+        // process got no menu-bar icon back (2026-11-21), Windows has no exec.
+        #[cfg(target_os = "linux")]
         {
             use std::os::unix::process::CommandExt;
             return Err(format!("restart: {}", cmd.exec()).into());
         }
-        #[cfg(not(unix))]
-        cmd.spawn()?;
+        #[cfg(not(target_os = "linux"))]
+        cmd.env(RESTARTED, "1").spawn()?;
     }
     Ok(())
 }
@@ -981,11 +1019,12 @@ async fn main_loop(
     let mut load_failed = false; // stops "Always" from retrying a broken load every tick; a take or settings change retries
     let mut sweep_tried = false; // once per run: a failed sweep is not retried (takes still work, first ones slower)
     let mut restart = false; // another GPU chosen: restart once no take is running
+    let cpu = cfg.cpu; // fixed for this run: switching restarts the app
 
     // Queue a (re)load of the configured model on the engine thread. Takes queued after it wait for it.
     let load = |mem: &mut Mem| {
         let m = &models::MODEL;
-        let _ = jobs.send(Job::Load { weights: m.weights(), kernels: m.kernel_cache() });
+        let _ = jobs.send(Job::Load { weights: m.weights(), kernels: m.kernel_cache(), cpu });
         *mem = Mem::Loading;
     };
     if state == State::NoModel && models::MODEL.download_started() {
@@ -1233,7 +1272,7 @@ async fn main_loop(
                 if let Err(e) = new.save() {
                     eprintln!("save config: {e}");
                 }
-                restart |= new.gpu != cfg.gpu;
+                restart |= new.gpu != cfg.gpu || new.cpu != cfg.cpu;
                 cfg = new;
                 load_failed = false;
             }
@@ -1263,12 +1302,12 @@ async fn main_loop(
         }
         // A GPU change applies once the current take is pasted.
         if restart && rec.is_none() && busy == 0 {
-            println!("GPU changed to {:?}: restarting", if cfg.gpu.is_empty() { "automatic" } else { &cfg.gpu });
+            println!("GPU changed to {:?}: restarting", if cfg.cpu { "CPU" } else if cfg.gpu.is_empty() { "automatic" } else { &cfg.gpu });
             break;
         }
         // Once per GPU (and build): compile/tune kernels for every take length before the first take, so no take
         // waits for that. Takes are blocked meanwhile; the tray shows progress.
-        if state == State::Idle && rec.is_none() && busy == 0 && !sweep_tried && !asr::swept(&models::MODEL.kernel_cache()) {
+        if state == State::Idle && rec.is_none() && busy == 0 && !sweep_tried && !cpu && !asr::swept(&models::MODEL.kernel_cache()) {
             sweep_tried = true;
             let m = &models::MODEL;
             let _ = jobs.send(Job::Sweep { weights: m.weights(), kernels: m.kernel_cache() });

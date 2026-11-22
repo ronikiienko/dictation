@@ -7,6 +7,8 @@ use std::path::PathBuf;
 pub struct Config {
     /// GPU (adapter name), or "" for the default: the fastest one ("high performance").
     pub gpu: String,
+    /// Run the speech model on the CPU instead of the GPU (src/asr/cpu.rs): no GPU needed, nothing to tune.
+    pub cpu: bool,
     /// Microphone: cpal device id, or "" for the system default.
     pub microphone: String,
     /// What happens with the text.
@@ -75,6 +77,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             gpu: String::new(),
+            cpu: false,
             microphone: String::new(),
             output: Output::Paste,
             paste_keys: PasteKeys::CtrlV,

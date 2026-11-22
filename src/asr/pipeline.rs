@@ -1,5 +1,6 @@
 //! Whole pipeline: pcm (16 kHz mono f32) -> text. Mel and decoder on the CPU, encoder + pause head on the GPU.
 //! Order of steps follows transcribe.cpp `src/arch/parakeet/model.cpp` (MIT, (c) 2026 The transcribe.cpp authors).
+use super::cpu;
 use super::decoder::Decoder;
 use super::encoder::{valid_lengths, Encoder, Ld, Vad, PRE_CHUNK};
 use super::weights::Weights;
@@ -9,11 +10,14 @@ use super::tokenizer::Tokenizer;
 use burn::tensor::{DType, Device, FloatDType, Tensor, TensorData};
 use std::time::Instant;
 
+/// Where the encoder runs: GPU (burn) or CPU (cpu.rs).
+enum Engine {
+    Gpu { dev: Device, enc: Encoder, vad: Vad, joint_enc: (Tensor<2>, Tensor<2>) },
+    Cpu(cpu::Encoder),
+}
+
 pub struct Model {
-    dev: Device,
-    enc: Encoder,
-    vad: Vad,
-    joint_enc: (Tensor<2>, Tensor<2>),
+    engine: Engine,
     dec: Decoder,
     tok: Tokenizer,
     mel: Mel,
@@ -47,13 +51,21 @@ fn dec(v: f64) -> f64 {
 impl Model {
     /// Weights go to the GPU as f16 activations with int8 (Q8_0) matrices; the encoder's weights as persistent
     /// allocations (own buffers, not pages of the dynamic pool).
-    pub fn load(g: &Weights, dev: Device) -> Model {
-        // Test only: F32=1 f32 activations, DEQ=1 weights dequantized (no int8 kernels), to see what f16 + int8 cost.
-        let f32 = std::env::var("F32").is_ok();
-        let l = Ld { g, dev: &dev, low: if f32 { FloatDType::F32 } else { FloatDType::F16 }, q8: std::env::var("DEQ").is_err() };
-        let enc = dev.memory_persistent_allocations(&l, |l| Encoder::load(l));
-        let vad = Vad::load(&l);
-        let joint_enc = (l.lin("joint.enc.weight"), l.row("joint.enc.bias"));
+    /// `dev` None: the encoder on the CPU.
+    pub fn load(g: &Weights, dev: Option<Device>) -> Model {
+        let engine = match dev {
+            Some(dev) => {
+                // Test only: F32=1 f32 activations, DEQ=1 weights dequantized (no int8 kernels), to see what f16 +
+                // int8 cost.
+                let f32 = std::env::var("F32").is_ok();
+                let l = Ld { g, dev: &dev, low: if f32 { FloatDType::F32 } else { FloatDType::F16 }, q8: std::env::var("DEQ").is_err() };
+                let enc = dev.memory_persistent_allocations(&l, |l| Encoder::load(l));
+                let vad = Vad::load(&l);
+                let joint_enc = (l.lin("joint.enc.weight"), l.row("joint.enc.bias"));
+                Engine::Gpu { dev, enc, vad, joint_enc }
+            }
+            None => Engine::Cpu(cpu::Encoder::load(g)),
+        };
         let sr = g.int("stt.frontend.sample_rate") as usize;
         let hop = g.int("stt.frontend.hop_length") as usize;
         let mel = Mel::new(
@@ -83,29 +95,54 @@ impl Model {
         };
         let dec = Decoder::load(g);
         let tok = Tokenizer::load(g);
-        Model { enc, vad, joint_enc, dec, tok, mel, lf, hop, dev }
+        Model { engine, dec, tok, mel, lf, hop }
     }
 
     /// Padded with zero frames to a whole number of encoder frames (8 mel frames = 80 ms, plus the centre-padding
     /// frame), so the GPU only ever sees lengths on the 80 ms grid: an off-grid length is a new kernel shape, which
     /// means compiling (and tuning) during a take. Same result: the subsampler masks everything past the valid
     /// length (`valid_lengths`, from the real sample count), and valid frames only read up to the last real one.
-    fn mel_tensor(&self, pcm: &[f32]) -> Tensor<2> {
+    /// The CPU encoder gets the same padding, so both see the same input.
+    fn mel_padded(&self, pcm: &[f32]) -> (Vec<f32>, usize) {
         let mut m = self.mel.compute(pcm);
         let frames = (m.len() / self.mel.n_mels - 1).div_ceil(8) * 8 + 1;
         m.resize(frames * self.mel.n_mels, 0.0);
-        Tensor::from_data(TensorData::new(m, [frames, self.mel.n_mels]), (&self.dev, DType::F32))
+        (m, frames)
     }
 
-    /// Encoder output through the joint's encoder projection, on the GPU: [T_valid][joint_h] f32.
+    fn mel_tensor(&self, pcm: &[f32], dev: &Device) -> Tensor<2> {
+        let (m, frames) = self.mel_padded(pcm);
+        Tensor::from_data(TensorData::new(m, [frames, self.mel.n_mels]), (dev, DType::F32))
+    }
+
+    /// GPU: hand the memory pool's free pages back.
+    fn cleanup(&self) {
+        if let Engine::Gpu { dev, .. } = &self.engine {
+            dev.memory_cleanup();
+        }
+    }
+
+    /// Encoder output through the joint's encoder projection: [T_valid][joint_h] f32.
     fn encode(&self, pcm: &[f32], t: &mut Timing) -> (Vec<f32>, usize) {
+        let (enc, joint_enc, dev) = match &self.engine {
+            Engine::Gpu { dev, enc, joint_enc, .. } => (enc, joint_enc, dev),
+            Engine::Cpu(c) => {
+                let t0 = Instant::now();
+                let (mel, frames) = self.mel_padded(pcm);
+                t.mel += t0.elapsed().as_secs_f64() * 1e3;
+                let t0 = Instant::now();
+                let r = c.encode(&mel, frames, pcm.len());
+                t.enc += t0.elapsed().as_secs_f64() * 1e3;
+                return r;
+            }
+        };
         let t0 = Instant::now();
-        let mel = self.mel_tensor(pcm);
+        let mel = self.mel_tensor(pcm, dev);
         t.mel += t0.elapsed().as_secs_f64() * 1e3;
         let t0 = Instant::now();
-        let x = self.enc.fwd(mel, pcm.len());
+        let x = enc.fwd(mel, pcm.len());
         let n = x.dims()[0];
-        let p = (x.matmul(self.joint_enc.0.clone()) + self.joint_enc.1.clone()).cast(FloatDType::F32);
+        let p = (x.matmul(joint_enc.0.clone()) + joint_enc.1.clone()).cast(FloatDType::F32);
         let v = p.into_data().convert::<f32>().try_into_vec::<f32>().unwrap();
         t.enc += t0.elapsed().as_secs_f64() * 1e3;
         (v, n)
@@ -151,15 +188,22 @@ impl Model {
                 end: at + (b + 1) as f64 * frame,
             }));
         }
-        self.dev.memory_cleanup();
+        self.cleanup();
         (words, t)
     }
 
     /// Speech probability per encoder frame for one block (subsampler + pause head only).
     fn speech_probs(&self, pcm: &[f32]) -> Vec<f32> {
+        let (enc, vad, dev) = match &self.engine {
+            Engine::Gpu { dev, enc, vad, .. } => (enc, vad, dev),
+            Engine::Cpu(c) => {
+                let (mel, frames) = self.mel_padded(pcm);
+                return c.speech_probs(&mel, frames, pcm.len(), self.hop);
+            }
+        };
         let len = valid_lengths(pcm.len(), self.hop);
-        let x = self.enc.pre.fwd_chunked(self.mel_tensor(pcm), len, PRE_CHUNK);
-        let p = self.vad.fwd(x).into_data().convert::<f32>().try_into_vec::<f32>().unwrap();
+        let x = enc.pre.fwd_chunked(self.mel_tensor(pcm, dev), len, PRE_CHUNK);
+        let p = vad.fwd(x).into_data().convert::<f32>().try_into_vec::<f32>().unwrap();
         p[..p.len().min(len[3])].to_vec()
     }
 
@@ -190,7 +234,7 @@ impl Model {
     pub fn transcribe(&self, pcm: &[f32]) -> (String, Timing) {
         let mut t = Timing::default();
         let text = self.transcribe_inner(pcm, &mut t);
-        self.dev.memory_cleanup();
+        self.cleanup();
         (text, t)
     }
 

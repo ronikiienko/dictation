@@ -19,6 +19,9 @@ bytemuck = "1"
 bytes = "1"
 half = "2"
 memmap2 = "0.9"
+# CPU encoder (src/asr/cpu.rs): threads and f32 matrix products (both pure Rust, already in the tree via burn).
+rayon = "1"
+matrixmultiply = "0.3"
 realfft = "3"
 arboard = { version = "3.7.0", default-features = false, features = ["wayland-data-control"] }
 cpal = { version = "0.18.2", features = ["pulseaudio"] }

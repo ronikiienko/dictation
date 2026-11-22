@@ -4,6 +4,7 @@
 //!
 //! The model comes as transcribe.cpp's GGUF and is converted once into our weights file (weights.rs), which loads
 //! with no CPU work: memory-mapped and uploaded as is.
+mod cpu;
 mod decoder;
 mod encoder;
 mod gguf;
@@ -215,7 +216,8 @@ fn block_on<T>(f: impl Future<Output = T>) -> T {
 /// A loaded model. 16 kHz mono f32 in, text out. Dropping it frees the GPU memory it used.
 pub struct Asr {
     model: Option<pipeline::Model>,
-    dev: Device,
+    /// None: encoder on the CPU.
+    dev: Option<Device>,
 }
 
 impl Asr {
@@ -225,10 +227,16 @@ impl Asr {
             // The best GPU (wgpu prefers "high power" ones). f16 activations.
             let mut dev = device();
             let _ = dev.configure(DeviceConfig::default().float_dtype(FloatDType::F16)); // fails if already set
-            let model = pipeline::Model::load(&w, dev.clone());
+            let model = pipeline::Model::load(&w, Some(dev.clone()));
             let _ = Tensor::<1>::zeros([1], &dev).into_data(); // wait for the uploads
-            Ok(Asr { model: Some(model), dev })
+            Ok(Asr { model: Some(model), dev: Some(dev) })
         })
+    }
+
+    /// Everything on the CPU (cpu.rs): no GPU, no kernels to compile or tune.
+    pub fn load_cpu(weights_file: &Path) -> Result<Asr, String> {
+        let w = weights::Weights::open(weights_file).map_err(|e| e.to_string())?;
+        Ok(Asr { model: Some(pipeline::Model::load(&w, None)), dev: None })
     }
 
     /// Compiles (and tunes) ahead of time what real takes will need, so no take waits for it. Content doesn't
@@ -325,8 +333,9 @@ impl Asr {
 impl Drop for Asr {
     fn drop(&mut self) {
         self.model = None;
+        let Some(dev) = &self.dev else { return };
         let _ = guard(|| {
-            self.dev.memory_cleanup();
+            dev.memory_cleanup();
             Ok(())
         });
     }
