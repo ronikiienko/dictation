@@ -3,6 +3,7 @@
 //! (80 ms) before its first token (but not before the previous word's end) to the next word's start; 0.5 s of
 //! silence is added on both sides (like a short dictation take). One JSON line per word on stdout, summary on stderr.
 //! usage: cargo run --release --example words -- <audio>...   (any format media.rs reads; uses the app's model)
+//! WEIGHTS=<file>: another weights file.
 use dictation::*;
 use serde_json::json;
 
@@ -25,7 +26,7 @@ fn script(s: &str) -> &'static str {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let m = &models::MODEL;
     asr::set_kernel_cache(&m.kernel_cache());
-    let mut a = asr::Asr::load(&m.weights())?;
+    let mut a = asr::Asr::load(&std::env::var("WEIGHTS").map(std::path::PathBuf::from).unwrap_or(m.weights()))?;
     let pad = vec![0.0f32; RATE / 2];
     let mut count = std::collections::BTreeMap::<&str, usize>::new();
     for arg in std::env::args().skip(1) {

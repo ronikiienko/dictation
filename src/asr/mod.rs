@@ -20,7 +20,8 @@ use std::path::Path;
 
 pub use live::Live;
 pub use pipeline::{Timing, Word};
-pub use weights::{convert, is_current};
+pub use gguf::Value;
+pub use weights::{Blob, Weights, convert, is_current, q8_bytes, write};
 
 /// burn reports GPU failures (out of memory, lost device, ...) by panicking: turn them into errors.
 fn guard<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {

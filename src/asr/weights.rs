@@ -58,20 +58,21 @@ fn from_json(v: &Json) -> Value {
     }
 }
 
-/// burn's bytes for a Q8_0 tensor (int8 values + f16 scales).
-fn q8_bytes(q: Vec<i8>, d: &[f32], rows: usize, cols: usize) -> Vec<u8> {
+/// burn's bytes for a Q8_0 tensor (int8 values + f16 scales, one per block of 32 along cols).
+pub fn q8_bytes(q: Vec<i8>, d: &[f32], rows: usize, cols: usize) -> Vec<u8> {
     let data = TensorData::quantized(q, [rows, cols], q8_scheme(), d, None);
     data.as_bytes().to_vec()
 }
+
+/// One tensor for `write`: name, kind ("f32", "f16", "q8"), shape, bytes in that kind's layout.
+pub type Blob = (String, &'static str, Vec<usize>, Vec<u8>);
 
 /// GGUF -> our file. Every Q8_0 tensor is checked: its stored bytes must read back as the GGUF's values and scales.
 pub fn convert(src: &Path, dst: &Path) -> io::Result<()> {
     let g = Gguf::open(src)?;
     let mut names: Vec<&String> = g.tensors.keys().collect();
     names.sort();
-    let mut tensors = Map::new();
-    let mut blobs: Vec<Vec<u8>> = Vec::new();
-    let mut offset = 0usize;
+    let mut blobs = Vec::new();
     for name in names {
         let (kind, shape, blob) = if let Some((q, d, shape)) = g.q8_0(name) {
             let cols = *shape.last().unwrap();
@@ -86,12 +87,21 @@ pub fn convert(src: &Path, dst: &Path) -> io::Result<()> {
             let (v, shape) = g.f32(name);
             ("f32", shape, v.iter().flat_map(|x| x.to_le_bytes()).collect())
         };
+        blobs.push((name.clone(), kind, shape, blob));
+    }
+    write(dst, &g.meta, blobs)
+}
+
+/// Our file from metadata and tensors (written next to `dst`, then renamed).
+pub fn write(dst: &Path, meta: &HashMap<String, Value>, blobs: Vec<Blob>) -> io::Result<()> {
+    let mut tensors = Map::new();
+    let mut offset = 0usize;
+    for (name, kind, shape, blob) in &blobs {
         offset = offset.next_multiple_of(TENSOR_ALIGN);
         tensors.insert(name.clone(), json!({ "kind": kind, "shape": shape, "offset": offset, "len": blob.len() }));
         offset += blob.len();
-        blobs.push(blob);
     }
-    let meta: Map<String, Json> = g.meta.iter().map(|(k, v)| (k.clone(), to_json(v))).collect();
+    let meta: Map<String, Json> = meta.iter().map(|(k, v)| (k.clone(), to_json(v))).collect();
     let header = serde_json::to_vec(&json!({ "format": FORMAT, "layout": LAYOUT, "meta": meta, "tensors": tensors }))?;
 
     let tmp = dst.with_extension("part");
@@ -104,7 +114,7 @@ pub fn convert(src: &Path, dst: &Path) -> io::Result<()> {
     let start = pos.next_multiple_of(DATA_ALIGN);
     f.write_all(&vec![0u8; start - pos])?;
     pos = 0;
-    for blob in &blobs {
+    for (_, _, _, blob) in &blobs {
         let pad = pos.next_multiple_of(TENSOR_ALIGN) - pos;
         f.write_all(&vec![0u8; pad])?;
         f.write_all(blob)?;
@@ -185,6 +195,12 @@ impl Weights {
     }
     pub fn kind(&self, name: &str) -> &str {
         &self.entry(name).kind
+    }
+    pub fn shape(&self, name: &str) -> Vec<usize> {
+        self.entry(name).shape.clone()
+    }
+    pub fn names(&self) -> Vec<String> {
+        self.tensors.keys().cloned().collect()
     }
     /// Tensor as f32 (q8 dequantized), shape in PyTorch order.
     pub fn f32(&self, name: &str) -> (Vec<f32>, Vec<usize>) {
