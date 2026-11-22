@@ -22,7 +22,7 @@ use std::path::Path;
 
 pub use live::Live;
 pub use pipeline::{Timing, Word};
-pub use gguf::Value;
+pub use gguf::{Gguf, Value};
 pub use redux::convert as convert_redux;
 pub use weights::{Blob, Weights, convert, is_current, q8_bytes, write};
 
