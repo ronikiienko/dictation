@@ -34,6 +34,8 @@ fn socket_name() -> std::io::Result<interprocess::local_socket::Name<'static>> {
 
 pub enum Ev {
     Toggle,
+    /// The microphone of take number .0 delivers real sound (audio::Recorder::start): now show "recording".
+    MicLive(u64),
     /// New settings chosen in the tray menu.
     Set(Config),
     /// config.toml edited by hand (`dictation reload`).
@@ -81,6 +83,9 @@ pub struct Take {
 enum State {
     NoModel,
     Idle,
+    /// A take started, but the microphone gives no sound yet (a Bluetooth headset switching to headset mode):
+    /// not shown as recording, so nobody speaks into it yet.
+    Starting,
     Recording,
     Transcribing,
     /// One-time per GPU: compiling (and tuning) kernels for every take length (Job::Sweep). No takes meanwhile.
@@ -243,6 +248,7 @@ impl Tray {
         match self.state {
             State::NoModel => "No model yet — click to download".into(),
             State::Idle => format!("Ready{key}"),
+            State::Starting => "Starting the microphone…".into(),
             State::Recording => format!("● Recording{key}"),
             State::Transcribing => "Transcribing…".into(),
             State::Optimizing => {
@@ -344,7 +350,7 @@ impl tray::Model for Tray {
             State::Transcribing => Icon::Transcribing,
             State::Optimizing => Icon::Optimizing,
             State::NoModel => Icon::Warning,
-            State::Idle => Icon::Idle,
+            State::Idle | State::Starting => Icon::Idle,
         }
     }
     fn attention(&self) -> bool {
@@ -382,7 +388,7 @@ impl tray::Model for Tray {
     }
     fn menu(&self) -> Vec<tray::Item> {
         use tray::Item::*;
-        let recording = self.state == State::Recording;
+        let recording = matches!(self.state, State::Starting | State::Recording);
 
         // GPUs, then the CPU. Picking a GPU also turns the CPU off; picking the CPU keeps the GPU choice in
         // config.toml for when you switch back.
@@ -432,7 +438,7 @@ impl tray::Model for Tray {
             Separator,
             Action {
                 label: if recording { "Stop dictation" } else { "Start dictation" }.into(),
-                enabled: matches!(self.state, State::Idle | State::Recording | State::Transcribing),
+                enabled: matches!(self.state, State::Idle | State::Starting | State::Recording | State::Transcribing),
                 click: self.send(|| Ev::Toggle),
             },
             Sub {
@@ -440,12 +446,12 @@ impl tray::Model for Tray {
                 items: vec![
                     Action {
                         label: "As text (.txt)…".into(),
-                        enabled: matches!(self.state, State::Idle | State::Recording | State::Transcribing),
+                        enabled: matches!(self.state, State::Idle | State::Starting | State::Recording | State::Transcribing),
                         click: self.send(|| Ev::PickFiles(false)),
                     },
                     Action {
                         label: "As subtitles (.srt)…".into(),
-                        enabled: matches!(self.state, State::Idle | State::Recording | State::Transcribing),
+                        enabled: matches!(self.state, State::Idle | State::Starting | State::Recording | State::Transcribing),
                         click: self.send(|| Ev::PickFiles(true)),
                     },
                 ],
@@ -1027,6 +1033,7 @@ async fn main_loop(
     let mut kb = Keyboard::new(true).map_err(|e| eprintln!("virtual keyboard: {e}")).ok();
     let mut notice = Notice { enabled: cfg.notifications, ..Default::default() };
     let mut rec: Option<audio::Recorder> = None;
+    let mut take_no = 0u64; // numbers takes, so a late Ev::MicLive of a stopped take is ignored
     let mut shortcut = String::new();
     let mut busy = 0usize; // takes queued in the engine
     let mut downloading = false;
@@ -1086,10 +1093,16 @@ async fn main_loop(
         };
         match ev {
             Ev::Toggle => match (state, rec.take()) {
-                (State::Idle | State::Transcribing, None) => match audio::Recorder::start(&cfg.microphone) {
+                (State::Idle | State::Transcribing, None) => match audio::Recorder::start(&cfg.microphone, {
+                    take_no += 1;
+                    let (tx, n) = (tx.clone(), take_no);
+                    move || {
+                        let _ = tx.send(Ev::MicLive(n));
+                    }
+                }) {
                     Ok(r) => {
                         rec = Some(r);
-                        state = State::Recording;
+                        state = State::Starting;
                         last_used = Instant::now();
                         if mem == Mem::Unloaded {
                             load_failed = false;
@@ -1098,9 +1111,6 @@ async fn main_loop(
                         live_on = cfg.live && cfg.output == Output::Paste;
                         if live_on {
                             let _ = jobs.send(Job::LiveStart);
-                        }
-                        if cfg.sounds {
-                            audio::play(audio::Cue::Start);
                         }
                     }
                     Err(e) => {
@@ -1154,6 +1164,14 @@ async fn main_loop(
                 }
                 _ => {}
             },
+            Ev::MicLive(n) => {
+                if n == take_no && state == State::Starting && rec.is_some() {
+                    state = State::Recording;
+                    if cfg.sounds {
+                        audio::play(audio::Cue::Start);
+                    }
+                }
+            }
             Ev::Done(r) => {
                 busy = busy.saturating_sub(1);
                 last_used = Instant::now();
@@ -1179,7 +1197,7 @@ async fn main_loop(
                         // on the clipboard), a notification on every take was just noise (user, 2026-11-20).
                         if let Some((title, body)) = problem {
                             notice.show(title, &body, "dialog-error").await;
-                        } else if t.text.is_empty() && state != State::Recording {
+                        } else if t.text.is_empty() && !matches!(state, State::Starting | State::Recording) {
                             notice.show("Nothing recognized", "", "dialog-information").await;
                         }
                         println!("{:.1}s audio, {:.0} ms: {}", t.audio.len() as f64 / RATE as f64, t.ms, t.text);

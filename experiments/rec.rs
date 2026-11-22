@@ -9,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let (src, secs, out) = (&a[1], a[2].parse::<f64>()?, &a[3]);
-    let r = dictation::audio::Recorder::start(src)?;
+    let r = dictation::audio::Recorder::start(src, || {})?;
     std::thread::sleep(std::time::Duration::from_secs_f64(secs));
     let x = r.stop()?;
     let peak = x.iter().fold(0f32, |m, v| m.max(v.abs()));

@@ -1,11 +1,17 @@
 //! Recording (microphone or system audio; cpal, PulseAudio protocol -> PipeWire on Linux) and short sounds (rodio).
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use crate::RATE;
 
 /// Keep recording this long after stop is pressed, so the block in flight is delivered.
-const TAIL: std::time::Duration = std::time::Duration::from_millis(150);
+const TAIL: Duration = Duration::from_millis(150);
+
+/// A microphone that still gives only exact zeros after this long is taken as live anyway (muted, no permission):
+/// the take then goes on as before instead of hanging in "starting".
+const WAKE_LIMIT: Duration = Duration::from_millis(2500);
 
 fn host() -> cpal::Host {
     #[cfg(target_os = "linux")]
@@ -43,14 +49,19 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    pub fn start(device: &str) -> Result<Recorder, String> {
+    /// `on_live` is called once, from the recording thread, when the microphone delivers real sound. Until then a
+    /// Bluetooth headset is still switching to its headset mode (0.4-1.6 s on Bluetooth headphones) and macOS hands over exact
+    /// zeros: those are dropped, and the app shows "recording" only from `on_live` on, so speech isn't lost in them.
+    /// System audio is live at once (silence there is real zeros); after WAKE_LIMIT a mic counts as live anyway.
+    pub fn start(device: &str, on_live: impl FnOnce() + Send + 'static) -> Result<Recorder, String> {
         let device = device.to_string();
         let (stop_tx, stop_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let buf = Arc::new(Mutex::new(Vec::<f32>::with_capacity(RATE * 60)));
-        let b = buf.clone();
+        let live = Arc::new(AtomicBool::new(device == SYSTEM_AUDIO));
+        let (b, l) = (buf.clone(), live.clone());
         let thread = std::thread::spawn(move || -> Result<Vec<f32>, String> {
-            let (stream, rate, channels) = match open(&device, b.clone()) {
+            let (stream, rate, channels) = match open(&device, b.clone(), l.clone()) {
                 Ok(s) => {
                     let _ = ready_tx.send(Ok((s.1, s.2)));
                     s
@@ -60,7 +71,19 @@ impl Recorder {
                     return Err(e);
                 }
             };
-            let _ = stop_rx.recv();
+            let t = Instant::now();
+            let mut on_live = Some(on_live);
+            loop {
+                match stop_rx.recv_timeout(Duration::from_millis(10)) {
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    _ => break,
+                }
+                if on_live.is_some() && (l.load(Ordering::Relaxed) || t.elapsed() >= WAKE_LIMIT) {
+                    l.store(true, Ordering::Relaxed);
+                    println!("microphone live after {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
+                    on_live.take().unwrap()();
+                }
+            }
             std::thread::sleep(TAIL); // let the last block arrive before closing
             drop(stream);
             let raw = std::mem::take(&mut *b.lock().unwrap());
@@ -82,7 +105,7 @@ impl Recorder {
     }
 }
 
-fn open(device: &str, buf: Arc<Mutex<Vec<f32>>>) -> Result<(cpal::Stream, u32, u16), String> {
+fn open(device: &str, buf: Arc<Mutex<Vec<f32>>>, live: Arc<AtomicBool>) -> Result<(cpal::Stream, u32, u16), String> {
     let host = host();
     // System audio: an input stream on the output device. cpal records it with a Core Audio process tap on macOS
     // (14.6+, asks for "System Audio Recording" permission; denied = silence, not an error), WASAPI loopback on Windows.
@@ -114,13 +137,26 @@ fn open(device: &str, buf: Arc<Mutex<Vec<f32>>>) -> Result<(cpal::Stream, u32, u
         cfg.buffer_size = cpal::BufferSize::Fixed(frames);
     }
     let (rate, ch) = (cfg.sample_rate, cfg.channels);
+    // Appends a block; before the mic is live, from its first non-zero value on (whole frames), dropping the rest.
+    let keep = move |d: &mut dyn Iterator<Item = f32>| {
+        let mut b = buf.lock().unwrap();
+        if live.load(Ordering::Relaxed) {
+            b.extend(d);
+            return;
+        }
+        let x: Vec<f32> = d.collect();
+        if let Some(i) = x.iter().position(|&v| v != 0.0) {
+            live.store(true, Ordering::Relaxed);
+            b.extend_from_slice(&x[i - i % ch as usize..]);
+        }
+    };
     let s = match def.sample_format() {
         cpal::SampleFormat::F32 => {
-            dev.build_input_stream(cfg.clone(), move |d: &[f32], _: &_| buf.lock().unwrap().extend_from_slice(d), err, None)
+            dev.build_input_stream(cfg.clone(), move |d: &[f32], _: &_| keep(&mut d.iter().copied()), err, None)
         }
         cpal::SampleFormat::I16 => dev.build_input_stream(
             cfg.clone(),
-            move |d: &[i16], _: &_| buf.lock().unwrap().extend(d.iter().map(|&v| v as f32 / 32768.0)),
+            move |d: &[i16], _: &_| keep(&mut d.iter().map(|&v| v as f32 / 32768.0)),
             err,
             None,
         ),
