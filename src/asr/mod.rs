@@ -12,6 +12,7 @@ mod live;
 mod longform;
 mod mel;
 mod pipeline;
+mod redux;
 mod tokenizer;
 mod weights;
 
@@ -22,6 +23,7 @@ use std::path::Path;
 pub use live::Live;
 pub use pipeline::{Timing, Word};
 pub use gguf::Value;
+pub use redux::convert as convert_redux;
 pub use weights::{Blob, Weights, convert, is_current, q8_bytes, write};
 
 /// burn reports GPU failures (out of memory, lost device, ...) by panicking: turn them into errors.
@@ -224,6 +226,9 @@ impl Asr {
     pub fn load(weights_file: &Path) -> Result<Asr, String> {
         guard(|| {
             let w = weights::Weights::open(weights_file).map_err(|e| e.to_string())?;
+            if w.has_ternary() {
+                return Err("Parakeet Redux runs on the CPU only (GPU: not implemented). Choose Processor → CPU.".into());
+            }
             // The best GPU (wgpu prefers "high power" ones). f16 activations.
             let mut dev = device();
             let _ = dev.configure(DeviceConfig::default().float_dtype(FloatDType::F16)); // fails if already set

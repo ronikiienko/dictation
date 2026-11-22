@@ -236,8 +236,8 @@ impl Tray {
     fn status_text(&self) -> String {
         let key = if self.shortcut.is_empty() { String::new() } else { format!(" — {}", self.shortcut) };
         match self.download {
-            Some((_, true)) => return format!("Checking and converting {}…", models::MODEL.name),
-            Some((pct, false)) => return format!("Downloading {}… {pct}%", models::MODEL.name),
+            Some((_, true)) => return format!("Checking and converting {}…", models::current().name),
+            Some((pct, false)) => return format!("Downloading {}… {pct}%", models::current().name),
             None => {}
         }
         match self.state {
@@ -458,6 +458,24 @@ impl tray::Model for Tray {
                     Separator,
                     Label(if self.cfg.cpu { "In use: CPU".into() } else { format!("In use: {}", self.gpu) }),
                     Label("Switching restarts the app".into()),
+                ],
+            },
+            Sub {
+                label: "Model".into(),
+                items: vec![
+                    Radio {
+                        options: models::ALL
+                            .iter()
+                            .map(|m| {
+                                let label = if m.gpu { m.name.to_string() } else { format!("{} — CPU only", m.name) };
+                                (label, self.setting(move |c| c.model = m.id.to_string()))
+                            })
+                            .collect(),
+                        selected: models::ALL.iter().position(|m| m.id == models::current().id).unwrap_or(0),
+                    },
+                    Separator,
+                    Label("Redux: less memory, less accurate; on a GPU: not implemented".into()),
+                    Label("Switching restarts the app (a new model downloads first)".into()),
                 ],
             },
             Sub {
@@ -877,7 +895,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let cfg = Config::load();
     let (tx, rx) = mpsc::unbounded_channel::<Ev>();
-    let state = if models::MODEL.installed() { State::Idle } else { State::NoModel };
+    let state = if models::current().installed() { State::Idle } else { State::NoModel };
     let model = Tray {
         state,
         mem: Mem::Unloaded,
@@ -923,7 +941,7 @@ fn start_download(tx: &mpsc::UnboundedSender<Ev>, tray: &tray::Handle<Tray>) {
     {
         let (p, tx) = (p.clone(), tx.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(Ev::Downloaded(models::download(&models::MODEL, &p)));
+            let _ = tx.send(Ev::Downloaded(models::download(models::current(), &p)));
         });
     }
     let tray = tray.clone();
@@ -959,7 +977,7 @@ async fn main_loop(
         let tx = tx.clone();
         std::thread::Builder::new().name("engine".into()).spawn(move || engine(jobs_rx, tx))?;
     }
-    let installed = || models::MODEL.installed();
+    let installed = || models::current().installed();
     let (status_tx, status_rx) = tokio::sync::watch::channel(String::new());
     tokio::spawn(socket_task(tx.clone(), status_rx));
     let (configure_tx, configure_rx) = mpsc::unbounded_channel();
@@ -1023,17 +1041,17 @@ async fn main_loop(
 
     // Queue a (re)load of the configured model on the engine thread. Takes queued after it wait for it.
     let load = |mem: &mut Mem| {
-        let m = &models::MODEL;
+        let m = models::current();
         let _ = jobs.send(Job::Load { weights: m.weights(), kernels: m.kernel_cache(), cpu });
         *mem = Mem::Loading;
     };
-    if state == State::NoModel && models::MODEL.download_started() {
+    if state == State::NoModel && models::current().download_started() {
         // A download to finish, or a GGUF from an older version of the app to check and convert.
         downloading = true;
         start_download(&tx, &tray);
         tray.update(|t: &mut Tray| t.download = Some((0, false))).await;
     } else if state == State::NoModel {
-        notice.show("Dictation needs a model", "Click the tray icon to download Parakeet Ultra (740 MB).", "dialog-information").await;
+        notice.show("Dictation needs a model", &format!("Click the tray icon to download {} ({} MB).", models::current().name, models::current().size_mb()), "dialog-information").await;
     }
     let _ = tx.send(Ev::Tick); // first pass of the checks below: optimizing for the GPU, "Always" loading
 
@@ -1216,7 +1234,7 @@ async fn main_loop(
                 Ok(info) => {
                     println!("model loaded ({info})");
                     mem = Mem::Loaded;
-                    let detail = format!("{}, {info}", models::MODEL.name);
+                    let detail = format!("{}, {info}", models::current().name);
                     tray.update(move |t: &mut Tray| t.detail = detail).await;
                 }
                 Err(e) => {
@@ -1234,7 +1252,7 @@ async fn main_loop(
                     Ok(info) => {
                         println!("GPU optimized: {gpu}, {info}");
                         mem = Mem::Loaded;
-                        let detail = format!("{}, {info}", models::MODEL.name);
+                        let detail = format!("{}, {info}", models::current().name);
                         tray.update(move |t: &mut Tray| t.detail = detail).await;
                         notice.show("Dictation is ready", &format!("Tuned for {gpu}. This won't be needed again."), "dialog-ok").await;
                     }
@@ -1264,7 +1282,7 @@ async fn main_loop(
                 downloading = false;
                 tray.update(|t: &mut Tray| t.download = None).await;
                 match r {
-                    Ok(()) => notice.show("Model downloaded", models::MODEL.name, "dialog-ok").await,
+                    Ok(()) => notice.show("Model downloaded", models::current().name, "dialog-ok").await,
                     Err(e) => notice.show("Download failed", &e, "dialog-error").await,
                 }
             }
@@ -1272,7 +1290,7 @@ async fn main_loop(
                 if let Err(e) = new.save() {
                     eprintln!("save config: {e}");
                 }
-                restart |= new.gpu != cfg.gpu || new.cpu != cfg.cpu;
+                restart |= new.gpu != cfg.gpu || new.cpu != cfg.cpu || models::by_id(&new.model).id != models::current().id;
                 cfg = new;
                 load_failed = false;
             }
@@ -1298,18 +1316,18 @@ async fn main_loop(
                 let _ = jobs.send(Job::Unload);
                 mem = Mem::Unloaded;
             }
-            println!("model file missing: {}", models::MODEL.weights().display());
+            println!("model file missing: {}", models::current().weights().display());
         }
         // A GPU change applies once the current take is pasted.
         if restart && rec.is_none() && busy == 0 {
-            println!("GPU changed to {:?}: restarting", if cfg.cpu { "CPU" } else if cfg.gpu.is_empty() { "automatic" } else { &cfg.gpu });
+            println!("model or processor changed ({}, {:?}): restarting", models::by_id(&cfg.model).id, if cfg.cpu { "CPU" } else if cfg.gpu.is_empty() { "automatic" } else { &cfg.gpu });
             break;
         }
         // Once per GPU (and build): compile/tune kernels for every take length before the first take, so no take
         // waits for that. Takes are blocked meanwhile; the tray shows progress.
-        if state == State::Idle && rec.is_none() && busy == 0 && !sweep_tried && !cpu && !asr::swept(&models::MODEL.kernel_cache()) {
+        if state == State::Idle && rec.is_none() && busy == 0 && !sweep_tried && !cpu && models::current().gpu && !asr::swept(&models::current().kernel_cache()) {
             sweep_tried = true;
-            let m = &models::MODEL;
+            let m = models::current();
             let _ = jobs.send(Job::Sweep { weights: m.weights(), kernels: m.kernel_cache() });
             state = State::Optimizing;
             mem = Mem::Loading;

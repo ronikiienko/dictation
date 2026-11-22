@@ -9,6 +9,8 @@ pub struct Config {
     pub gpu: String,
     /// Run the speech model on the CPU instead of the GPU (src/asr/cpu.rs): no GPU needed, nothing to tune.
     pub cpu: bool,
+    /// Speech model id (models.rs), "" = the default (Parakeet Ultra).
+    pub model: String,
     /// Microphone: cpal device id, or "" for the system default.
     pub microphone: String,
     /// What happens with the text.
@@ -78,6 +80,7 @@ impl Default for Config {
         Config {
             gpu: String::new(),
             cpu: false,
+            model: String::new(),
             microphone: String::new(),
             output: Output::Paste,
             paste_keys: PasteKeys::CtrlV,

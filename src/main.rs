@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 /// `full`: the old exhaustive sweep (every 80 ms to 30 s, full takes to 120 s), to check the short one misses nothing.
 fn sweep(full: bool) -> Result<(), String> {
-    let m = &models::MODEL;
+    let m = models::current();
     if !m.installed() {
         return Err("model not installed: start the app and download it first".into());
     }
@@ -75,7 +75,7 @@ fn run_here(p: &PathBuf, srt: bool, local: &mut Option<asr::Asr>) -> Result<Stri
     let a = match local {
         Some(a) => a,
         None => {
-            let m = &models::MODEL;
+            let m = models::current();
             if !m.installed() {
                 return Err("model not installed: start the app (`dictation`) and download it first".into());
             }

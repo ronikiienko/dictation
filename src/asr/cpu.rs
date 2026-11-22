@@ -85,6 +85,9 @@ impl QLin {
         let shape = g.shape(name);
         let (n, k) = (shape[0], shape[1..].iter().product::<usize>());
         let bias = bias.map(|b| g.f32(b).0);
+        if let Some((q, d, _)) = g.ternary(name) {
+            return QLin::pack(&q, &d, n, k, super::redux::GROUP, bias); // stays 2-bit (pack sees the codes)
+        }
         if let Some((q, d, _)) = g.q8_0(name) {
             // Scales repeated over 4 blocks everywhere: one block of 128.
             let nb = k / 32;

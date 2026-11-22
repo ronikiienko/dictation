@@ -1,6 +1,7 @@
 //! Check the app's transcription path on recorded takes: whole take in (long takes are cut at pauses inside asr),
 //! text out. One JSON line per take on stdout.
 //! usage: cargo run --release --example check -- <audio>...  (any format media.rs reads)   (uses the app's installed model)
+//! MODEL=<id> (models.rs, e.g. parakeet-redux): that model, downloaded like the app does if missing.
 //! WEIGHTS=<file>: another weights file (e.g. Parakeet Redux converted by experiments/redux.rs). CPU=1: encoder on
 //! the CPU (src/asr/cpu.rs).
 //! LIVE=1: replay each take through the app's "paste while speaking" mode (asr::Live), audio fed in 300 ms steps.
@@ -26,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("LOG").is_ok() {
         let _ = log::set_logger(&Log).map(|_| log::set_max_level(log::LevelFilter::Debug));
     }
-    let m = &models::MODEL;
+    let m = models::by_id(&std::env::var("MODEL").unwrap_or_default()); // MODEL=parakeet-redux: that model
     if !m.installed() {
         // Same as the app: finish the download (or take an older version's GGUF), check, convert.
         let t = Instant::now();

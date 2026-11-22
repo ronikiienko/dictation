@@ -5,7 +5,9 @@
 //! Data starts at a 4096-byte boundary, every tensor at a 64-byte boundary (offsets are relative to the data start).
 //! Kinds: "f32", "f16" (as stored in the GGUF), "q8" (Q8_0 in burn's quantized byte layout: the int8 values, then one
 //! f16 scale per block of 32, aligned to 4; 2-D [rows, cols] with blocks along cols). The q8 layout belongs to burn
-//! 0.22: `LAYOUT` names it, and a file with another layout must be converted again.
+//! 0.22: `LAYOUT` names it, and a file with another layout must be converted again. "t2" (Parakeet Redux, redux.rs;
+//! CPU only): ternary codes + 1 (0..2), 4 per byte, lowest bits first, row-major, then one f32 scale per group of
+//! 128 along each row.
 use super::gguf::{Gguf, Value};
 use burn::tensor::quantization::{QuantScheme, QuantValue, ScaleDtype};
 use burn::tensor::{AllocationProperty, Bytes, DType, TensorData};
@@ -217,6 +219,24 @@ impl Weights {
             k => panic!("{name}: unknown kind {k}"),
         };
         (v, e.shape.clone())
+    }
+
+    /// "t2" tensor as codes -1/0/+1 [rows][cols] and f32 scales [rows][cols / 128]. None if not t2.
+    pub fn ternary(&self, name: &str) -> Option<(Vec<i8>, Vec<f32>, Vec<usize>)> {
+        let e = self.entry(name);
+        if e.kind != "t2" {
+            return None;
+        }
+        let n: usize = e.shape.iter().product();
+        let b = self.raw(e);
+        let codes = b[..n.div_ceil(4)].iter().flat_map(|&v| (0..4).map(move |j| ((v >> (2 * j)) & 3) as i8 - 1)).take(n).collect();
+        let s = b[n.div_ceil(4)..].chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).collect();
+        Some((codes, s, e.shape.clone()))
+    }
+
+    /// Whether any tensor is stored as "t2" (CPU only).
+    pub fn has_ternary(&self) -> bool {
+        self.tensors.values().any(|e| e.kind == "t2")
     }
 
     /// Q8_0 tensor as int8 values + one f32 scale per block of 32 (CPU decoder). None if not q8.
