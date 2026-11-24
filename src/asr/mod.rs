@@ -227,7 +227,7 @@ impl Asr {
         guard(|| {
             let w = weights::Weights::open(weights_file).map_err(|e| e.to_string())?;
             if w.has_ternary() {
-                return Err("Parakeet Redux runs on the CPU only (GPU: not implemented). Choose Processor → CPU.".into());
+                return Err("Parakeet Redux runs on the CPU only (GPU: not implemented). Choose Model → Parakeet Redux — CPU.".into());
             }
             // The best GPU (wgpu prefers "high power" ones). f16 activations.
             let mut dev = device();

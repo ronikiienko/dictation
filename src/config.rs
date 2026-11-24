@@ -99,13 +99,21 @@ pub fn path() -> PathBuf {
 }
 
 impl Config {
-    /// Missing file -> defaults (and writes them, so there is something to look at).
+    /// Missing file -> defaults (and writes them, so there is something to look at). A CPU-only model set to run on
+    /// the GPU (e.g. an older menu allowed it) is moved to the CPU and saved.
     pub fn load() -> Config {
         match std::fs::read_to_string(path()) {
-            Ok(s) => toml::from_str(&s).unwrap_or_else(|e| {
-                eprintln!("config.toml: {e}; using defaults");
-                Config::default()
-            }),
+            Ok(s) => {
+                let mut c: Config = toml::from_str(&s).unwrap_or_else(|e| {
+                    eprintln!("config.toml: {e}; using defaults");
+                    Config::default()
+                });
+                if !c.cpu && !crate::models::by_id(&c.model).gpu {
+                    c.cpu = true;
+                    let _ = c.save();
+                }
+                c
+            }
             Err(_) => {
                 let c = Config::default();
                 let _ = c.save();

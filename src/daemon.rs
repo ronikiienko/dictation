@@ -390,31 +390,46 @@ impl tray::Model for Tray {
         use tray::Item::*;
         let recording = matches!(self.state, State::Starting | State::Recording);
 
-        // GPUs, then the CPU. Picking a GPU also turns the CPU off; picking the CPU keeps the GPU choice in
-        // config.toml for when you switch back.
-        let mut gpu_options = vec![(
-            "Automatic (fastest)".to_string(),
-            self.setting(|c| {
-                c.gpu = String::new();
-                c.cpu = false;
-            }),
-        )];
-        for (name, kind) in &self.gpus {
-            let n = name.clone();
-            gpu_options.push((
-                format!("{name} ({kind})"),
+        // Model × processor in one list, only combinations that run: a GPU model on each GPU (plus "automatic" when
+        // there is more than one) and on the CPU; a CPU-only model on the CPU. Picking the CPU keeps the GPU choice
+        // in config.toml for when you switch back.
+        let mut model_options = Vec::new();
+        let mut model_selected = 0;
+        let chosen = models::by_id(&self.cfg.model).id;
+        for m in models::ALL {
+            let this = m.id == chosen;
+            if m.gpu {
+                let mut gpus: Vec<(String, String)> =
+                    self.gpus.iter().map(|(n, k)| (n.clone(), format!("{} — {n} ({k})", m.name))).collect();
+                if gpus.len() > 1 {
+                    gpus.insert(0, (String::new(), format!("{} — Automatic", m.name)));
+                }
+                for (gpu, label) in gpus {
+                    let matches = gpu == self.cfg.gpu || (self.cfg.gpu.is_empty() && self.gpus.len() == 1);
+                    if this && !self.cfg.cpu && matches {
+                        model_selected = model_options.len();
+                    }
+                    model_options.push((
+                        label,
+                        self.setting(move |c| {
+                            c.model = m.id.to_string();
+                            c.gpu = gpu.clone();
+                            c.cpu = false;
+                        }),
+                    ));
+                }
+            }
+            if this && self.cfg.cpu {
+                model_selected = model_options.len();
+            }
+            model_options.push((
+                format!("{} — CPU", m.name),
                 self.setting(move |c| {
-                    c.gpu = n.clone();
-                    c.cpu = false;
+                    c.model = m.id.to_string();
+                    c.cpu = true;
                 }),
             ));
         }
-        gpu_options.push(("CPU (no GPU)".to_string(), self.setting(|c| c.cpu = true)));
-        let gpu_selected = if self.cfg.cpu {
-            gpu_options.len() - 1
-        } else {
-            self.gpus.iter().position(|g| g.0 == self.cfg.gpu).map_or(0, |i| i + 1)
-        };
 
         let outputs = [
             (Output::Paste, PasteKeys::CtrlV),
@@ -458,29 +473,11 @@ impl tray::Model for Tray {
             },
             Separator,
             Sub {
-                label: "Processor".into(),
-                items: vec![
-                    Radio { options: gpu_options, selected: gpu_selected },
-                    Separator,
-                    Label(if self.cfg.cpu { "In use: CPU".into() } else { format!("In use: {}", self.gpu) }),
-                    Label("Switching restarts the app".into()),
-                ],
-            },
-            Sub {
                 label: "Model".into(),
                 items: vec![
-                    Radio {
-                        options: models::ALL
-                            .iter()
-                            .map(|m| {
-                                let label = if m.gpu { m.name.to_string() } else { format!("{} — CPU only", m.name) };
-                                (label, self.setting(move |c| c.model = m.id.to_string()))
-                            })
-                            .collect(),
-                        selected: models::ALL.iter().position(|m| m.id == models::current().id).unwrap_or(0),
-                    },
+                    Radio { options: model_options, selected: model_selected },
                     Separator,
-                    Label("Redux: less memory, less accurate; on a GPU: not implemented".into()),
+                    Label("Redux: less memory, less accurate".into()),
                     Label("Switching restarts the app (a new model downloads first)".into()),
                 ],
             },
