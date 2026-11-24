@@ -65,7 +65,24 @@ fn unpack2(p: &[u8], out: &mut [i8]) {
             vst1q_s8(o.add(48), vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<6>(b)), one));
         }
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    // SSE2 is part of x86-64 itself: no run-time check. Shifting 16-bit lanes leaks the neighbour byte's bits into
+    // the top, the mask with 3 drops them.
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: 16 bytes in -> 64 out per step, lengths p.len() * 4 == out.len() (asserted).
+    unsafe {
+        use std::arch::x86_64::*;
+        assert_eq!(p.len() * 4, out.len());
+        let (three, one) = (_mm_set1_epi8(3), _mm_set1_epi8(1));
+        for g in 0..p.len() / 16 {
+            let b = _mm_loadu_si128(p.as_ptr().add(g * 16) as *const __m128i);
+            let o = out.as_mut_ptr().add(g * 64) as *mut __m128i;
+            _mm_storeu_si128(o, _mm_sub_epi8(_mm_and_si128(b, three), one));
+            _mm_storeu_si128(o.add(1), _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16::<2>(b), three), one));
+            _mm_storeu_si128(o.add(2), _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16::<4>(b), three), one));
+            _mm_storeu_si128(o.add(3), _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16::<6>(b), three), one));
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     for (g, b) in p.chunks_exact(16).enumerate() {
         for (i, &v) in b.iter().enumerate() {
             for j in 0..4 {
@@ -216,8 +233,61 @@ unsafe fn tile(mr: usize, x: &[i8], xd: &[f32], k: usize, kb: usize, w: &[i8], w
             }
         };
     }
+    // x86: AVX2 is on nearly every x86-64 CPU since 2013-2015 (Haswell, Zen); older ones take the plain loop.
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: the CPU has the feature tile_avx2 is compiled for.
+        return unsafe {
+            match mr {
+                4 => tile_avx2::<4>(x, xd, k, kb, w, wd, y, ldy),
+                3 => tile_avx2::<3>(x, xd, k, kb, w, wd, y, ldy),
+                2 => tile_avx2::<2>(x, xd, k, kb, w, wd, y, ldy),
+                _ => tile_avx2::<1>(x, xd, k, kb, w, wd, y, ldy),
+            }
+        };
+    }
     // SAFETY: as the caller's.
     unsafe { tile_plain(mr, x, xd, k, kb, w, wd, y, ldy) }
+}
+
+/// The packed panel holds, per 4 values of k, 8 outputs x 4 bytes = one 256-bit register: each 32-bit lane is one
+/// output. x's 4 bytes are broadcast to all lanes; `maddubs` (unsigned x signed bytes, pairs summed to i16) + `madd`
+/// with ones (pairs to i32) give the 4-term dot product per lane. maddubs needs one side unsigned: |w| and x with
+/// w's sign. No overflow: |x| <= 127 (fwd's quantizing), |w| <= 128, a pair <= 2 * 128 * 127 < 32767.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn tile_avx2<const R: usize>(x: &[i8], xd: &[f32], k: usize, kb: usize, w: &[i8], wd: &[f32], y: *mut f32, ldy: usize) {
+    use std::arch::x86_64::*;
+    let nb = k / kb;
+    debug_assert!(x.len() >= R * k && w.len() >= 8 * k && wd.len() >= 8 * nb && xd.len() >= R * nb);
+    // SAFETY (whole body): pointers stay inside x, w, wd, xd (lengths above) and the caller's y tile.
+    unsafe {
+        let ones = _mm256_set1_epi16(1);
+        let mut f = [_mm256_setzero_ps(); R];
+        let mut wp = w.as_ptr() as *const __m256i;
+        let xp = x.as_ptr();
+        for b in 0..nb {
+            let mut a = [_mm256_setzero_si256(); R];
+            for g in 0..kb / 4 {
+                let wv = _mm256_loadu_si256(wp);
+                wp = wp.add(1);
+                let wabs = _mm256_sign_epi8(wv, wv);
+                for m in 0..R {
+                    let xv = _mm256_set1_epi32((xp.add(m * k + b * kb + g * 4) as *const i32).read_unaligned());
+                    let p = _mm256_maddubs_epi16(wabs, _mm256_sign_epi8(xv, wv));
+                    a[m] = _mm256_add_epi32(a[m], _mm256_madd_epi16(p, ones));
+                }
+            }
+            let dw = _mm256_loadu_ps(wd.as_ptr().add(b * 8));
+            for m in 0..R {
+                let dx = _mm256_set1_ps(*xd.get_unchecked(m * nb + b));
+                f[m] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(a[m]), _mm256_mul_ps(dw, dx), f[m]);
+            }
+        }
+        for m in 0..R {
+            _mm256_storeu_ps(y.add(m * ldy), f[m]);
+        }
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -708,7 +778,7 @@ mod tests {
     use super::*;
 
     /// QLin (packing, int8 and 2-bit storage, every row count of the last tile) against a plain f32 product of the
-    /// same quantized values; on ARM also the NEON kernel against the plain loop other CPUs use.
+    /// same quantized values; also the SIMD kernel in use (NEON / AVX2) against the plain loop.
     #[test]
     fn linear_matches_reference() {
         let mut seed = 7u32;
@@ -731,7 +801,7 @@ mod tests {
                         assert!((y[r * n + c] - want).abs() <= 1e-3 * want.abs().max(1.0), "{n}x{k} m{m} [{r},{c}]: {} vs {want}", y[r * n + c]);
                     }
                 }
-                // The plain loop (x86 etc.) gives the same as whatever `tile` picked here.
+                // The plain loop (CPUs without the SIMD kernel) gives the same as whatever `tile` picked here.
                 let nb = k / kb;
                 let mut buf = Vec::new();
                 let w = l.w.panel(0, k, &mut buf);
