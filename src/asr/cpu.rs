@@ -167,18 +167,7 @@ impl QLin {
         assert_eq!(x.len(), m * k);
         let mut xq = vec![0i8; m * k];
         let mut xd = vec![0f32; m * nb];
-        xq.par_chunks_mut(k).zip(xd.par_chunks_mut(nb)).zip(x.par_chunks(k)).for_each(|((q, d), x)| {
-            for b in 0..nb {
-                let blk = &x[b * kb..(b + 1) * kb];
-                let amax = blk.iter().fold(0f32, |a, v| a.max(v.abs()));
-                let s = amax / 127.0;
-                let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
-                d[b] = s;
-                for (o, v) in q[b * kb..(b + 1) * kb].iter_mut().zip(blk) {
-                    *o = (v * inv).round() as i8;
-                }
-            }
-        });
+        xq.par_chunks_mut(k).zip(xd.par_chunks_mut(nb)).zip(x.par_chunks(k)).for_each(|((q, d), x)| quantize_row(x, kb, q, d));
         let mut y = vec![0f32; m * n];
         let out = Out(y.as_mut_ptr());
         let (row_tasks, col_tasks) = (m.div_ceil(TASK_ROWS), n.div_ceil(TASK_COLS));
@@ -203,6 +192,60 @@ impl QLin {
             y.par_chunks_mut(n).for_each(|row| row.iter_mut().zip(b).for_each(|(v, b)| *v += b));
         }
         y
+    }
+}
+
+/// One row of activations to int8 per block of `kb`: d = amax / 127, q = round(x / d) (half away from zero).
+fn quantize_row(x: &[f32], kb: usize, q: &mut [i8], d: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if kb % 32 == 0 && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the CPU has AVX2; slices as in the plain loop below.
+        return unsafe { quantize_row_avx2(x, kb, q, d) };
+    }
+    for (b, (blk, q)) in x.chunks_exact(kb).zip(q.chunks_exact_mut(kb)).enumerate() {
+        let s = blk.iter().fold(0f32, |a, v| a.max(v.abs())) / 127.0;
+        let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
+        d[b] = s;
+        for (o, v) in q.iter_mut().zip(blk) {
+            *o = (v * inv).round() as i8;
+        }
+    }
+}
+
+/// As the plain loop of `quantize_row` (same results): without SSE4.1, `round` is a library call per value.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn quantize_row_avx2(x: &[f32], kb: usize, q: &mut [i8], d: &mut [f32]) {
+    use std::arch::x86_64::*;
+    assert!(x.len() == q.len() && x.len() == d.len() * kb && kb % 32 == 0);
+    // SAFETY (whole body): every load/store is inside x, q (lengths checked above).
+    unsafe {
+        let abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
+        let sign = _mm256_castsi256_ps(_mm256_set1_epi32(i32::MIN));
+        // round(v) = trunc(v + copysign(0.49999997, v)), as LLVM lowers `f32::round`.
+        let half = _mm256_set1_ps(0.499_999_97);
+        let order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        for b in 0..d.len() {
+            let (xp, qp) = (x.as_ptr().add(b * kb), q.as_mut_ptr().add(b * kb));
+            let mut m = _mm256_setzero_ps();
+            for i in (0..kb).step_by(8) {
+                m = _mm256_max_ps(m, _mm256_and_ps(_mm256_loadu_ps(xp.add(i)), abs));
+            }
+            let m4 = _mm_max_ps(_mm256_castps256_ps128(m), _mm256_extractf128_ps::<1>(m));
+            let m2 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+            let amax = _mm_cvtss_f32(_mm_max_ss(m2, _mm_shuffle_ps::<1>(m2, m2)));
+            let s = amax / 127.0;
+            let inv = _mm256_set1_ps(if s > 0.0 { 1.0 / s } else { 0.0 });
+            d[b] = s;
+            for i in (0..kb).step_by(32) {
+                let r = |j: usize| {
+                    let v = _mm256_mul_ps(_mm256_loadu_ps(xp.add(i + j)), inv);
+                    _mm256_cvttps_epi32(_mm256_add_ps(v, _mm256_or_ps(half, _mm256_and_ps(v, sign))))
+                };
+                let p = _mm256_packs_epi16(_mm256_packs_epi32(r(0), r(8)), _mm256_packs_epi32(r(16), r(24)));
+                _mm256_storeu_si256(qp.add(i) as *mut __m256i, _mm256_permutevar8x32_epi32(p, order));
+            }
+        }
     }
 }
 
@@ -814,6 +857,39 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// The AVX2 activation quantizing gives the same bytes and scales as the plain loop, incl. halves (ties).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn quantize_avx2_matches_plain() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut seed = 11u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        for kb in [32, 128] {
+            let mut x: Vec<f32> = (0..kb * 64).map(|_| rnd() * 10.0).collect();
+            // Blocks whose scale is exactly 1 (amax 127): values k + 0.5 are exact ties; and an all-zero block.
+            for i in 0..kb {
+                x[i] = if i == 0 { 127.0 } else { (i as f32 - kb as f32 / 2.0) + 0.5 };
+            }
+            x[kb..2 * kb].fill(0.0);
+            let (mut q1, mut d1) = (vec![0i8; x.len()], vec![0f32; x.len() / kb]);
+            let (mut q2, mut d2) = (q1.clone(), d1.clone());
+            quantize_row(&x, kb, &mut q1, &mut d1);
+            for (b, (blk, q)) in x.chunks_exact(kb).zip(q2.chunks_exact_mut(kb)).enumerate() {
+                let s = blk.iter().fold(0f32, |a, v| a.max(v.abs())) / 127.0;
+                let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
+                d2[b] = s;
+                q.iter_mut().zip(blk).for_each(|(o, v)| *o = (v * inv).round() as i8);
+            }
+            assert_eq!(d1, d2);
+            assert_eq!(q1, q2);
         }
     }
 }
