@@ -150,16 +150,34 @@ fn open(device: &str, buf: Arc<Mutex<Vec<f32>>>, live: Arc<AtomicBool>) -> Resul
             b.extend_from_slice(&x[i - i % ch as usize..]);
         }
     };
+    // Any format the device runs at, converted to f32 (cpal's sample conversion). E.g. laptop mics on PipeWire
+    // run at s32.
+    fn stream<T>(
+        dev: &cpal::Device,
+        cfg: cpal::StreamConfig,
+        keep: impl Fn(&mut dyn Iterator<Item = f32>) + Send + 'static,
+        err: impl FnMut(cpal::Error) + Send + 'static,
+    ) -> Result<cpal::Stream, cpal::Error>
+    where
+        T: cpal::SizedSample,
+        f32: cpal::FromSample<T>,
+    {
+        dev.build_input_stream(cfg, move |d: &[T], _: &_| keep(&mut d.iter().map(|v| v.to_sample::<f32>())), err, None)
+    }
+    use cpal::{I24, SampleFormat as F, U24};
     let s = match def.sample_format() {
-        cpal::SampleFormat::F32 => {
-            dev.build_input_stream(cfg.clone(), move |d: &[f32], _: &_| keep(&mut d.iter().copied()), err, None)
-        }
-        cpal::SampleFormat::I16 => dev.build_input_stream(
-            cfg.clone(),
-            move |d: &[i16], _: &_| keep(&mut d.iter().map(|&v| v as f32 / 32768.0)),
-            err,
-            None,
-        ),
+        F::F32 => stream::<f32>(&dev, cfg.clone(), keep, err),
+        F::F64 => stream::<f64>(&dev, cfg.clone(), keep, err),
+        F::I8 => stream::<i8>(&dev, cfg.clone(), keep, err),
+        F::I16 => stream::<i16>(&dev, cfg.clone(), keep, err),
+        F::I24 => stream::<I24>(&dev, cfg.clone(), keep, err),
+        F::I32 => stream::<i32>(&dev, cfg.clone(), keep, err),
+        F::I64 => stream::<i64>(&dev, cfg.clone(), keep, err),
+        F::U8 => stream::<u8>(&dev, cfg.clone(), keep, err),
+        F::U16 => stream::<u16>(&dev, cfg.clone(), keep, err),
+        F::U24 => stream::<U24>(&dev, cfg.clone(), keep, err),
+        F::U32 => stream::<u32>(&dev, cfg.clone(), keep, err),
+        F::U64 => stream::<u64>(&dev, cfg.clone(), keep, err),
         f => return Err(format!("unsupported sample format {f:?}")),
     }
     .map_err(|e| e.to_string())?;
