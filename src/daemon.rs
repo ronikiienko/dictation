@@ -60,10 +60,6 @@ pub enum Ev {
     PickFiles(bool),
     /// One picked file done: (file name, the .txt written) or what went wrong.
     FileSaved(Result<(String, std::path::PathBuf), String>),
-    /// Every 300 ms: in live mode, re-transcribe if enough new audio is in.
-    LiveTick,
-    /// Live mode: text to paste now (None: nothing new yet).
-    Live(Option<String>),
     /// The one-time GPU optimization (sweep): share done, 0..1.
     SweepProgress(f64),
     /// The sweep finished; the model stays loaded. Ok = load/sweep info.
@@ -74,8 +70,6 @@ pub struct Take {
     audio: Vec<f32>,
     /// The whole take's text.
     text: String,
-    /// What is left to paste (live mode pasted the rest while recording).
-    paste: String,
     ms: f64,
 }
 
@@ -111,12 +105,6 @@ enum Job {
     Transcribe(Vec<f32>),
     /// A file: the text (`srt`: subtitles) goes straight back to the sender, then Ev::FileDone.
     File(Vec<f32>, bool, tokio::sync::oneshot::Sender<Result<String, String>>),
-    /// Live mode (paste while speaking): a take starts.
-    LiveStart,
-    /// Live mode: everything recorded so far -> Ev::Live with newly agreed words.
-    LiveCheck(Vec<f32>),
-    /// Live mode: the take stopped (whole audio); the current window's final pass -> Ev::Done.
-    LiveFinish(Vec<f32>),
 }
 
 fn timing_line(what: &str, s: &asr::Timing) {
@@ -125,7 +113,6 @@ fn timing_line(what: &str, s: &asr::Timing) {
 
 fn engine(jobs: std_mpsc::Receiver<Job>, ev: mpsc::UnboundedSender<Ev>) {
     let mut model: Option<asr::Asr> = None;
-    let mut live: Option<asr::Live> = None;
     for job in jobs {
         match job {
             Job::Load { weights, kernels, cpu } => {
@@ -180,7 +167,7 @@ fn engine(jobs: std_mpsc::Receiver<Job>, ev: mpsc::UnboundedSender<Ev>) {
                 if let Ok((_, s)) = &r {
                     timing_line("", s);
                 }
-                let _ = ev.send(Ev::Done(r.map(|(text, _)| Take { audio: x, paste: text.clone(), text, ms })));
+                let _ = ev.send(Ev::Done(r.map(|(text, _)| Take { audio: x, text, ms })));
             }
             Job::File(x, srt, reply) => {
                 let t = Instant::now();
@@ -195,24 +182,6 @@ fn engine(jobs: std_mpsc::Receiver<Job>, ev: mpsc::UnboundedSender<Ev>) {
                 }
                 let _ = reply.send(r.map(|(text, _)| text));
                 let _ = ev.send(Ev::FileDone);
-            }
-            Job::LiveStart => live = Some(asr::Live::default()),
-            Job::LiveCheck(x) => {
-                let mut piece = None;
-                if let (Some(a), Some(l)) = (model.as_mut(), live.as_mut()) {
-                    piece = l.check(a, &x);
-                }
-                let _ = ev.send(Ev::Live(piece));
-            }
-            Job::LiveFinish(x) => {
-                let mut l = live.take().unwrap_or_default();
-                let t = Instant::now();
-                let r = match model.as_mut() {
-                    Some(a) => l.finish(a, &x),
-                    None => Err("model not loaded".into()),
-                };
-                let ms = t.elapsed().as_secs_f64() * 1000.0;
-                let _ = ev.send(Ev::Done(r.map(|paste| Take { audio: x, text: l.text, paste, ms })));
             }
         }
     }
@@ -526,17 +495,6 @@ impl tray::Model for Tray {
                             .collect(),
                         selected: out_selected,
                     },
-                    Separator,
-                    Check {
-                        label: "Paste while speaking".into(),
-                        checked: self.cfg.live,
-                        enabled: self.cfg.output == Output::Paste,
-                        click: self.setting(|c| c.live = !c.live),
-                    },
-                    // Live words are pasted once two passes agree, with only ~1-2 s of audio after them; pasted text
-                    // is never corrected. Without live mode the whole take is transcribed at once (full context).
-                    Label("Slightly less accurate: words are pasted".into()),
-                    Label("before the model hears what follows".into()),
                 ],
             },
             Check { label: "Sounds".into(), checked: self.cfg.sounds, enabled: true, click: self.setting(|c| c.sounds = !c.sounds) },
@@ -1014,17 +972,6 @@ async fn main_loop(
             }
         });
     }
-    {
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                if tx.send(Ev::LiveTick).is_err() {
-                    break;
-                }
-            }
-        });
-    }
     let mut clipboard = crate::output::Clipboard::default();
     // Without it the app still works, the text just stays on the clipboard (press_paste retries, notices say why).
     let mut kb = Keyboard::new(true).map_err(|e| eprintln!("virtual keyboard: {e}")).ok();
@@ -1036,8 +983,6 @@ async fn main_loop(
     let mut downloading = false;
     let mut mem = Mem::Unloaded;
     let mut last_used = Instant::now();
-    let mut live_on = false; // the current take pastes piece by piece
-    let mut live_busy = false; // a LiveCheck is queued in the engine
     let mut load_failed = false; // stops "Always" from retrying a broken load every tick; a take or settings change retries
     let mut sweep_tried = false; // once per run: a failed sweep is not retried (takes still work, first ones slower)
     let mut restart = false; // another GPU chosen: restart once no take is running
@@ -1062,28 +1007,10 @@ async fn main_loop(
     let _ = status_tx.send(serde_json::json!({"state": format!("{state:?}"), "model_memory": format!("{mem:?}"), "shortcut": ""}).to_string());
     loop {
         let Some(ev) = rx.recv().await else { break };
-        // Live mode events change no state shown in the tray: handled here, without the bookkeeping below.
+        // Sweep progress changes no state shown in the tray: handled here, without the bookkeeping below.
         let ev = match ev {
-            Ev::LiveTick => {
-                if let Some(r) = rec.as_ref().filter(|_| live_on && !live_busy && mem == Mem::Loaded) {
-                    let _ = jobs.send(Job::LiveCheck(r.snapshot()));
-                    live_busy = true;
-                }
-                continue;
-            }
             Ev::SweepProgress(done) => {
                 tray.update(move |t: &mut Tray| t.sweep = (done * 100.0) as u32).await;
-                continue;
-            }
-            Ev::Live(piece) => {
-                live_busy = false;
-                if let Some(p) = piece {
-                    if let Err(e) = clipboard.set(&p) {
-                        eprintln!("clipboard: {e}");
-                    } else if let Err(e) = press_paste(&mut kb, cfg.paste_keys) {
-                        eprintln!("paste: {e}");
-                    }
-                }
                 continue;
             }
             ev => ev,
@@ -1105,10 +1032,6 @@ async fn main_loop(
                             load_failed = false;
                             load(&mut mem); // loads while you speak
                         }
-                        live_on = cfg.live && cfg.output == Output::Paste;
-                        if live_on {
-                            let _ = jobs.send(Job::LiveStart);
-                        }
                     }
                     Err(e) => {
                         eprintln!("recording error: {e}");
@@ -1121,7 +1044,7 @@ async fn main_loop(
                     }
                     state = if busy > 0 { State::Transcribing } else { State::Idle };
                     match r.stop() {
-                        Ok(x) if !live_on && cfg.microphone == audio::SYSTEM_AUDIO && x.iter().all(|&v| v == 0.0) => {
+                        Ok(x) if cfg.microphone == audio::SYSTEM_AUDIO && x.iter().all(|&v| v == 0.0) => {
                             notice
                                 .show(
                                     "System audio was silent",
@@ -1129,11 +1052,6 @@ async fn main_loop(
                                     "dialog-information",
                                 )
                                 .await
-                        }
-                        Ok(x) if live_on => {
-                            busy += 1;
-                            let _ = jobs.send(Job::LiveFinish(x));
-                            state = State::Transcribing;
                         }
                         Ok(x) if x.len() >= RATE / 4 => {
                             busy += 1;
@@ -1146,7 +1064,6 @@ async fn main_loop(
                         notice.show("Recording error", &e, "dialog-error").await
                     }
                     }
-                    live_on = false;
                     last_used = Instant::now();
                 }
                 (State::Optimizing, None) => {
@@ -1179,8 +1096,8 @@ async fn main_loop(
                     Ok(t) => {
                         // (title, body) of a notice about what went wrong.
                         let mut problem: Option<(&str, String)> = None;
-                        if !t.paste.is_empty() {
-                            if let Err(e) = clipboard.set(&t.paste) {
+                        if !t.text.is_empty() {
+                            if let Err(e) = clipboard.set(&t.text) {
                                 eprintln!("clipboard: {e}");
                                 problem = Some(("Couldn't copy the text", e.to_string()));
                             } else if cfg.output == Output::Paste {
@@ -1319,7 +1236,7 @@ async fn main_loop(
             }
             Ev::ShortcutFailed(e) => notice.show("Shortcut not set", &format!("{e}. Pick another in the tray menu."), "dialog-error").await,
             Ev::Quit => break,
-            Ev::LiveTick | Ev::Live(_) | Ev::SweepProgress(_) => unreachable!("handled above"),
+            Ev::SweepProgress(_) => unreachable!("handled above"),
         }
         notice.enabled = cfg.notifications;
         if state == State::NoModel && installed() {

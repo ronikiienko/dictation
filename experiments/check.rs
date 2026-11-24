@@ -4,7 +4,6 @@
 //! MODEL=<id> (models.rs, e.g. parakeet-redux): that model, downloaded like the app does if missing.
 //! WEIGHTS=<file>: another weights file (e.g. Parakeet Redux converted by experiments/redux.rs). CPU=1: encoder on
 //! the CPU (src/asr/cpu.rs).
-//! LIVE=1: replay each take through the app's "paste while speaking" mode (asr::Live), audio fed in 300 ms steps.
 use dictation::*;
 use serde_json::json;
 use std::time::Instant;
@@ -49,18 +48,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let path = std::path::Path::new(&arg);
         let x = media::read(path)?;
-        if std::env::var("LIVE").is_ok() {
-            // Feed the audio in 300 ms steps, as the app's ticks do (each pass here runs instantly, not in real time).
-            let mut l = asr::Live::default();
-            for end in (RATE * 3 / 10..=x.len()).step_by(RATE * 3 / 10) {
-                if let Some(p) = l.check(&mut a, &x[..end]) {
-                    eprintln!("  at {:5.1} s paste: {p:?}", end as f64 / RATE as f64);
-                }
-            }
-            let p = l.finish(&mut a, &x)?;
-            eprintln!("  stop     paste: {p:?}");
-            println!("{}", json!({"wav": path.file_name().unwrap().to_string_lossy(), "live_text": l.text}));
-        }
         let t = Instant::now();
         let (text, s) = a.run(&x)?;
         if std::env::var("MEMSTEP").is_ok() {

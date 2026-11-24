@@ -8,7 +8,6 @@ mod cpu;
 mod decoder;
 mod encoder;
 mod gguf;
-mod live;
 mod longform;
 mod mel;
 mod pipeline;
@@ -20,7 +19,6 @@ use burn::tensor::{Device, DeviceConfig, DeviceKind, FloatDType, Tensor};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
-pub use live::Live;
 pub use pipeline::{Timing, Word};
 pub use gguf::{Gguf, Value};
 pub use redux::convert as convert_redux;
@@ -279,7 +277,7 @@ impl Asr {
             Take,  // pause scan over a take over 30 s, in 120 s blocks (no text)
             Block, // pause scan of one block
         }
-        let mut runs: Vec<(usize, Run)> = vec![(30 * rate + step, Run::Take)]; // live mode's window end
+        let mut runs: Vec<(usize, Run)> = vec![(30 * rate + step, Run::Take)]; // the shortest take that is cut at pauses
         runs.extend((1..=frames).filter(|&f| wanted(f)).map(|f| (f * step, Run::Full)));
         runs.extend((1..=frames).filter(|&f| wanted(f)).map(|f| (f * step, Run::Block)));
         if full {
@@ -311,7 +309,7 @@ impl Asr {
         Ok(())
     }
 
-    /// Audio just over 30 s: where its first piece ends (latest pause before 30 s). Live mode's window end.
+    /// Audio just over 30 s: where its first piece ends (latest pause before 30 s). The sweep uses it for the pause scan.
     pub fn first_cut(&mut self, pcm: &[f32]) -> Result<usize, String> {
         let m = self.model.as_ref().ok_or("model not loaded")?;
         guard(|| Ok(m.first_cut(pcm)))

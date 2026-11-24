@@ -17,8 +17,6 @@ pub struct Config {
     pub output: Output,
     /// Keys pressed to paste.
     pub paste_keys: PasteKeys,
-    /// Paste words while speaking (Output::Paste only), instead of the whole take after stop.
-    pub live: bool,
     /// Start / stop sounds.
     pub sounds: bool,
     /// Desktop notifications (recording, transcribing, result).
@@ -84,7 +82,6 @@ impl Default for Config {
             microphone: String::new(),
             output: Output::Paste,
             paste_keys: PasteKeys::CtrlV,
-            live: false,
             sounds: true,
             notifications: true,
             save_recordings: false,

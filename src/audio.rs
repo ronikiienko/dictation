@@ -43,9 +43,6 @@ pub fn input_devices() -> Vec<(String, String)> {
 pub struct Recorder {
     stop: mpsc::Sender<()>,
     thread: std::thread::JoinHandle<Result<Vec<f32>, String>>,
-    buf: Arc<Mutex<Vec<f32>>>,
-    rate: u32,
-    channels: u16,
 }
 
 impl Recorder {
@@ -59,11 +56,11 @@ impl Recorder {
         let (ready_tx, ready_rx) = mpsc::channel();
         let buf = Arc::new(Mutex::new(Vec::<f32>::with_capacity(RATE * 60)));
         let live = Arc::new(AtomicBool::new(device == SYSTEM_AUDIO));
-        let (b, l) = (buf.clone(), live.clone());
+        let (b, l) = (buf, live);
         let thread = std::thread::spawn(move || -> Result<Vec<f32>, String> {
             let (stream, rate, channels) = match open(&device, b.clone(), l.clone()) {
                 Ok(s) => {
-                    let _ = ready_tx.send(Ok((s.1, s.2)));
+                    let _ = ready_tx.send(Ok(()));
                     s
                 }
                 Err(e) => {
@@ -89,14 +86,8 @@ impl Recorder {
             let raw = std::mem::take(&mut *b.lock().unwrap());
             Ok(to_16k_mono(&raw, rate, channels))
         });
-        let (rate, channels) = ready_rx.recv().map_err(|_| "audio thread died".to_string())??;
-        Ok(Recorder { stop: stop_tx, thread, buf, rate, channels })
-    }
-
-    /// Everything recorded so far, 16 kHz mono (same samples stop() will return, minus the tail).
-    pub fn snapshot(&self) -> Vec<f32> {
-        let raw = self.buf.lock().unwrap().clone();
-        to_16k_mono(&raw, self.rate, self.channels)
+        ready_rx.recv().map_err(|_| "audio thread died".to_string())??;
+        Ok(Recorder { stop: stop_tx, thread })
     }
 
     pub fn stop(self) -> Result<Vec<f32>, String> {
