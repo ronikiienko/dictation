@@ -39,7 +39,28 @@ impl Q8 {
         let (q, d, shape) = g.q8_0(name).unwrap_or_else(|| panic!("{name}: expected Q8_0"));
         Q8 { q, d, cols: shape[1] }
     }
-    /// y = W x (+ b).
+    /// y = W x (+ b), rows split over the cores (tasks of `ROWS`): the decoder runs one step at a time, so this is
+    /// where its time goes (126 s take on the Ryzen 5600H: 462 -> ~180 ms, same results).
+    fn matvec(&self, x: &[f32], b: Option<&[f32]>, y: &mut [f32]) {
+        use rayon::prelude::*;
+        const ROWS: usize = 64;
+        let nb = self.cols / 32;
+        y.par_chunks_mut(ROWS).enumerate().for_each(|(i, y)| {
+            let (r0, r1) = (i * ROWS, i * ROWS + y.len());
+            let w = Rows { q: &self.q[r0 * self.cols..r1 * self.cols], d: &self.d[r0 * nb..r1 * nb], cols: self.cols };
+            w.matvec(x, b.map(|b| &b[r0..r1]), y)
+        });
+    }
+}
+
+/// A range of a `Q8`'s rows: what one task multiplies.
+struct Rows<'a> {
+    q: &'a [i8],
+    d: &'a [f32],
+    cols: usize,
+}
+
+impl Rows<'_> {
     fn matvec(&self, x: &[f32], b: Option<&[f32]>, y: &mut [f32]) {
         #[cfg(target_arch = "x86_64")]
         if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
@@ -55,7 +76,7 @@ impl Q8 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn q8_avx2(w: &Q8, x: &[f32], b: Option<&[f32]>, y: &mut [f32]) {
+unsafe fn q8_avx2(w: &Rows, x: &[f32], b: Option<&[f32]>, y: &mut [f32]) {
     use std::arch::x86_64::*;
     let nb = w.cols / 32;
     assert!(x.len() >= nb * 32 && w.q.len() >= y.len() * w.cols && w.d.len() >= y.len() * nb);
@@ -84,7 +105,7 @@ unsafe fn q8_avx2(w: &Q8, x: &[f32], b: Option<&[f32]>, y: &mut [f32]) {
 
 /// The same on ARM (NEON): 8 int8 -> two f32x4, fused multiply-add, one scale per block of 32.
 #[cfg(target_arch = "aarch64")]
-fn q8_neon(w: &Q8, x: &[f32], b: Option<&[f32]>, y: &mut [f32]) {
+fn q8_neon(w: &Rows, x: &[f32], b: Option<&[f32]>, y: &mut [f32]) {
     use std::arch::aarch64::*;
     let nb = w.cols / 32;
     assert!(x.len() >= nb * 32 && w.q.len() >= y.len() * w.cols && w.d.len() >= y.len() * nb);
@@ -112,7 +133,7 @@ fn q8_neon(w: &Q8, x: &[f32], b: Option<&[f32]>, y: &mut [f32]) {
 }
 
 #[inline(always)]
-fn q8_body(w: &Q8, x: &[f32], b: Option<&[f32]>, y: &mut [f32]) {
+fn q8_body(w: &Rows, x: &[f32], b: Option<&[f32]>, y: &mut [f32]) {
     let nb = w.cols / 32;
     for (r, out) in y.iter_mut().enumerate() {
         let q = &w.q[r * w.cols..(r + 1) * w.cols];

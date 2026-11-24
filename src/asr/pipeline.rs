@@ -160,6 +160,55 @@ impl Model {
         toks
     }
 
+    /// Tokens of each piece (start, length) of `pcm`. GPU: piece i is decoded on a CPU thread while the GPU encodes
+    /// piece i + 1 (CPU encoder: one after the other, both want the same cores). `t.dec` then also counts decoder
+    /// time hidden behind the encoder.
+    fn pieces_tokens(&self, pcm: &[f32], segs: &[(usize, usize)], t: &mut Timing) -> Vec<Vec<(usize, usize)>> {
+        if matches!(self.engine, Engine::Cpu(_)) || segs.len() < 2 {
+            return segs.iter().map(|&(start, len)| self.one_shot_tokens(&pcm[start..start + len], t)).collect();
+        }
+        type Job<'s> = std::thread::ScopedJoinHandle<'s, (Vec<(usize, usize)>, f64)>;
+        let dec = &self.dec;
+        std::thread::scope(|s| {
+            let mut out = Vec::new();
+            let mut pending: Option<Job> = None;
+            let join = |h: Job, out: &mut Vec<_>, t: &mut Timing| {
+                let (toks, ms) = h.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+                t.dec += ms;
+                out.push(toks);
+            };
+            for &(start, len) in segs {
+                let piece = &pcm[start..start + len];
+                let enc = (piece.len() >= self.lf.min_feature_samples).then(|| self.encode(piece, t));
+                if let Some(h) = pending.take() {
+                    join(h, &mut out, t);
+                }
+                pending = Some(s.spawn(move || {
+                    let t0 = Instant::now();
+                    let toks = enc.map_or_else(Vec::new, |(proj, n)| {
+                        // Its own pool of a third of the threads: on all of them it slowed the GPU encoder, which
+                        // needs a CPU thread to build and launch its work (Ryzen 5600H, 12 threads: 4 best; 8 and
+                        // all 12 lost most of the gain, NOTES.md "Decoder on all cores").
+                        static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+                        let pool = POOL.get_or_init(|| {
+                            let n = std::thread::available_parallelism().map_or(1, |n| n.get() / 3).max(1);
+                            rayon::ThreadPoolBuilder::new().num_threads(n).build().ok()
+                        });
+                        match pool {
+                            Some(p) => p.install(|| dec.decode(&proj, n)),
+                            None => dec.decode(&proj, n),
+                        }
+                    });
+                    (toks, t0.elapsed().as_secs_f64() * 1e3)
+                }));
+            }
+            if let Some(h) = pending.take() {
+                join(h, &mut out, t);
+            }
+            out
+        })
+    }
+
     /// One piece (<= 30 s).
     fn one_shot(&self, pcm: &[f32], t: &mut Timing) -> String {
         let ids: Vec<usize> = self.one_shot_tokens(pcm, t).into_iter().map(|(id, _)| id).collect();
@@ -179,9 +228,8 @@ impl Model {
         };
         let (rate, frame) = (self.lf.sample_rate as f64, self.lf.frame_seconds);
         let mut words = Vec::new();
-        for (start, len) in segs {
+        for (&(start, _), toks) in segs.iter().zip(self.pieces_tokens(pcm, &segs, &mut t)) {
             let at = start as f64 / rate;
-            let toks = self.one_shot_tokens(&pcm[start..start + len], &mut t);
             words.extend(self.tok.words(&toks).into_iter().map(|(text, a, b)| Word {
                 text,
                 start: at + a as f64 * frame,
@@ -246,8 +294,9 @@ impl Model {
         let segs = self.segments(pcm);
         t.vad = t0.elapsed().as_secs_f64() * 1e3;
         let mut text = String::new();
-        for (start, len) in segs {
-            let s = self.one_shot(&pcm[start..start + len], t);
+        for toks in self.pieces_tokens(pcm, &segs, t) {
+            let ids: Vec<usize> = toks.into_iter().map(|(id, _)| id).collect();
+            let s = self.tok.decode(&ids);
             if !s.is_empty() {
                 if !text.is_empty() {
                     text.push(' ');
