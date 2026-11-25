@@ -1,0 +1,4 @@
+# turso_core (via cubecl-environment) reruns its build script on every commit/checkout of OUR repo (it finds our
+# .git from .cache/cargo) and so rebuilds all of burn/CubeCL; with SOURCE_DATE_EPOCH set it skips git.
+[env]
+SOURCE_DATE_EPOCH = "0"
