@@ -1,29 +1,26 @@
-"""Step 2 of making assets/parakeet-ultra-ane (step 1: export.py; NOTES.md "Neural Engine"): the three window
-packages -> one multifunction model (functions w501/w1501/w3001 sharing the weights) -> compiled -> what the app ships
-to rebuild it from moondream/parakeet-ultra's model.safetensors (src/asr/ane_build.rs): the compiled model folder
-without weights/weight.bin, plus recipe.json for weight.bin: a list of segments, each one of
+"""Step 2 of making assets/parakeet-ultra-ane (step 1: export.py; NOTES.md "Neural Engine"): the 30 s window package
+-> compiled -> what the app ships to rebuild it from moondream/parakeet-ultra's model.safetensors (src/asr/ane_build.rs):
+the compiled model folder without weights/weight.bin, plus recipe.json for weight.bin: a list of segments, each one of
   ["bytes", start, len]              literal bytes from consts.bin (file/blob headers, architecture-only constants)
   ["tensor", name]                   a safetensors tensor as fp16 (F32 ones rounded), same element order
   ["bn_w", layer] / ["bn_b", layer]  depthwise conv with its batch norm folded in (weight / bias)
   ["pos", layer, P]                  relative_k_proj(position table of P positions), as [1, 8, 128, P]
 Checks that numpy's version of every computed blob matches CoreML's (prints the worst difference).
-usage: python recipe.py <hf dir> <dir with enc501/enc1501/enc3001.mlpackage> <out dir, e.g. assets/parakeet-ultra-ane>"""
-import sys, os, re, json, struct, shutil, hashlib, subprocess, numpy as np
+One plain 30 s model, not several windows: one compiled program for macOS to keep instead of 3 (NOTES.md "Neural Engine").
+usage: python recipe.py <hf dir> <enc3001.mlpackage> <out dir, e.g. assets/parakeet-ultra-ane>"""
+import sys, os, re, json, struct, shutil, hashlib, subprocess, tempfile, numpy as np
 from safetensors import safe_open
-from coremltools.models.utils import MultiFunctionDescriptor, save_multifunction
-ST, PK, OUT = sys.argv[1].rstrip('/') + '/', sys.argv[2], sys.argv[3]
-d = MultiFunctionDescriptor()
-for w in (501, 1501, 3001):
-    d.add_function(f'{PK}/enc{w}.mlpackage', src_function_name='main', target_function_name=f'w{w}')
-d.default_function_name = 'w3001'
-save_multifunction(d, f'{PK}/enc.mlpackage')
-subprocess.run(['xcrun', 'coremlcompiler', 'compile', f'{PK}/enc.mlpackage', PK], check=True, stdout=subprocess.DEVNULL)
-M = f'{PK}/enc.mlmodelc'
+ST, PK, OUT = sys.argv[1].rstrip('/') + '/', sys.argv[2].rstrip('/'), sys.argv[3]
+TMP = tempfile.mkdtemp()
+subprocess.run(['xcrun', 'coremlcompiler', 'compile', PK, TMP], check=True, stdout=subprocess.DEVNULL)
+M = f'{TMP}/' + os.path.basename(PK).replace('.mlpackage', '.mlmodelc')
 cfg = json.load(open(ST + 'config.json'))
 ecfg = cfg.get('encoder_config', cfg)
 mil = open(M + '/model.mil').read()
 wb = open(M + '/weights/weight.bin', 'rb').read()
-pat = re.compile(r'tensor<(\w+), \[([\d, ]*)\]> (\w+) = const\(\)\[name = string\("([^"]+)"\), val = tensor<[^>]+>\(BLOBFILE\(path = string\("[^"]+"\), offset = uint64\((\d+)\)\)\)\]')
+# both MIL text forms: `string("x")` / `uint64(n)` and the older `tensor<string, []>("x")` / `tensor<uint64, []>(n)`
+S, U = r'(?:string|tensor<string, \[\]>)', r'(?:uint64|tensor<uint64, \[\]>)'
+pat = re.compile(r'tensor<(\w+), \[([\d, ]*)\]> (\w+) = const\(\)\[name = ' + S + r'\("([^"]+)"\), val = tensor<[^>]+>\(BLOBFILE\(path = ' + S + r'\("[^"]+"\), offset = ' + U + r'\((\d+)\)\)\)\]')
 blobs = {}
 for dt, shape, var, name, off in pat.findall(mil):
     off = int(off)

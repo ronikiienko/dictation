@@ -143,13 +143,14 @@ impl ModelInfo {
     pub fn weights(&self) -> PathBuf {
         self.folder().join("model.weights")
     }
-    /// The Neural Engine model (macOS): compiled CoreML `enc.mlmodelc` (asr::build_ane).
+    /// The Neural Engine model's folder (macOS): compiled CoreML model asr::ANE_MODEL (asr::build_ane).
     pub fn ane_dir(&self) -> PathBuf {
         self.folder().join("ane")
     }
-    /// The Neural Engine models are there (not checked further: a broken one fails to load, with its error).
+    /// The Neural Engine model is there (not checked further: a broken one fails to load, with its error). An older
+    /// build (other name) doesn't count: the model is downloaded and built again.
     pub fn ane_installed(&self) -> bool {
-        std::fs::read_dir(self.ane_dir()).is_ok_and(|d| d.flatten().any(|e| e.path().extension().is_some_and(|x| x == "mlmodelc")))
+        self.ane_dir().join(crate::asr::ANE_MODEL).is_dir()
     }
     pub fn kernel_cache(&self) -> PathBuf {
         self.folder().join("kernels")
@@ -221,8 +222,7 @@ pub fn download(m: &ModelInfo, p: &Arc<Progress>) -> Result<(), String> {
     let r = match m.format {
         Format::Gguf => crate::asr::convert(&files[0], &m.weights()),
         Format::Redux => crate::asr::convert_redux(&m.folder(), &m.weights(), false),
-        Format::UltraAne => std::fs::create_dir_all(m.ane_dir())
-            .and_then(|()| crate::asr::build_ane(&files[0], &m.ane_dir(), |_| {}))
+        Format::UltraAne => crate::asr::build_ane(&files[0], &m.ane_dir(), |_| {})
             .and_then(|()| crate::asr::convert_ultra_head(&m.folder(), &m.weights())),
     };
     r.map_err(|e| format!("converting the model: {e}"))?;

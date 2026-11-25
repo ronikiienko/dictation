@@ -1,5 +1,5 @@
 //! Neural Engine model from moondream/parakeet-ultra's model.safetensors (src/asr/ane_build.rs), for checking it
-//! against the export: `cargo run --release --example anebuild -- <model.safetensors> <out dir>`.
+//! against the export: `cargo run --release --example anebuild -- <model.safetensors> <out dir>` (the out dir is emptied first).
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let (st, out) = (std::path::Path::new(&a[0]), std::path::Path::new(&a[1]));

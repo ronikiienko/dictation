@@ -24,7 +24,7 @@ use std::path::Path;
 
 pub use pipeline::{Timing, Word};
 pub use gguf::{Gguf, Value};
-pub use ane_build::build as build_ane;
+pub use ane_build::{MODEL as ANE_MODEL, build as build_ane};
 pub use redux::{convert as convert_redux, convert_ultra_head};
 pub use weights::{Blob, Weights, convert, is_current, q8_bytes, write};
 
@@ -257,9 +257,9 @@ impl Asr {
         Ok(Asr { model: Some(pipeline::Model::load(&w, None)), dev: None })
     }
 
-    /// Parakeet Ultra's encoder on the Neural Engine (macOS, CoreML models `*.mlmodelc` in `ane_dir`, ane.rs), the
-    /// rest on the CPU: no GPU, nothing to tune. Every window is run once here (its first run is slow).
-    /// `progress(done 0..1)` per window loaded (only slow the first time: `prepare_ane`).
+    /// Parakeet Ultra's encoder on the Neural Engine (macOS, CoreML model ANE_MODEL in `ane_dir`, ane.rs), the rest
+    /// on the CPU: no GPU, nothing to tune. Run once here (its first run is slow). `progress(done 0..1)` (only slow
+    /// the first time: `prepare_ane`).
     pub fn load_ane(weights_file: &Path, ane_dir: &Path, progress: impl FnMut(f64)) -> Result<Asr, String> {
         #[cfg(target_os = "macos")]
         {
@@ -278,8 +278,8 @@ impl Asr {
         }
     }
 
-    /// One-time: the first load of the Neural Engine models makes macOS compile them for it (~30 s per window, then
-    /// cached by macOS); `load_ane` + `mark_ane_prepared`, like the GPU's sweep.
+    /// One-time: the first load of the Neural Engine model makes macOS compile it for it (~40 s, then cached by
+    /// macOS); `load_ane` + `mark_ane_prepared`, like the GPU's sweep.
     pub fn prepare_ane(weights_file: &Path, ane_dir: &Path, progress: impl FnMut(f64)) -> Result<Asr, String> {
         let a = Asr::load_ane(weights_file, ane_dir, progress)?;
         std::fs::write(ane_dir.join("prepared"), ane_key()).map_err(|e| e.to_string())?;

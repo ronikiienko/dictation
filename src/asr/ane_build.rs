@@ -1,4 +1,4 @@
-//! Builds the Neural Engine model (compiled CoreML, `enc.mlmodelc`) from moondream/parakeet-ultra's
+//! Builds the Neural Engine model (compiled CoreML, [`MODEL`]) from moondream/parakeet-ultra's
 //! `model.safetensors` (fp16, as published): the architecture ships with the app (assets/parakeet-ultra-ane, made
 //! from our export by experiments/ane/export.py + recipe.py; NOTES.md "Neural Engine"), only `weights/weight.bin` is written here,
 //! following the recipe's segments:
@@ -7,13 +7,16 @@
 //! - the depthwise conv with its batch norm folded in (CoreML folds it at export; same f32 formula, same bytes);
 //! - `relative_k_proj` applied to the position table of one window (CoreML folds that too): f32 here from our
 //!   f64 table (encoder::pos_emb_vec), rounded once; CoreML's own differs by at most one fp16 step.
-//! The model has one function per window (5/15/30 s) sharing the weights; ane.rs loads it.
+//! One plain model, one 30 s window (why: ane.rs); ane.rs loads it.
 use super::encoder::{pos_emb_vec, D, DK, H};
 use super::redux::St;
 use half::f16;
 use std::io::{self, Write};
 use std::path::Path;
 
+/// The built model's folder name in the model folder. A new name for a new template, so an older build is not taken
+/// for this one (models.rs: not installed, downloaded and built again).
+pub const MODEL: &str = "enc-30s.mlmodelc";
 const DIR: &str = "parakeet-ultra-ane";
 const MIL: &[u8] = include_bytes!("../../assets/parakeet-ultra-ane/model.mil");
 const COREMLDATA: &[u8] = include_bytes!("../../assets/parakeet-ultra-ane/coremldata.bin");
@@ -80,15 +83,17 @@ fn pos(st: &St, i: usize, p: usize) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// `safetensors` (moondream/parakeet-ultra's model.safetensors) -> `<dir>/enc.mlmodelc`, written next to it first
-/// and renamed when complete. `progress(done 0..1)`.
+/// `safetensors` (moondream/parakeet-ultra's model.safetensors) -> `<dir>/`[`MODEL`], written next to it first and
+/// renamed when complete; anything else in `dir` (an older build) is removed first. `progress(done 0..1)`.
 pub fn build(safetensors: &Path, dir: &Path, mut progress: impl FnMut(f64)) -> io::Result<()> {
     let recipe: serde_json::Value = serde_json::from_str(RECIPE).map_err(|e| bad(format!("{DIR}/recipe.json: {e}")))?;
     let segs = recipe["segments"].as_array().ok_or_else(|| bad("recipe: no segments".into()))?;
     let size = recipe["weight_bin_size"].as_u64().ok_or_else(|| bad("recipe: no size".into()))?;
     let st = St::open(safetensors)?;
-    let tmp = dir.join("enc.mlmodelc.part");
-    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir)?;
+    let done = dir.join(MODEL);
+    let tmp = done.with_extension("part");
     std::fs::create_dir_all(tmp.join("weights"))?;
     std::fs::create_dir_all(tmp.join("analytics"))?;
     std::fs::write(tmp.join("model.mil"), MIL)?;
@@ -116,7 +121,5 @@ pub fn build(safetensors: &Path, dir: &Path, mut progress: impl FnMut(f64)) -> i
     if written != size {
         return Err(bad(format!("weight.bin: {written} bytes written, recipe says {size}")));
     }
-    let done = dir.join("enc.mlmodelc");
-    let _ = std::fs::remove_dir_all(&done);
     std::fs::rename(&tmp, &done)
 }
