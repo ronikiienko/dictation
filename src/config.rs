@@ -105,7 +105,8 @@ impl Config {
                     eprintln!("config.toml: {e}; using defaults");
                     Config::default()
                 });
-                if !c.cpu && !crate::models::by_id(&c.model).gpu {
+                let m = crate::models::by_id(&c.model);
+                if !c.cpu && !m.gpu && !m.ane {
                     c.cpu = true;
                     let _ = c.save();
                 }

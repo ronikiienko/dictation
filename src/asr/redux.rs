@@ -17,8 +17,9 @@ use std::path::Path;
 /// Values per ternary scale (config.json `ternary_group_size`; the "t2" kind assumes it).
 pub const GROUP: usize = 128;
 
-struct St {
-    data: Vec<u8>,
+/// A safetensors file, memory-mapped (also used by ane_build.rs).
+pub(super) struct St {
+    data: memmap2::Mmap,
     start: usize,
     header: serde_json::Map<String, Json>,
 }
@@ -28,13 +29,14 @@ fn bad(m: String) -> io::Error {
 }
 
 impl St {
-    fn open(path: &Path) -> io::Result<St> {
-        let data = std::fs::read(path)?;
+    pub(super) fn open(path: &Path) -> io::Result<St> {
+        // SAFETY: read-only map of a file only this app writes (its own download, already checked).
+        let data = unsafe { memmap2::Mmap::map(&std::fs::File::open(path)?)? };
         let n = u64::from_le_bytes(data.get(..8).ok_or_else(|| bad("safetensors: too short".into()))?.try_into().unwrap()) as usize;
         let header = serde_json::from_slice(data.get(8..8 + n).ok_or_else(|| bad("safetensors: bad header".into()))?)?;
         Ok(St { data, start: 8 + n, header })
     }
-    fn get(&self, name: &str) -> io::Result<(&str, Vec<usize>, &[u8])> {
+    pub(super) fn get(&self, name: &str) -> io::Result<(&str, Vec<usize>, &[u8])> {
         let t = self.header.get(name).ok_or_else(|| bad(format!("{name} not in safetensors")))?;
         let o = t["data_offsets"].as_array().ok_or_else(|| bad(format!("{name}: no offsets")))?;
         let (a, b) = (o[0].as_u64().unwrap_or(0) as usize, o[1].as_u64().unwrap_or(0) as usize);
@@ -42,7 +44,7 @@ impl St {
         let bytes = self.data.get(self.start + a..self.start + b).ok_or_else(|| bad(format!("{name}: out of range")))?;
         Ok((t["dtype"].as_str().unwrap_or(""), shape, bytes))
     }
-    fn f32(&self, name: &str) -> io::Result<(Vec<f32>, Vec<usize>)> {
+    pub(super) fn f32(&self, name: &str) -> io::Result<(Vec<f32>, Vec<usize>)> {
         let (dt, shape, b) = self.get(name)?;
         let v = match dt {
             "F32" => b.chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).collect(),
@@ -96,8 +98,9 @@ fn t2_bytes(codes: &[i8], scales: &[f32]) -> Vec<u8> {
     b
 }
 
-/// Metadata in Ultra's keys (see the module comment).
-fn meta(dir: &Path) -> io::Result<HashMap<String, Value>> {
+/// Metadata in Ultra's keys (see the module comment). `ultra`: moondream/parakeet-ultra (same keys and values,
+/// only its name).
+fn meta(dir: &Path, ultra: bool) -> io::Result<HashMap<String, Value>> {
     let cfg: Json = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
     let tok: Json = serde_json::from_slice(&std::fs::read(dir.join("tokenizer.json"))?)?;
     let num = |v: &Json, k: &str| v[k].as_i64().ok_or_else(|| bad(format!("config.json: no {k}")));
@@ -121,10 +124,10 @@ fn meta(dir: &Path) -> io::Result<HashMap<String, Value>> {
     let i = Value::Int;
     let mut m: HashMap<String, Value> = [
         ("general.architecture", s("parakeet")),
-        ("general.name", s("Parakeet Redux")),
-        ("general.repo_url", s("https://huggingface.co/moondream/parakeet-redux")),
+        ("general.name", s(if ultra { "Parakeet Ultra" } else { "Parakeet Redux" })),
+        ("general.repo_url", s(if ultra { "https://huggingface.co/moondream/parakeet-ultra" } else { "https://huggingface.co/moondream/parakeet-redux" })),
         ("general.license", s("cc-by-4.0")),
-        ("stt.variant", s("tdt-0.6b-redux")),
+        ("stt.variant", s(if ultra { "tdt-0.6b-ultra" } else { "tdt-0.6b-redux" })),
         ("stt.frontend.sample_rate", i(16000)),
         ("stt.frontend.n_fft", i(512)),
         ("stt.frontend.win_length", i(400)),
@@ -164,8 +167,21 @@ fn meta(dir: &Path) -> io::Result<HashMap<String, Value>> {
 
 /// `dir` with model.safetensors, tokenizer.json, config.json -> our weights file `dst`.
 pub fn convert(dir: &Path, dst: &Path, ternary_q8: bool) -> io::Result<()> {
+    convert_with(dir, dst, Some(ternary_q8))
+}
+
+/// moondream/parakeet-ultra (`dir` as for `convert`) -> our weights file without the encoder's conformer blocks:
+/// what runs next to the Neural Engine's encoder (subsampler + pause head, joint, predictor; ane_build.rs builds the
+/// encoder itself from the same download).
+pub fn convert_ultra_head(dir: &Path, dst: &Path) -> io::Result<()> {
+    convert_with(dir, dst, None)
+}
+
+/// `blocks`: the Redux encoder blocks, `Some(ternary_q8)`; None: Ultra, no blocks.
+fn convert_with(dir: &Path, dst: &Path, blocks: Option<bool>) -> io::Result<()> {
+    let ternary_q8 = blocks.unwrap_or(false);
     let st = St::open(&dir.join("model.safetensors"))?;
-    let meta = meta(dir)?;
+    let meta = meta(dir, blocks.is_none())?;
     let layers = match meta["stt.parakeet.encoder.n_layers"] { Value::Int(n) => n as usize, _ => unreachable!() };
     let lstm = match meta["stt.parakeet.predictor.n_layers"] { Value::Int(n) => n as usize, _ => unreachable!() };
     let mut out: Vec<Blob> = Vec::new();
@@ -199,7 +215,7 @@ pub fn convert(dir: &Path, dst: &Path, ternary_q8: bool) -> io::Result<()> {
         Ok(())
     };
 
-    for l in 0..layers {
+    for l in (0..layers).filter(|_| blocks.is_some()) {
         let (o, t) = (format!("enc.blocks.{l}"), format!("encoder.layers.{l}"));
         for (ours, theirs) in [
             ("ff1.linear1", "feed_forward1.linear1"),

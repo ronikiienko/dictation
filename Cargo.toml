@@ -53,6 +53,11 @@ burn = { version = "0.22.1", default-features = false, features = ["vulkan"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 burn = { version = "0.22.1", default-features = false, features = ["metal"] }
+# Parakeet Ultra's encoder on the Neural Engine (src/asr/ane.rs, CoreML). Only the features used: objc2-foundation
+# also sits under CubeCL's Metal backend, new features there would rebuild burn.
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSError", "NSString", "NSURL", "NSValue"] }
+objc2-core-ml = { version = "0.3.2", default-features = false, features = ["std", "MLModel", "MLModelConfiguration", "MLModelDescription", "MLFeatureDescription", "MLMultiArrayConstraint", "MLMultiArray", "MLFeatureValue", "MLFeatureProvider", "MLDictionaryFeatureProvider"] }
 
 # Linux: global shortcut via the desktop portal (ashpd), tray via D-Bus (ksni), paste via its own virtual keyboard
 # (evdev, /dev/uinput); all work on X11 and Wayland. Elsewhere: global-hotkey, tray-icon on tao, enigo.
@@ -86,6 +91,10 @@ path = "experiments/words.rs"
 [[example]]
 name = "redux"
 path = "experiments/redux.rs"
+
+[[example]]
+name = "anebuild"
+path = "experiments/anebuild.rs"
 
 [[example]]
 name = "phonon"

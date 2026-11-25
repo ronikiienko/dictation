@@ -1,4 +1,5 @@
-//! Whole pipeline: pcm (16 kHz mono f32) -> text. Mel and decoder on the CPU, encoder + pause head on the GPU.
+//! Whole pipeline: pcm (16 kHz mono f32) -> text. Mel and decoder on the CPU, encoder + pause head on the GPU (or the
+//! encoder on the Neural Engine, macOS, with the pause head on the CPU; or all on the CPU).
 //! Order of steps follows transcribe.cpp `src/arch/parakeet/model.cpp` (MIT, (c) 2026 The transcribe.cpp authors).
 use super::cpu;
 use super::decoder::Decoder;
@@ -10,10 +11,13 @@ use super::tokenizer::Tokenizer;
 use burn::tensor::{DType, Device, FloatDType, Tensor, TensorData};
 use std::time::Instant;
 
-/// Where the encoder runs: GPU (burn) or CPU (cpu.rs).
+/// Where the encoder runs: GPU (burn), CPU (cpu.rs), or Neural Engine (ane.rs; subsampler for the pause scan, pause
+/// head and joint projection on the CPU: cpu.rs without its blocks).
 enum Engine {
     Gpu { dev: Device, enc: Encoder, vad: Vad, joint_enc: (Tensor<2>, Tensor<2>) },
     Cpu(cpu::Encoder),
+    #[cfg(target_os = "macos")]
+    Ane { ane: super::ane::Encoder, head: cpu::Encoder },
 }
 
 pub struct Model {
@@ -66,6 +70,16 @@ impl Model {
             }
             None => Engine::Cpu(cpu::Encoder::load(g)),
         };
+        Self::with_engine(g, engine)
+    }
+
+    /// Encoder on the Neural Engine (its models already loaded), the rest from `g` on the CPU.
+    #[cfg(target_os = "macos")]
+    pub fn load_ane(g: &Weights, ane: super::ane::Encoder) -> Model {
+        Self::with_engine(g, Engine::Ane { ane, head: cpu::Encoder::load_head(g) })
+    }
+
+    fn with_engine(g: &Weights, engine: Engine) -> Model {
         let sr = g.int("stt.frontend.sample_rate") as usize;
         let hop = g.int("stt.frontend.hop_length") as usize;
         let mel = Mel::new(
@@ -132,6 +146,18 @@ impl Model {
                 t.mel += t0.elapsed().as_secs_f64() * 1e3;
                 let t0 = Instant::now();
                 let r = c.encode(&mel, frames, pcm.len());
+                t.enc += t0.elapsed().as_secs_f64() * 1e3;
+                return r;
+            }
+            #[cfg(target_os = "macos")]
+            Engine::Ane { ane, head } => {
+                // Unpadded: the model takes the valid frames and pads to its window itself.
+                let t0 = Instant::now();
+                let mel = self.mel.compute(pcm);
+                t.mel += t0.elapsed().as_secs_f64() * 1e3;
+                let t0 = Instant::now();
+                let (x, n) = ane.encode(&mel, mel.len() / self.mel.n_mels).unwrap_or_else(|e| panic!("{e}"));
+                let r = (head.project(&x, n), n);
                 t.enc += t0.elapsed().as_secs_f64() * 1e3;
                 return r;
             }
@@ -247,6 +273,11 @@ impl Model {
             Engine::Cpu(c) => {
                 let (mel, frames) = self.mel_padded(pcm);
                 return c.speech_probs(&mel, frames, pcm.len(), self.hop);
+            }
+            #[cfg(target_os = "macos")]
+            Engine::Ane { head, .. } => {
+                let (mel, frames) = self.mel_padded(pcm);
+                return head.speech_probs(&mel, frames, pcm.len(), self.hop);
             }
         };
         let len = valid_lengths(pcm.len(), self.hop);

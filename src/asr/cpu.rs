@@ -793,6 +793,17 @@ impl Encoder {
         }
     }
 
+    /// Only what runs next to the Neural Engine's encoder (ane.rs): the subsampler + pause head (pause scan of long
+    /// takes) and the joint's encoder projection; no conformer blocks (`encode` must not be called).
+    pub fn load_head(g: &Weights) -> Encoder {
+        Encoder { pre: Pre::load(g), blocks: Vec::new(), vad: Vad::load(g), joint: QLin::load(g, "joint.enc.weight", Some("joint.enc.bias")) }
+    }
+
+    /// Encoder output [t][1024] -> joint's encoder projection [t][joint_h].
+    pub fn project(&self, x: &[f32], t: usize) -> Vec<f32> {
+        self.joint.fwd(x, t)
+    }
+
     /// mel [frames][128] of `n_samples` audio -> joint's encoder projection [T_valid][joint_h], and T_valid.
     pub fn encode(&self, mel: &[f32], frames: usize, n_samples: usize) -> (Vec<f32>, usize) {
         let len = valid_lengths(n_samples, 160);

@@ -4,6 +4,9 @@
 //!
 //! The model comes as transcribe.cpp's GGUF and is converted once into our weights file (weights.rs), which loads
 //! with no CPU work: memory-mapped and uploaded as is.
+#[cfg(target_os = "macos")]
+mod ane;
+mod ane_build;
 mod cpu;
 mod decoder;
 mod encoder;
@@ -21,7 +24,8 @@ use std::path::Path;
 
 pub use pipeline::{Timing, Word};
 pub use gguf::{Gguf, Value};
-pub use redux::convert as convert_redux;
+pub use ane_build::build as build_ane;
+pub use redux::{convert as convert_redux, convert_ultra_head};
 pub use weights::{Blob, Weights, convert, is_current, q8_bytes, write};
 
 /// burn reports GPU failures (out of memory, lost device, ...) by panicking: turn them into errors.
@@ -113,6 +117,17 @@ const SWEEP_KEY: &str = concat!(env!("DICTATION_BUILD_KEY"), " shapes ", "2");
 /// Whether this GPU's kernel cache already holds a full sweep for this build (`Asr::sweep` + `mark_swept`).
 pub fn swept(kernels: &Path) -> bool {
     std::fs::read_to_string(gpu_dir(kernels).join("swept")).is_ok_and(|s| s.trim() == SWEEP_KEY)
+}
+
+/// What macOS's compiled copy of the Neural Engine models depends on, as far as we know: the app (its build and path;
+/// an updated app is prepared again, quick if macOS still has them) and the model folder (its path).
+fn ane_key() -> String {
+    format!("{} {}", env!("DICTATION_BUILD_KEY"), std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default())
+}
+
+/// Whether `Asr::prepare_ane` ran for these Neural Engine models and this app.
+pub fn ane_prepared(ane_dir: &Path) -> bool {
+    std::fs::read_to_string(ane_dir.join("prepared")).is_ok_and(|s| s == ane_key())
 }
 
 pub fn mark_swept(kernels: &Path) -> std::io::Result<()> {
@@ -240,6 +255,35 @@ impl Asr {
     pub fn load_cpu(weights_file: &Path) -> Result<Asr, String> {
         let w = weights::Weights::open(weights_file).map_err(|e| e.to_string())?;
         Ok(Asr { model: Some(pipeline::Model::load(&w, None)), dev: None })
+    }
+
+    /// Parakeet Ultra's encoder on the Neural Engine (macOS, CoreML models `*.mlmodelc` in `ane_dir`, ane.rs), the
+    /// rest on the CPU: no GPU, nothing to tune. Every window is run once here (its first run is slow).
+    /// `progress(done 0..1)` per window loaded (only slow the first time: `prepare_ane`).
+    pub fn load_ane(weights_file: &Path, ane_dir: &Path, progress: impl FnMut(f64)) -> Result<Asr, String> {
+        #[cfg(target_os = "macos")]
+        {
+            let w = weights::Weights::open(weights_file).map_err(|e| e.to_string())?;
+            if w.has_ternary() {
+                return Err("the Neural Engine runs Parakeet Ultra only".into());
+            }
+            let ane = ane::Encoder::load(ane_dir, progress)?;
+            ane.warm_up()?;
+            Ok(Asr { model: Some(pipeline::Model::load_ane(&w, ane)), dev: None })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = progress;
+            Err(format!("the Neural Engine is macOS only ({}, {})", weights_file.display(), ane_dir.display()))
+        }
+    }
+
+    /// One-time: the first load of the Neural Engine models makes macOS compile them for it (~30 s per window, then
+    /// cached by macOS); `load_ane` + `mark_ane_prepared`, like the GPU's sweep.
+    pub fn prepare_ane(weights_file: &Path, ane_dir: &Path, progress: impl FnMut(f64)) -> Result<Asr, String> {
+        let a = Asr::load_ane(weights_file, ane_dir, progress)?;
+        std::fs::write(ane_dir.join("prepared"), ane_key()).map_err(|e| e.to_string())?;
+        Ok(a)
     }
 
     /// Compiles (and tunes) ahead of time what real takes will need, so no take waits for it. Content doesn't

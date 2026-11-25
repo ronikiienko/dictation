@@ -79,7 +79,10 @@ fn run_here(p: &PathBuf, srt: bool, local: &mut Option<asr::Asr>) -> Result<Stri
             if !m.installed() {
                 return Err("model not installed: start the app (`dictation`) and download it first".into());
             }
-            if Config::load().cpu {
+            let cfg = Config::load();
+            if m.ane {
+                local.insert(asr::Asr::load_ane(&m.weights(), &m.ane_dir(), |_| {})?)
+            } else if cfg.cpu {
                 local.insert(asr::Asr::load_cpu(&m.weights())?)
             } else {
                 asr::set_kernel_cache(&m.kernel_cache());

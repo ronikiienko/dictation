@@ -26,6 +26,9 @@ pub enum Format {
     Gguf,
     /// Parakeet Redux's safetensors + tokenizer.json + config.json (asr::convert_redux): CPU only.
     Redux,
+    /// Parakeet Ultra's original (fp16) safetensors + tokenizer.json + config.json: the encoder for the Neural
+    /// Engine (asr::build_ane, into `ane/`) and the rest (asr::convert_ultra_head, `model.weights`).
+    UltraAne,
 }
 
 pub struct ModelInfo {
@@ -33,8 +36,10 @@ pub struct ModelInfo {
     pub name: &'static str,
     pub format: Format,
     pub files: &'static [File],
-    /// Runs on the GPU (else CPU only).
+    /// Runs on the GPU (else CPU only, or the Neural Engine).
     pub gpu: bool,
+    /// Runs on the Neural Engine only (macOS).
+    pub ane: bool,
 }
 
 /// The default model (src/asr is a port of exactly this architecture).
@@ -49,6 +54,7 @@ pub const MODEL: ModelInfo = ModelInfo {
         sha256: "007a59761e9258779f189df396b50d12b83bb5b79e66df4b955c230d2f2a0a59",
     }],
     gpu: true,
+    ane: false,
 };
 
 /// Same architecture with a ternary encoder: ~4x less memory on the CPU, less accurate (NOTES.md "Encoder on the
@@ -78,9 +84,40 @@ pub const REDUX: ModelInfo = ModelInfo {
         },
     ],
     gpu: false,
+    ane: false,
 };
 
-pub const ALL: [&ModelInfo; 2] = [&MODEL, &REDUX];
+/// Parakeet Ultra on the Neural Engine (macOS): its own download, the original fp16 weights (as the Neural Engine
+/// computes), pinned to one revision; nothing shared with the GGUF model's folder.
+pub const ULTRA_ANE: ModelInfo = ModelInfo {
+    id: "parakeet-ultra-ane",
+    name: "Parakeet Ultra",
+    format: Format::UltraAne,
+    files: &[
+        File {
+            name: "model.safetensors",
+            url: "https://huggingface.co/moondream/parakeet-ultra/resolve/73175eb7aeb0d82f1e2a6b53b3aabc10a90bcd0b/model.safetensors",
+            size: 1_255_353_386,
+            sha256: "c9608f36d0ab956c14bfcc525479b0746b3b42a56f6949ec85c14eb7466717dc",
+        },
+        File {
+            name: "tokenizer.json",
+            url: "https://huggingface.co/moondream/parakeet-ultra/resolve/73175eb7aeb0d82f1e2a6b53b3aabc10a90bcd0b/tokenizer.json",
+            size: 1_159_960,
+            sha256: "bd321b096832a3f270bd3b2a88823957920f1a5c5ada71114a26ea729d0cbe91",
+        },
+        File {
+            name: "config.json",
+            url: "https://huggingface.co/moondream/parakeet-ultra/resolve/73175eb7aeb0d82f1e2a6b53b3aabc10a90bcd0b/config.json",
+            size: 1_153,
+            sha256: "e747b85e1bdfd300c8b8ac63bac8dd5221f8fe9bc275b48d06c735fcd6971b6e",
+        },
+    ],
+    gpu: false,
+    ane: true,
+};
+
+pub const ALL: [&ModelInfo; 3] = [&MODEL, &REDUX, &ULTRA_ANE];
 
 /// The model chosen in config.toml, fixed for this run (choosing another restarts the app).
 pub fn current() -> &'static ModelInfo {
@@ -88,9 +125,10 @@ pub fn current() -> &'static ModelInfo {
     CURRENT.get_or_init(|| by_id(&crate::config::Config::load().model))
 }
 
-/// The model with this id (config.toml `model`); unknown or "": the default.
+/// The model with this id (config.toml `model`); unknown, "" or not runnable here (the Neural Engine one off macOS):
+/// the default.
 pub fn by_id(id: &str) -> &'static ModelInfo {
-    ALL.into_iter().find(|m| m.id == id).unwrap_or(&MODEL)
+    ALL.into_iter().find(|m| m.id == id && (!m.ane || cfg!(target_os = "macos"))).unwrap_or(&MODEL)
 }
 
 /// Folder holding the downloaded models (not created here).
@@ -105,6 +143,14 @@ impl ModelInfo {
     pub fn weights(&self) -> PathBuf {
         self.folder().join("model.weights")
     }
+    /// The Neural Engine model (macOS): compiled CoreML `enc.mlmodelc` (asr::build_ane).
+    pub fn ane_dir(&self) -> PathBuf {
+        self.folder().join("ane")
+    }
+    /// The Neural Engine models are there (not checked further: a broken one fails to load, with its error).
+    pub fn ane_installed(&self) -> bool {
+        std::fs::read_dir(self.ane_dir()).is_ok_and(|d| d.flatten().any(|e| e.path().extension().is_some_and(|x| x == "mlmodelc")))
+    }
     pub fn kernel_cache(&self) -> PathBuf {
         self.folder().join("kernels")
     }
@@ -115,9 +161,9 @@ impl ModelInfo {
     fn part(&self, f: &File) -> PathBuf {
         self.folder().join(format!("{}.part", f.name))
     }
-    /// A converted weights file this build can load.
+    /// A converted weights file this build can load (and the Neural Engine model, for that one).
     pub fn installed(&self) -> bool {
-        crate::asr::is_current(&self.weights())
+        crate::asr::is_current(&self.weights()) && (!self.ane || self.ane_installed())
     }
     /// A finished (or partial) download is already on disk, or a GGUF from an older version of the app sits in
     /// the models folder: "downloading" then only checks and converts it.
@@ -175,6 +221,9 @@ pub fn download(m: &ModelInfo, p: &Arc<Progress>) -> Result<(), String> {
     let r = match m.format {
         Format::Gguf => crate::asr::convert(&files[0], &m.weights()),
         Format::Redux => crate::asr::convert_redux(&m.folder(), &m.weights(), false),
+        Format::UltraAne => std::fs::create_dir_all(m.ane_dir())
+            .and_then(|()| crate::asr::build_ane(&files[0], &m.ane_dir(), |_| {}))
+            .and_then(|()| crate::asr::convert_ultra_head(&m.folder(), &m.weights())),
     };
     r.map_err(|e| format!("converting the model: {e}"))?;
     for f in files {

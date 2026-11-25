@@ -3,10 +3,19 @@
 //! usage: cargo run --release --example check -- <audio>...  (any format media.rs reads)   (uses the app's installed model)
 //! MODEL=<id> (models.rs, e.g. parakeet-redux): that model, downloaded like the app does if missing.
 //! WEIGHTS=<file>: another weights file (e.g. Parakeet Redux converted by experiments/redux.rs). CPU=1: encoder on
-//! the CPU (src/asr/cpu.rs).
+//! the CPU (src/asr/cpu.rs). ANE=<dir> (macOS): encoder on the Neural Engine with the CoreML models in <dir>
+//! (ANE=1: the app's Neural Engine model, models/parakeet-ultra-ane/ane/).
 use dictation::*;
 use serde_json::json;
 use std::time::Instant;
+
+fn load(w: &std::path::Path) -> Result<asr::Asr, String> {
+    if let Ok(d) = std::env::var("ANE") {
+        let d = if d == "1" { models::ULTRA_ANE.ane_dir() } else { d.into() };
+        return asr::Asr::load_ane(w, &d, |_| {});
+    }
+    if std::env::var("CPU").is_ok() { asr::Asr::load_cpu(w) } else { asr::Asr::load(w) }
+}
 
 /// LOG=1: CubeCL's log records (debug and up) on stderr.
 struct Log;
@@ -37,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     asr::set_kernel_cache(&std::env::var("KERNELS").map(std::path::PathBuf::from).unwrap_or(m.kernel_cache()));
     let t = Instant::now();
     let w = std::env::var("WEIGHTS").map(std::path::PathBuf::from).unwrap_or(m.weights());
-    let mut a = if std::env::var("CPU").is_ok() { asr::Asr::load_cpu(&w)? } else { asr::Asr::load(&w)? };
+    let mut a = load(&w)?;
     a.run(&vec![0.0; RATE])?;
     eprintln!("ready {:.2}s", t.elapsed().as_secs_f64());
     // GAP=<seconds>: idle this long before each take (GPU clocking down between takes vs back-to-back).
@@ -94,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let t = Instant::now();
         let w = std::env::var("WEIGHTS").map(std::path::PathBuf::from).unwrap_or(m.weights());
-    let mut a = if std::env::var("CPU").is_ok() { asr::Asr::load_cpu(&w)? } else { asr::Asr::load(&w)? };
+    let mut a = load(&w)?;
         a.run(&vec![0.0; RATE])?;
         eprintln!("reload + warm-up in {:.2}s: {}", t.elapsed().as_secs_f64(), status());
     }

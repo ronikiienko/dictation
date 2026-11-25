@@ -97,10 +97,11 @@ enum Mem {
 // ---------------------------------------------------------------- engine: owns the model, runs on its own thread
 
 enum Job {
-    /// `cpu`: the encoder on the CPU (no kernel cache used).
-    Load { weights: std::path::PathBuf, kernels: std::path::PathBuf, cpu: bool },
+    /// `cpu`: the encoder on the CPU (no kernel cache used). `ane`: on the Neural Engine, its CoreML models' folder.
+    Load { weights: std::path::PathBuf, kernels: std::path::PathBuf, cpu: bool, ane: Option<std::path::PathBuf> },
     /// Load + sweep (asr::Asr::sweep) + mark the GPU's kernel cache as swept. Progress -> Ev::SweepProgress.
-    Sweep { weights: std::path::PathBuf, kernels: std::path::PathBuf },
+    /// `ane`: instead the Neural Engine models' folder: their first load (macOS compiles them), asr::Asr::prepare_ane.
+    Sweep { weights: std::path::PathBuf, kernels: std::path::PathBuf, ane: Option<std::path::PathBuf> },
     Unload,
     Transcribe(Vec<f32>),
     /// A file: the text (`srt`: subtitles) goes straight back to the sender, then Ev::FileDone.
@@ -115,11 +116,13 @@ fn engine(jobs: std_mpsc::Receiver<Job>, ev: mpsc::UnboundedSender<Ev>) {
     let mut model: Option<asr::Asr> = None;
     for job in jobs {
         match job {
-            Job::Load { weights, kernels, cpu } => {
+            Job::Load { weights, kernels, cpu, ane } => {
                 model = None; // free the old model first (VRAM)
                 let t = Instant::now();
                 let r = (|| -> Result<String, String> {
-                    let mut a = if cpu {
+                    let mut a = if let Some(dir) = ane {
+                        asr::Asr::load_ane(&weights, &dir, |_| {})?
+                    } else if cpu {
                         asr::Asr::load_cpu(&weights)?
                     } else {
                         asr::set_kernel_cache(&kernels);
@@ -131,7 +134,19 @@ fn engine(jobs: std_mpsc::Receiver<Job>, ev: mpsc::UnboundedSender<Ev>) {
                 })();
                 let _ = ev.send(Ev::EngineLoaded(r));
             }
-            Job::Sweep { weights, kernels } => {
+            Job::Sweep { weights, ane: Some(dir), .. } => {
+                model = None;
+                let t = Instant::now();
+                let r = asr::Asr::prepare_ane(&weights, &dir, |done| {
+                    let _ = ev.send(Ev::SweepProgress(done));
+                })
+                .map(|a| {
+                    model = Some(a);
+                    format!("prepared in {:.0} s", t.elapsed().as_secs_f64())
+                });
+                let _ = ev.send(Ev::Swept(r));
+            }
+            Job::Sweep { weights, kernels, ane: None } => {
                 model = None;
                 asr::set_kernel_cache(&kernels);
                 let t = Instant::now();
@@ -220,6 +235,7 @@ impl Tray {
             State::Starting => "Starting the microphone…".into(),
             State::Recording => format!("● Recording{key}"),
             State::Transcribing => "Transcribing…".into(),
+            State::Optimizing if models::current().ane => format!("Preparing for the Neural Engine… {}%", self.sweep),
             State::Optimizing => {
                 format!("Speeding up dictation for {}… {}%", self.gpu, self.sweep)
             }
@@ -228,7 +244,7 @@ impl Tray {
 
     fn mem_text(&self) -> String {
         if self.state == State::Optimizing {
-            return "Makes dictation faster on this GPU".into();
+            return if models::current().ane { "macOS compiles the model for it" } else { "Makes dictation faster on this GPU" }.into();
         }
         match self.mem {
             Mem::Unloaded => "Model not loaded (loads when you start, ~1 s)".into(),
@@ -367,6 +383,22 @@ impl tray::Model for Tray {
         let chosen = models::by_id(&self.cfg.model).id;
         for m in models::ALL {
             let this = m.id == chosen;
+            // The Neural Engine model (macOS): that is its only processor.
+            if m.ane {
+                if cfg!(target_os = "macos") {
+                    if this {
+                        model_selected = model_options.len();
+                    }
+                    model_options.push((
+                        format!("{} — Neural Engine", m.name),
+                        self.setting(move |c| {
+                            c.model = m.id.to_string();
+                            c.cpu = false;
+                        }),
+                    ));
+                }
+                continue;
+            }
             if m.gpu {
                 let mut gpus: Vec<(String, String)> =
                     self.gpus.iter().map(|(n, k)| (n.clone(), format!("{} — {n} ({k})", m.name))).collect();
@@ -938,6 +970,7 @@ async fn main_loop(
         let tx = tx.clone();
         std::thread::Builder::new().name("engine".into()).spawn(move || engine(jobs_rx, tx))?;
     }
+    let ane = models::current().ane; // fixed for this run: switching restarts the app
     let installed = || models::current().installed();
     let (status_tx, status_rx) = tokio::sync::watch::channel(String::new());
     tokio::spawn(socket_task(tx.clone(), status_rx));
@@ -991,7 +1024,7 @@ async fn main_loop(
     // Queue a (re)load of the configured model on the engine thread. Takes queued after it wait for it.
     let load = |mem: &mut Mem| {
         let m = models::current();
-        let _ = jobs.send(Job::Load { weights: m.weights(), kernels: m.kernel_cache(), cpu });
+        let _ = jobs.send(Job::Load { weights: m.weights(), kernels: m.kernel_cache(), cpu, ane: ane.then(|| m.ane_dir()) });
         *mem = Mem::Loading;
     };
     if state == State::NoModel && models::current().download_started() {
@@ -1066,6 +1099,11 @@ async fn main_loop(
                     }
                     last_used = Instant::now();
                 }
+                (State::Optimizing, None) if ane => {
+                    notice
+                        .show("Still preparing for the Neural Engine", "One-time. Dictation is available when it's done; progress is in the tray menu.", "dialog-information")
+                        .await
+                }
                 (State::Optimizing, None) => {
                     notice
                         .show("Still speeding up dictation for your GPU", "One-time tuning. Dictation is available when it's done; progress is in the tray menu.", "dialog-information")
@@ -1126,7 +1164,7 @@ async fn main_loop(
             }
             Ev::File(x, srt, reply) => {
                 if matches!(state, State::NoModel | State::Optimizing) {
-                    let why = if state == State::NoModel { "no model yet: download it from the tray menu" } else { "still tuning for the GPU (see the tray menu); try again when it's done" };
+                    let why = if state == State::NoModel { "no model yet: download it from the tray menu" } else { if ane { "still preparing for the Neural Engine (see the tray menu); try again when it's done" } else { "still tuning for the GPU (see the tray menu); try again when it's done" } };
                     let _ = reply.send(Err(why.into()));
                 } else {
                     if mem == Mem::Unloaded {
@@ -1176,6 +1214,24 @@ async fn main_loop(
                     notice.show("Model failed to load", &e, "dialog-error").await;
                 }
             },
+            Ev::Swept(r) if ane => {
+                state = State::Idle;
+                last_used = Instant::now();
+                match r {
+                    Ok(info) => {
+                        println!("Neural Engine prepared, {info}");
+                        mem = Mem::Loaded;
+                        let detail = format!("{}, Neural Engine, {info}", models::current().name);
+                        tray.update(move |t: &mut Tray| t.detail = detail).await;
+                        notice.show("Dictation is ready", "Prepared for the Neural Engine. This won't be needed again.", "dialog-ok").await;
+                    }
+                    Err(e) => {
+                        eprintln!("Neural Engine preparation failed: {e}");
+                        mem = Mem::Unloaded;
+                        notice.show("Preparing for the Neural Engine failed", &format!("{e}\nChoose another processor in the tray menu (Model)."), "dialog-error").await;
+                    }
+                }
+            }
             Ev::Swept(r) => {
                 state = State::Idle;
                 last_used = Instant::now();
@@ -1252,15 +1308,25 @@ async fn main_loop(
         }
         // A GPU change applies once the current take is pasted.
         if restart && rec.is_none() && busy == 0 {
-            println!("model or processor changed ({}, {:?}): restarting", models::by_id(&cfg.model).id, if cfg.cpu { "CPU" } else if cfg.gpu.is_empty() { "automatic" } else { &cfg.gpu });
+            println!("model or processor changed ({}, {:?}): restarting", models::by_id(&cfg.model).id, if models::by_id(&cfg.model).ane { "Neural Engine" } else if cfg.cpu { "CPU" } else if cfg.gpu.is_empty() { "automatic" } else { &cfg.gpu });
             break;
         }
         // Once per GPU (and build): compile/tune kernels for every take length before the first take, so no take
         // waits for that. Takes are blocked meanwhile; the tray shows progress.
-        if state == State::Idle && rec.is_none() && busy == 0 && !sweep_tried && !cpu && models::current().gpu && !asr::swept(&models::current().kernel_cache()) {
+        if state == State::Idle && rec.is_none() && busy == 0 && !sweep_tried && ane && !asr::ane_prepared(&models::current().ane_dir()) {
             sweep_tried = true;
             let m = models::current();
-            let _ = jobs.send(Job::Sweep { weights: m.weights(), kernels: m.kernel_cache() });
+            let _ = jobs.send(Job::Sweep { weights: m.weights(), kernels: m.kernel_cache(), ane: Some(m.ane_dir()) });
+            state = State::Optimizing;
+            mem = Mem::Loading;
+            tray.update(|t: &mut Tray| t.sweep = 0).await;
+            println!("preparing for the Neural Engine");
+            notice.show("Preparing dictation for the Neural Engine", "macOS compiles the model for the Neural Engine. This runs only once and takes 1-2 minutes. Progress is in the tray menu.", "dialog-information").await;
+        }
+        if state == State::Idle && rec.is_none() && busy == 0 && !sweep_tried && !cpu && !ane && models::current().gpu && !asr::swept(&models::current().kernel_cache()) {
+            sweep_tried = true;
+            let m = models::current();
+            let _ = jobs.send(Job::Sweep { weights: m.weights(), kernels: m.kernel_cache(), ane: None });
             state = State::Optimizing;
             mem = Mem::Loading;
             tray.update(|t: &mut Tray| t.sweep = 0).await;
