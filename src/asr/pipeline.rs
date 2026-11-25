@@ -308,6 +308,20 @@ impl Model {
         })
     }
 
+    /// Neural Engine only: one encode of silence, so the ANE does not wind down while a take is being recorded (the
+    /// first call after idle is slower: +10 ms after 3 s, +30 after 8, +100-140 after 16-25 s; NOTES.md "Neural
+    /// Engine"). False (nothing done) on the GPU and CPU.
+    pub fn keep_awake(&self) -> bool {
+        match &self.engine {
+            #[cfg(target_os = "macos")]
+            Engine::Ane { ane, .. } => {
+                let _ = ane.warm_up();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Takes over 30 s are cut at pauses (the model's own pause head) and the pieces' texts joined with spaces.
     /// Afterwards the GPU memory pool hands its free pages back.
     pub fn transcribe(&self, pcm: &[f32]) -> (String, Timing) {

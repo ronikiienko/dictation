@@ -103,6 +103,8 @@ enum Job {
     /// `ane`: instead the Neural Engine models' folder: their first load (macOS compiles them), asr::Asr::prepare_ane.
     Sweep { weights: std::path::PathBuf, kernels: std::path::PathBuf, ane: Option<std::path::PathBuf> },
     Unload,
+    /// A take started (true) or stopped (false): while one is recorded, the Neural Engine is kept awake.
+    Recording(bool),
     Transcribe(Vec<f32>),
     /// A file: the text (`srt`: subtitles) goes straight back to the sender, then Ev::FileDone.
     File(Vec<f32>, bool, tokio::sync::oneshot::Sender<Result<String, String>>),
@@ -112,10 +114,44 @@ fn timing_line(what: &str, s: &asr::Timing) {
     println!("  {what}mel {:.0} ms, pauses {:.0} ms, encoder {:.0} ms, decoder {:.0} ms", s.mel, s.vad, s.enc, s.dec);
 }
 
+/// While a take is recorded, the Neural Engine runs one encode of silence after this long without work: it winds
+/// down when idle and the take's own encode would pay +100-140 ms after 16+ s. One run (~130 ms) every 4 s leaves
+/// ~15 ms; a stop during a run waits for its rest (~3.5% of takes, ~65 ms on average).
+const KEEP_AWAKE: Duration = Duration::from_secs(4);
+
 fn engine(jobs: std_mpsc::Receiver<Job>, ev: mpsc::UnboundedSender<Ev>) {
     let mut model: Option<asr::Asr> = None;
-    for job in jobs {
+    let mut recording = false;
+    let mut awake_runs = 0u32;
+    loop {
+        let job = if recording && model.is_some() {
+            match jobs.recv_timeout(KEEP_AWAKE) {
+                Ok(job) => job,
+                Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                    // Not the Neural Engine: nothing to keep awake, stop asking until the next take.
+                    if model.as_mut().is_some_and(|a| a.keep_awake()) {
+                        awake_runs += 1;
+                    } else {
+                        recording = false;
+                    }
+                    continue;
+                }
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match jobs.recv() {
+                Ok(job) => job,
+                Err(_) => break,
+            }
+        };
         match job {
+            Job::Recording(on) => {
+                recording = on;
+                if !on && awake_runs > 0 {
+                    println!("  kept the Neural Engine awake: {awake_runs} runs");
+                }
+                awake_runs = 0;
+            }
             Job::Load { weights, kernels, cpu, ane } => {
                 model = None; // free the old model first (VRAM)
                 let t = Instant::now();
@@ -1065,6 +1101,7 @@ async fn main_loop(
                             load_failed = false;
                             load(&mut mem); // loads while you speak
                         }
+                        let _ = jobs.send(Job::Recording(true));
                     }
                     Err(e) => {
                         eprintln!("recording error: {e}");
@@ -1072,6 +1109,7 @@ async fn main_loop(
                     }
                 },
                 (_, Some(r)) => {
+                    let _ = jobs.send(Job::Recording(false));
                     if cfg.sounds {
                         audio::play(audio::Cue::Stop);
                     }

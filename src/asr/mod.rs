@@ -368,6 +368,12 @@ impl Asr {
         guard(|| Ok(m.transcribe_words(pcm)))
     }
 
+    /// Neural Engine: one encode of silence to keep it from winding down during a take (pipeline::Model::keep_awake).
+    /// False: nothing to do (GPU, CPU, no model).
+    pub fn keep_awake(&mut self) -> bool {
+        self.model.as_ref().is_some_and(|m| m.keep_awake())
+    }
+
     pub fn run(&mut self, pcm: &[f32]) -> Result<(String, Timing), String> {
         if pcm.is_empty() {
             return Ok((String::new(), Timing::default()));
