@@ -20,7 +20,7 @@ app on every system.
 | System | State |
 |---|---|
 | Linux, KDE Plasma (Wayland) | used daily |
-| macOS (Apple Silicon) | used daily |
+| macOS 14 or newer, Apple Silicon | used daily |
 | Windows | not tested: the code is written, but the app hasn't been built or run there |
 | Other Linux desktops | untested |
 
