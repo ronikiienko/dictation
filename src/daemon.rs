@@ -374,11 +374,12 @@ impl tray::Model for Tray {
     fn icon(&self) -> Icon {
         match self.state {
             State::Recording => Icon::Recording,
+            State::Starting => Icon::Starting,
             _ if self.download.is_some() => Icon::Downloading,
             State::Transcribing => Icon::Transcribing,
             State::Optimizing => Icon::Optimizing,
             State::NoModel => Icon::Warning,
-            State::Idle | State::Starting => Icon::Idle,
+            State::Idle => Icon::Idle,
         }
     }
     fn attention(&self) -> bool {
@@ -1110,13 +1111,17 @@ async fn main_loop(
         };
         match ev {
             Ev::Toggle => match (state, rec.take()) {
-                (State::Idle | State::Transcribing, None) => match audio::Recorder::start(&cfg.microphone, {
+                (State::Idle | State::Transcribing, None) => match {
+                    // Show the click at once: opening the microphone can take a moment (blocks this loop).
+                    tray.update(|t: &mut Tray| t.state = State::Starting).await;
+                    audio::Recorder::start(&cfg.microphone, {
                     take_no += 1;
                     let (tx, n) = (tx.clone(), take_no);
                     move || {
                         let _ = tx.send(Ev::MicLive(n));
                     }
-                }) {
+                })
+                } {
                     Ok(r) => {
                         rec = Some(r);
                         state = State::Starting;

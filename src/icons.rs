@@ -6,6 +6,8 @@
 pub enum Icon {
     /// Ready: microphone on grey.
     Idle,
+    /// Microphone on amber: a take is starting, the microphone isn't live yet (don't speak yet).
+    Starting,
     /// Microphone on red.
     Recording,
     /// Three dots on blue.
@@ -19,11 +21,12 @@ pub enum Icon {
 }
 
 impl Icon {
-    pub const ALL: [Icon; 6] = [Icon::Idle, Icon::Recording, Icon::Transcribing, Icon::Downloading, Icon::Optimizing, Icon::Warning];
+    pub const ALL: [Icon; 7] = [Icon::Idle, Icon::Starting, Icon::Recording, Icon::Transcribing, Icon::Downloading, Icon::Optimizing, Icon::Warning];
 
     fn background(self) -> [u8; 3] {
         match self {
             Icon::Idle => [0x4d, 0x53, 0x5c],
+            Icon::Starting => [0xd9, 0x8c, 0x12],
             Icon::Recording => [0xdf, 0x35, 0x3b],
             Icon::Transcribing => [0x2f, 0x7c, 0xe0],
             Icon::Downloading => [0x16, 0x9c, 0x8f],
@@ -35,7 +38,7 @@ impl Icon {
     /// Whether the white symbol covers point (x, y) of the unit square (y down).
     fn symbol(self, x: f32, y: f32) -> bool {
         match self {
-            Icon::Idle | Icon::Recording => microphone(x, y),
+            Icon::Idle | Icon::Starting | Icon::Recording => microphone(x, y),
             Icon::Transcribing => [0.29, 0.5, 0.71].iter().any(|&cx| dist(x, y, cx, 0.5) <= 0.075),
             Icon::Downloading => {
                 segment(x, y, (0.5, 0.24), (0.5, 0.52), 0.055)
@@ -89,12 +92,12 @@ impl Icon {
 impl Icon {
     /// macOS menu bar look: the symbol alone (no disc), scaled up to fill the bar's height. Black + alpha, to be shown
     /// as a template image (macOS tints it for light/dark menu bars), except Recording: a red symbol, not a template
-    /// (macOS apps show recording in red). Returns (RGBA, template).
+    /// (macOS apps show recording in red), and Starting: amber. Returns (RGBA, template).
     pub fn glyph_rgba(self, size: u32) -> (Vec<u8>, bool) {
         const SS: u32 = 4;
         // The symbols are drawn inside the disc (about 0.18..0.82 of the square): zoom in so they span ~0.03..0.97.
         const ZOOM: f32 = 0.66;
-        let template = self != Icon::Recording;
+        let template = !matches!(self, Icon::Recording | Icon::Starting);
         let rgb = if template { [0, 0, 0] } else { self.background() };
         let mut out = Vec::with_capacity((size * size * 4) as usize);
         for py in 0..size {
