@@ -24,6 +24,11 @@ app on every system.
 | Windows | not tested: the code is written, but the app hasn't been built or run there |
 | Other Linux desktops | untested |
 
+## Install
+
+macOS: download `Dictation-macos-arm64.zip` from Releases, unzip it and move `Dictation.app` to Applications. The
+app isn't signed by Apple, so the first open is blocked: then System Settings → Privacy & Security → Open Anyway.
+
 ## First start
 
 The app downloads the model (~740 MB; ~1.26 GB on macOS) and prepares it for your machine, which
@@ -54,10 +59,10 @@ Tray menu → Model. Switching restarts the app.
 
 **Linux**
 
-- To paste, the app needs access to `/dev/uinput`. Run once as root, then log out and back in:
+- To paste, the app needs access to `/dev/uinput`. Run once, then log out and back in:
 
   ```sh
-  echo 'KERNEL=="uinput", TAG+="uaccess"' > /etc/udev/rules.d/70-uinput.rules
+  echo 'KERNEL=="uinput", TAG+="uaccess"' | sudo tee /etc/udev/rules.d/70-uinput.rules
   ```
 
 - The tray icon needs a desktop with StatusNotifierItem support, and the shortcut needs the desktop's global
@@ -78,9 +83,8 @@ Tray menu → Model. Switching restarts the app.
   [handy-computer](https://huggingface.co/handy-computer/parakeet-ultra-gguf).
   `assets/parakeet-ultra-ane/` is derived from Parakeet Ultra.
 - The Rust pipeline is a port of [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) (MIT).
-- Built on [burn](https://github.com/tracel-ai/burn) and CubeCL; `patches/` holds fixed copies of three CubeCL
-  crates under their own licenses.
+- The GPU path is built on [burn](https://github.com/tracel-ai/burn) and CubeCL.
 
 ## License
 
-MIT or Apache-2.0, at your option.
+MIT ([LICENSE-MIT](LICENSE-MIT)) or Apache-2.0 ([LICENSE-APACHE](LICENSE-APACHE)), at your option.

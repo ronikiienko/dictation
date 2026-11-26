@@ -2,6 +2,7 @@
 name = "dictation"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 
 [features]
 # GPU kernel tuning (~40% faster encoder on the RTX 3050, 2.1x on the AMD iGPU), done once per GPU by the app's
@@ -69,9 +70,6 @@ enigo = "0.6.1"
 global-hotkey = "0.10.0"
 tao = "0.37.3"
 tray-icon = "0.26.1"
-
-[profile.release]
-debug = 1
 
 # Research tool, not part of the app: WER/timing check on recorded takes.
 [[example]]
