@@ -18,4 +18,9 @@ fn main() {
     let key = h.finish();
     // CubeCL's cache key (lib.rs `build_id__get`); also a GPU's kernel cache is marked "swept" for it (asr::mark_swept).
     println!("cargo:rustc-env=DICTATION_BUILD_KEY={key:016x}");
+    // `cfg(gpu)`: the GPU path (burn/CubeCL, Vulkan) is built everywhere except macOS (Neural Engine or CPU there).
+    println!("cargo::rustc-check-cfg=cfg(gpu)");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        println!("cargo:rustc-cfg=gpu");
+    }
 }

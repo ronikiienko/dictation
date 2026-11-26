@@ -31,6 +31,7 @@ pub fn open_root() -> Result<(), String> {
 /// The build ID CubeCL keys its kernel cache by (`buildid` with feature `buildid-custom-inject` calls this instead of
 /// reading the OS-specific one from the binary): our build key (build.rs: Cargo.lock + rustc), so the cache survives
 /// rebuilds that don't change the kernels. Same on every OS.
+#[cfg(gpu)]
 #[unsafe(no_mangle)]
 pub extern "C" fn build_id__get(build_id: *mut *const u8, len: *mut usize) -> std::ffi::c_int {
     const KEY: &str = env!("DICTATION_BUILD_KEY");

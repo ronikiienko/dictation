@@ -1,16 +1,19 @@
-//! dictation — offline dictation for KDE Wayland (Parakeet Ultra, own Rust port on burn: Vulkan, macOS Metal). Settings are in the tray menu.
+//! dictation — offline dictation (Parakeet Ultra, own Rust port: GPU via burn/Vulkan on Linux and Windows, Neural Engine
+//! on macOS, or the CPU). Settings are in the tray menu.
 //!   dictation            run the tray app
 //!   dictation toggle     start / stop a take in the running app (for a custom shortcut or scripts)
 //!   dictation transcribe [--srt] <file>...   text (or subtitles, .srt format) of audio/video files on stdout (by
 //!                        the running app if there is one, else loads the model itself)
 //!   dictation sweep      compile (and tune, if enabled) GPU kernels for every take length ahead of time. The tray
-//!                        app does this by itself (once per GPU, again only after Cargo.lock or rustc change)
+//!                        app does this by itself (once per GPU, again only after Cargo.lock or rustc change).
+//!                        Not on macOS (no GPU path).
 // Windows: a tray app, not a console program (no black console window next to it; closing that would kill the app).
 #![cfg_attr(windows, windows_subsystem = "windows")]
 use dictation::{RATE, asr, config::Config, daemon, media, models};
 use std::path::{Path, PathBuf};
 
 /// `full`: the old exhaustive sweep (every 80 ms to 30 s, full takes to 120 s), to check the short one misses nothing.
+#[cfg(gpu)]
 fn sweep(full: bool) -> Result<(), String> {
     let m = models::current();
     if !m.installed() {
@@ -85,8 +88,13 @@ fn run_here(p: &PathBuf, srt: bool, local: &mut Option<asr::Asr>) -> Result<Stri
             } else if cfg.cpu {
                 local.insert(asr::Asr::load_cpu(&m.weights())?)
             } else {
-                asr::set_kernel_cache(&m.kernel_cache());
-                local.insert(asr::Asr::load(&m.weights())?)
+                #[cfg(gpu)]
+                {
+                    asr::set_kernel_cache(&m.kernel_cache());
+                    local.insert(asr::Asr::load(&m.weights())?)
+                }
+                #[cfg(not(gpu))]
+                return Err("no GPU path in this build: choose the Neural Engine or the CPU in the tray menu".into());
             }
         }
     };
@@ -107,7 +115,9 @@ fn main() {
             Ok(_) => Ok(()),
             Err(_) => Err("Dictation is not running (start it with `dictation`).".into()),
         },
+        #[cfg(gpu)]
         ["sweep"] => sweep(false).map_err(Into::into),
+        #[cfg(gpu)]
         ["sweep", "full"] => sweep(true).map_err(Into::into),
         ["transcribe", "--srt", files @ ..] if !files.is_empty() => transcribe(files, true).map_err(Into::into),
         ["transcribe", files @ ..] if !files.is_empty() => transcribe(files, false).map_err(Into::into),

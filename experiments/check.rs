@@ -14,7 +14,21 @@ fn load(w: &std::path::Path) -> Result<asr::Asr, String> {
         let d = if d == "1" { models::ULTRA_ANE.ane_dir() } else { d.into() };
         return asr::Asr::load_ane(w, &d, |_| {});
     }
-    if std::env::var("CPU").is_ok() { asr::Asr::load_cpu(w) } else { asr::Asr::load(w) }
+    if std::env::var("CPU").is_ok() {
+        return asr::Asr::load_cpu(w);
+    }
+    #[cfg(gpu)]
+    return asr::Asr::load(w);
+    #[cfg(not(gpu))]
+    Err("macOS has no GPU path: ANE=1 or CPU=1".into())
+}
+
+/// The GPU allocator's pools (GPU builds only).
+fn pool() -> String {
+    #[cfg(gpu)]
+    return asr::mem_report();
+    #[cfg(not(gpu))]
+    String::new()
 }
 
 /// LOG=1: CubeCL's log records (debug and up) on stderr.
@@ -43,6 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("model prepared in {:.1}s", t.elapsed().as_secs_f64());
     }
     // KERNELS=<dir>: use another kernel cache folder (tests that would otherwise add entries to the app's own).
+    #[cfg(gpu)]
     asr::set_kernel_cache(&std::env::var("KERNELS").map(std::path::PathBuf::from).unwrap_or(m.kernel_cache()));
     let t = Instant::now();
     let w = std::env::var("WEIGHTS").map(std::path::PathBuf::from).unwrap_or(m.weights());
@@ -80,7 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 format!("{} (+ GTT {})", kib / 1024, gtt / 1024)
             });
-            eprintln!("{:6.1} s take -> VRAM {} MiB | {}", x.len() as f64 / RATE as f64, me, asr::mem_report());
+            eprintln!("{:6.1} s take -> VRAM {} MiB | {}", x.len() as f64 / RATE as f64, me, pool());
         }
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         println!("{}", json!({"wav": path.file_name().unwrap().to_string_lossy(), "seconds": x.len() as f64 / RATE as f64,
@@ -93,7 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let smi = std::process::Command::new("nvidia-smi").args(["--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"]).output().unwrap();
             let me = String::from_utf8_lossy(&smi.stdout).lines().find(|l| l.starts_with(&format!("{},", std::process::id()))).map(|l| l.to_string());
             let pm = std::fs::read_to_string("/sys/bus/pci/devices/0000:01:00.0/power/runtime_status").unwrap_or_default();
-            format!("VRAM of this process: {:?} MiB; GPU power: {}\n    pool: {}", me.map(|l| l.split(',').nth(1).unwrap().trim().to_string()), pm.trim(), asr::mem_report())
+            format!("VRAM of this process: {:?} MiB; GPU power: {}\n    pool: {}", me.map(|l| l.split(',').nth(1).unwrap().trim().to_string()), pm.trim(), pool())
         };
         eprintln!("loaded:        {}", status());
         drop(a);

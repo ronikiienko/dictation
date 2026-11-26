@@ -25,8 +25,14 @@ fn script(s: &str) -> &'static str {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let m = &models::MODEL;
-    asr::set_kernel_cache(&m.kernel_cache());
-    let mut a = asr::Asr::load(&std::env::var("WEIGHTS").map(std::path::PathBuf::from).unwrap_or(m.weights()))?;
+    let w = std::env::var("WEIGHTS").map(std::path::PathBuf::from).unwrap_or(m.weights());
+    #[cfg(gpu)]
+    let mut a = {
+        asr::set_kernel_cache(&m.kernel_cache());
+        asr::Asr::load(&w)?
+    };
+    #[cfg(not(gpu))]
+    let mut a = asr::Asr::load_cpu(&w)?; // macOS: no GPU path
     let pad = vec![0.0f32; RATE / 2];
     let mut count = std::collections::BTreeMap::<&str, usize>::new();
     for arg in std::env::args().skip(1) {

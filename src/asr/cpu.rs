@@ -4,7 +4,7 @@
 //! 32 values, or 128 when a matrix's scales come in groups of 128 (Parakeet Redux: ternary weights, one scale per
 //! 128), so fewer float fix-ups. ARM: `sdot` (NEON dot product, checked at run time); elsewhere (x86 too, for now) a plain loop.
 //! Attention and the subsampler's convs run in f32 (matrixmultiply). Threads: rayon.
-use super::encoder::{pos_emb_vec, stride2, valid_lengths, D, DK, H, LAYERS, PRE_CHUNK};
+use super::shapes::{pos_emb_vec, stride2, valid_lengths, D, DK, H, LAYERS, PRE_CHUNK};
 use super::weights::Weights;
 use rayon::prelude::*;
 

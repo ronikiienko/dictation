@@ -97,7 +97,8 @@ pub fn path() -> PathBuf {
 
 impl Config {
     /// Missing file -> defaults (and writes them, so there is something to look at). A CPU-only model set to run on
-    /// the GPU (e.g. an older menu allowed it) is moved to the CPU and saved.
+    /// the GPU (e.g. an older menu allowed it) is moved to the CPU and saved; on macOS a GPU choice to the Neural
+    /// Engine.
     pub fn load() -> Config {
         match std::fs::read_to_string(path()) {
             Ok(s) => {
@@ -108,6 +109,11 @@ impl Config {
                 let m = crate::models::by_id(&c.model);
                 if !c.cpu && !m.gpu && !m.ane {
                     c.cpu = true;
+                    let _ = c.save();
+                }
+                // macOS has no GPU path (since 2026-11-25): a GPU choice from an older version -> the Neural Engine.
+                if cfg!(target_os = "macos") && !c.cpu && !m.ane {
+                    c.model = crate::models::default().id.to_string();
                     let _ = c.save();
                 }
                 c

@@ -5,21 +5,16 @@ edition = "2024"
 
 [features]
 # GPU kernel tuning (~40% faster encoder on the RTX 3050, 2.1x on the AMD iGPU), done once per GPU by the app's
-# one-time optimization. `--no-default-features` builds without it.
+# one-time optimization. `--no-default-features` builds without it. No effect on macOS (no GPU path there).
 default = ["autotune"]
 autotune = ["burn/autotune"]
 
 [dependencies]
-buildid = { version = "1.1.0", features = ["buildid-custom-inject"] } # see lib.rs build_id__get
-# Speech-to-text (src/asr). "autotune" comes from our feature of that name; "persistence"
-# keeps compiled GPU kernels on disk (cache folder set in asr::set_kernel_cache). cubecl-runtime only for that config.
-burn = { version = "0.22.1", default-features = false, features = ["std", "fusion", "persistence"] }
-cubecl-runtime = { version = "0.11.4", default-features = false }
 bytemuck = "1"
 bytes = "1"
 half = "2"
 memmap2 = "0.9"
-# CPU encoder (src/asr/cpu.rs): threads and f32 matrix products (both pure Rust, already in the tree via burn).
+# CPU encoder (src/asr/cpu.rs): threads and f32 matrix products (both pure Rust).
 rayon = "1"
 matrixmultiply = "0.3"
 realfft = "3"
@@ -47,15 +42,17 @@ rubato = "5.1.0"
 opus-pure = "0.2.5"
 rfd = "0.18.0"
 
-# GPU API (asr::device): Vulkan, except macOS (no Vulkan there): Metal. Both get kernels in their own language
-# (SPIR-V / MSL), not WGSL.
+# The GPU path (src/asr/encoder.rs, gpu.rs; Linux, Windows): burn on CubeCL, Vulkan (kernels as SPIR-V, not WGSL).
+# macOS has no GPU path (Neural Engine or CPU), so no burn there; build.rs sets `cfg(gpu)` for the code using it.
+# "autotune" comes from our feature of that name; "persistence" keeps compiled GPU kernels on disk (cache folder set
+# in asr::set_kernel_cache). cubecl-runtime only for that config.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-burn = { version = "0.22.1", default-features = false, features = ["vulkan"] }
+burn = { version = "0.22.1", default-features = false, features = ["std", "fusion", "persistence", "vulkan"] }
+cubecl-runtime = { version = "0.11.4", default-features = false }
+buildid = { version = "1.1.0", features = ["buildid-custom-inject"] } # see lib.rs build_id__get
 
 [target.'cfg(target_os = "macos")'.dependencies]
-burn = { version = "0.22.1", default-features = false, features = ["metal"] }
-# Parakeet Ultra's encoder on the Neural Engine (src/asr/ane.rs, CoreML). Only the features used: objc2-foundation
-# also sits under CubeCL's Metal backend, new features there would rebuild burn.
+# Parakeet Ultra's encoder on the Neural Engine (src/asr/ane.rs, CoreML). Only the features used.
 objc2 = { version = "0.6", default-features = false, features = ["std"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSError", "NSString", "NSURL", "NSValue"] }
 objc2-core-ml = { version = "0.3.2", default-features = false, features = ["std", "MLModel", "MLModelConfiguration", "MLModelDescription", "MLFeatureDescription", "MLMultiArrayConstraint", "MLMultiArray", "MLFeatureValue", "MLFeatureProvider", "MLDictionaryFeatureProvider"] }
@@ -104,10 +101,3 @@ path = "experiments/phonon.rs"
 [[example]]
 name = "appicon"
 path = "experiments/appicon.rs"
-
-# Our fixes to CubeCL 0.11.4 (Mac kernel cache), full crate copies; what and why: NOTES.md "Mac kernel cache fixed".
-# Remove an entry once upstream has the fix; on a CubeCL upgrade redo the changes on the new version.
-[patch.crates-io]
-cubecl-cpp = { path = "patches/cubecl-cpp" }
-cubecl-opt = { path = "patches/cubecl-opt" }
-cubecl-wgpu = { path = "patches/cubecl-wgpu" }

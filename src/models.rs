@@ -36,7 +36,7 @@ pub struct ModelInfo {
     pub name: &'static str,
     pub format: Format,
     pub files: &'static [File],
-    /// Runs on the GPU (else CPU only, or the Neural Engine).
+    /// Runs on the GPU (else CPU only, or the Neural Engine). The GPU path exists only off macOS (`cfg(gpu)`).
     pub gpu: bool,
     /// Runs on the Neural Engine only (macOS).
     pub ane: bool,
@@ -126,9 +126,14 @@ pub fn current() -> &'static ModelInfo {
 }
 
 /// The model with this id (config.toml `model`); unknown, "" or not runnable here (the Neural Engine one off macOS):
-/// the default.
+/// the default for this OS (`default`).
 pub fn by_id(id: &str) -> &'static ModelInfo {
-    ALL.into_iter().find(|m| m.id == id && (!m.ane || cfg!(target_os = "macos"))).unwrap_or(&MODEL)
+    ALL.into_iter().find(|m| m.id == id && (!m.ane || cfg!(target_os = "macos"))).unwrap_or(default())
+}
+
+/// Parakeet Ultra on the GPU; macOS (no GPU path): on the Neural Engine.
+pub fn default() -> &'static ModelInfo {
+    if cfg!(target_os = "macos") { &ULTRA_ANE } else { &MODEL }
 }
 
 /// Folder holding the downloaded models (not created here).

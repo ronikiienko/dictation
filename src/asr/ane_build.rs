@@ -6,9 +6,9 @@
 //! - an encoder tensor as fp16 (published fp16: copied; the few f32 ones, norms etc.: rounded to nearest);
 //! - the depthwise conv with its batch norm folded in (CoreML folds it at export; same f32 formula, same bytes);
 //! - `relative_k_proj` applied to the position table of one window (CoreML folds that too): f32 here from our
-//!   f64 table (encoder::pos_emb_vec), rounded once; CoreML's own differs by at most one fp16 step.
+//!   f64 table (shapes::pos_emb_vec), rounded once; CoreML's own differs by at most one fp16 step.
 //! One plain model, one 30 s window (why: ane.rs); ane.rs loads it.
-use super::encoder::{pos_emb_vec, D, DK, H};
+use super::shapes::{pos_emb_vec, D, DK, H};
 use super::redux::St;
 use half::f16;
 use std::io::{self, Write};

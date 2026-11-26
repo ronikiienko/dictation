@@ -9,7 +9,9 @@
 //! CPU only): ternary codes + 1 (0..2), 4 per byte, lowest bits first, row-major, then one f32 scale per group of
 //! 128 along each row.
 use super::gguf::{Gguf, Value};
+#[cfg(gpu)]
 use burn::tensor::quantization::{QuantScheme, QuantValue, ScaleDtype};
+#[cfg(gpu)]
 use burn::tensor::{AllocationProperty, Bytes, DType, TensorData};
 use serde_json::{json, Map, Value as Json};
 use std::collections::HashMap;
@@ -23,6 +25,7 @@ pub const LAYOUT: &str = "burn-0.22 q8s block32 f16-scales";
 const DATA_ALIGN: usize = 4096;
 const TENSOR_ALIGN: usize = 64;
 
+#[cfg(gpu)]
 pub fn q8_scheme() -> QuantScheme {
     QuantScheme::default().with_value(QuantValue::Q8S).per_block([32], ScaleDtype::F16)
 }
@@ -60,10 +63,15 @@ fn from_json(v: &Json) -> Value {
     }
 }
 
-/// burn's bytes for a Q8_0 tensor (int8 values + f16 scales, one per block of 32 along cols).
+/// The stored bytes of a Q8_0 tensor [rows, cols] in burn's layout: the int8 values, then one f16 scale per block of
+/// 32 along cols (cols is a multiple of 32, so the values already end on the 4-byte boundary the scales start at).
+/// Written here, not by burn, so builds without burn (macOS) write the same files; GPU builds check it against burn's
+/// own bytes (`convert`).
 pub fn q8_bytes(q: Vec<i8>, d: &[f32], rows: usize, cols: usize) -> Vec<u8> {
-    let data = TensorData::quantized(q, [rows, cols], q8_scheme(), d, None);
-    data.as_bytes().to_vec()
+    assert!(cols % 32 == 0 && q.len() == rows * cols && d.len() == q.len() / 32, "q8: {rows}x{cols}, {} scales", d.len());
+    let mut b: Vec<u8> = bytemuck::cast_slice(&q).to_vec();
+    b.extend(d.iter().flat_map(|&x| half::f16::from_f32(x).to_le_bytes()));
+    b
 }
 
 /// One tensor for `write`: name, kind ("f32", "f16", "q8"), shape, bytes in that kind's layout.
@@ -81,7 +89,12 @@ pub fn convert(src: &Path, dst: &Path) -> io::Result<()> {
             let rows = q.len() / cols;
             let blob = q8_bytes(q.clone(), &d, rows, cols);
             let (q2, d2) = split_q8(&blob, rows * cols);
-            assert!(q2 == q.as_slice() && d2 == d, "{name}: burn's q8 layout is not the expected one");
+            assert!(q2 == q.as_slice() && d2 == d, "{name}: q8 bytes don't read back");
+            #[cfg(gpu)]
+            assert!(
+                TensorData::quantized(q.clone(), [rows, cols], q8_scheme(), &d, None).as_bytes() == blob.as_slice(),
+                "{name}: burn's q8 layout is not the expected one"
+            );
             ("q8", shape, blob)
         } else if let Some((v, shape)) = g.f16(name) {
             ("f16", shape, v.iter().flat_map(|x| x.to_le_bytes()).collect())
@@ -180,6 +193,7 @@ impl Weights {
 
     /// A linear weight as stored, 2-D [out, in], without copying (burn reads it from the mapped file when
     /// uploading).
+    #[cfg(gpu)]
     pub fn lin_data(&self, name: &str) -> TensorData {
         let e = self.entry(name);
         let shape = [e.shape[0], e.shape[1..].iter().product()];

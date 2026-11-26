@@ -100,8 +100,11 @@ enum Job {
     /// `cpu`: the encoder on the CPU (no kernel cache used). `ane`: on the Neural Engine, its CoreML models' folder.
     Load { weights: std::path::PathBuf, kernels: std::path::PathBuf, cpu: bool, ane: Option<std::path::PathBuf> },
     /// Load + sweep (asr::Asr::sweep) + mark the GPU's kernel cache as swept. Progress -> Ev::SweepProgress.
-    /// `ane`: instead the Neural Engine models' folder: their first load (macOS compiles them), asr::Asr::prepare_ane.
-    Sweep { weights: std::path::PathBuf, kernels: std::path::PathBuf, ane: Option<std::path::PathBuf> },
+    #[cfg(gpu)]
+    Sweep { weights: std::path::PathBuf, kernels: std::path::PathBuf },
+    /// The Neural Engine models' first load (macOS compiles them), asr::Asr::prepare_ane; `dir`: their folder.
+    /// Progress -> Ev::SweepProgress, done -> Ev::Swept, like the GPU's sweep.
+    PrepareAne { weights: std::path::PathBuf, dir: std::path::PathBuf },
     Unload,
     /// A take started (true) or stopped (false): while one is recorded, the Neural Engine is kept awake.
     Recording(bool),
@@ -161,8 +164,13 @@ fn engine(jobs: std_mpsc::Receiver<Job>, ev: mpsc::UnboundedSender<Ev>) {
                     } else if cpu {
                         asr::Asr::load_cpu(&weights)?
                     } else {
-                        asr::set_kernel_cache(&kernels);
-                        asr::Asr::load(&weights)?
+                        #[cfg(gpu)]
+                        {
+                            asr::set_kernel_cache(&kernels);
+                            asr::Asr::load(&weights)?
+                        }
+                        #[cfg(not(gpu))]
+                        return Err(format!("no GPU path in this build ({})", kernels.display()));
                     };
                     a.run(&vec![0.0; RATE])?; // warm-up (the first run of new kernels compiles them, then cached)
                     model = Some(a);
@@ -170,7 +178,7 @@ fn engine(jobs: std_mpsc::Receiver<Job>, ev: mpsc::UnboundedSender<Ev>) {
                 })();
                 let _ = ev.send(Ev::EngineLoaded(r));
             }
-            Job::Sweep { weights, ane: Some(dir), .. } => {
+            Job::PrepareAne { weights, dir } => {
                 model = None;
                 let t = Instant::now();
                 let r = asr::Asr::prepare_ane(&weights, &dir, |done| {
@@ -182,7 +190,8 @@ fn engine(jobs: std_mpsc::Receiver<Job>, ev: mpsc::UnboundedSender<Ev>) {
                 });
                 let _ = ev.send(Ev::Swept(r));
             }
-            Job::Sweep { weights, kernels, ane: None } => {
+            #[cfg(gpu)]
+            Job::Sweep { weights, kernels } => {
                 model = None;
                 asr::set_kernel_cache(&kernels);
                 let t = Instant::now();
@@ -1407,17 +1416,18 @@ async fn main_loop(
         if state == State::Idle && rec.is_none() && busy == 0 && !sweep_tried && ane && !asr::ane_prepared(&models::current().ane_dir()) {
             sweep_tried = true;
             let m = models::current();
-            let _ = jobs.send(Job::Sweep { weights: m.weights(), kernels: m.kernel_cache(), ane: Some(m.ane_dir()) });
+            let _ = jobs.send(Job::PrepareAne { weights: m.weights(), dir: m.ane_dir() });
             state = State::Optimizing;
             mem = Mem::Loading;
             tray.update(|t: &mut Tray| t.sweep = 0).await;
             println!("preparing for the Neural Engine");
             notice.show("Preparing dictation for the Neural Engine", "macOS compiles the model for the Neural Engine. This runs only once and takes 1-2 minutes. Progress is in the tray menu.", "dialog-information").await;
         }
+        #[cfg(gpu)]
         if state == State::Idle && rec.is_none() && busy == 0 && !sweep_tried && !cpu && !ane && models::current().gpu && !asr::swept(&models::current().kernel_cache()) {
             sweep_tried = true;
             let m = models::current();
-            let _ = jobs.send(Job::Sweep { weights: m.weights(), kernels: m.kernel_cache(), ane: None });
+            let _ = jobs.send(Job::Sweep { weights: m.weights(), kernels: m.kernel_cache() });
             state = State::Optimizing;
             mem = Mem::Loading;
             tray.update(|t: &mut Tray| t.sweep = 0).await;

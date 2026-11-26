@@ -1,19 +1,24 @@
-//! Whole pipeline: pcm (16 kHz mono f32) -> text. Mel and decoder on the CPU, encoder + pause head on the GPU (or the
-//! encoder on the Neural Engine, macOS, with the pause head on the CPU; or all on the CPU).
+//! Whole pipeline: pcm (16 kHz mono f32) -> text. Mel and decoder on the CPU, encoder + pause head on the GPU (Linux,
+//! Windows), or the encoder on the Neural Engine (macOS) with the pause head on the CPU, or all on the CPU.
 //! Order of steps follows transcribe.cpp `src/arch/parakeet/model.cpp` (MIT, (c) 2026 The transcribe.cpp authors).
 use super::cpu;
 use super::decoder::Decoder;
-use super::encoder::{valid_lengths, Encoder, Ld, Vad, PRE_CHUNK};
+#[cfg(gpu)]
+use super::encoder::{Encoder, Ld, Vad};
+#[cfg(gpu)]
+use super::shapes::{valid_lengths, PRE_CHUNK};
 use super::weights::Weights;
 use super::longform::{self, Params};
 use super::mel::Mel;
 use super::tokenizer::Tokenizer;
+#[cfg(gpu)]
 use burn::tensor::{DType, Device, FloatDType, Tensor, TensorData};
 use std::time::Instant;
 
 /// Where the encoder runs: GPU (burn), CPU (cpu.rs), or Neural Engine (ane.rs; subsampler for the pause scan, pause
 /// head and joint projection on the CPU: cpu.rs without its blocks).
 enum Engine {
+    #[cfg(gpu)]
     Gpu { dev: Device, enc: Encoder, vad: Vad, joint_enc: (Tensor<2>, Tensor<2>) },
     Cpu(cpu::Encoder),
     #[cfg(target_os = "macos")]
@@ -55,22 +60,20 @@ fn dec(v: f64) -> f64 {
 impl Model {
     /// Weights go to the GPU as f16 activations with int8 (Q8_0) matrices; the encoder's weights as persistent
     /// allocations (own buffers, not pages of the dynamic pool).
-    /// `dev` None: the encoder on the CPU.
-    pub fn load(g: &Weights, dev: Option<Device>) -> Model {
-        let engine = match dev {
-            Some(dev) => {
-                // Test only: F32=1 f32 activations, DEQ=1 weights dequantized (no int8 kernels), to see what f16 +
-                // int8 cost.
-                let f32 = std::env::var("F32").is_ok();
-                let l = Ld { g, dev: &dev, low: if f32 { FloatDType::F32 } else { FloatDType::F16 }, q8: std::env::var("DEQ").is_err() };
-                let enc = dev.memory_persistent_allocations(&l, |l| Encoder::load(l));
-                let vad = Vad::load(&l);
-                let joint_enc = (l.lin("joint.enc.weight"), l.row("joint.enc.bias"));
-                Engine::Gpu { dev, enc, vad, joint_enc }
-            }
-            None => Engine::Cpu(cpu::Encoder::load(g)),
-        };
-        Self::with_engine(g, engine)
+    #[cfg(gpu)]
+    pub fn load_gpu(g: &Weights, dev: Device) -> Model {
+        // Test only: F32=1 f32 activations, DEQ=1 weights dequantized (no int8 kernels), to see what f16 + int8 cost.
+        let f32 = std::env::var("F32").is_ok();
+        let l = Ld { g, dev: &dev, low: if f32 { FloatDType::F32 } else { FloatDType::F16 }, q8: std::env::var("DEQ").is_err() };
+        let enc = dev.memory_persistent_allocations(&l, |l| Encoder::load(l));
+        let vad = Vad::load(&l);
+        let joint_enc = (l.lin("joint.enc.weight"), l.row("joint.enc.bias"));
+        Self::with_engine(g, Engine::Gpu { dev, enc, vad, joint_enc })
+    }
+
+    /// Everything on the CPU (cpu.rs).
+    pub fn load_cpu(g: &Weights) -> Model {
+        Self::with_engine(g, Engine::Cpu(cpu::Encoder::load(g)))
     }
 
     /// Encoder on the Neural Engine (its models already loaded), the rest from `g` on the CPU.
@@ -124,6 +127,7 @@ impl Model {
         (m, frames)
     }
 
+    #[cfg(gpu)]
     fn mel_tensor(&self, pcm: &[f32], dev: &Device) -> Tensor<2> {
         let (m, frames) = self.mel_padded(pcm);
         Tensor::from_data(TensorData::new(m, [frames, self.mel.n_mels]), (dev, DType::F32))
@@ -131,6 +135,7 @@ impl Model {
 
     /// GPU: hand the memory pool's free pages back.
     fn cleanup(&self) {
+        #[cfg(gpu)]
         if let Engine::Gpu { dev, .. } = &self.engine {
             dev.memory_cleanup();
         }
@@ -138,8 +143,20 @@ impl Model {
 
     /// Encoder output through the joint's encoder projection: [T_valid][joint_h] f32.
     fn encode(&self, pcm: &[f32], t: &mut Timing) -> (Vec<f32>, usize) {
-        let (enc, joint_enc, dev) = match &self.engine {
-            Engine::Gpu { dev, enc, joint_enc, .. } => (enc, joint_enc, dev),
+        match &self.engine {
+            #[cfg(gpu)]
+            Engine::Gpu { dev, enc, joint_enc, .. } => {
+                let t0 = Instant::now();
+                let mel = self.mel_tensor(pcm, dev);
+                t.mel += t0.elapsed().as_secs_f64() * 1e3;
+                let t0 = Instant::now();
+                let x = enc.fwd(mel, pcm.len());
+                let n = x.dims()[0];
+                let p = (x.matmul(joint_enc.0.clone()) + joint_enc.1.clone()).cast(FloatDType::F32);
+                let v = p.into_data().convert::<f32>().try_into_vec::<f32>().unwrap();
+                t.enc += t0.elapsed().as_secs_f64() * 1e3;
+                (v, n)
+            }
             Engine::Cpu(c) => {
                 let t0 = Instant::now();
                 let (mel, frames) = self.mel_padded(pcm);
@@ -147,7 +164,7 @@ impl Model {
                 let t0 = Instant::now();
                 let r = c.encode(&mel, frames, pcm.len());
                 t.enc += t0.elapsed().as_secs_f64() * 1e3;
-                return r;
+                r
             }
             #[cfg(target_os = "macos")]
             Engine::Ane { ane, head } => {
@@ -159,19 +176,9 @@ impl Model {
                 let (x, n) = ane.encode(&mel, mel.len() / self.mel.n_mels).unwrap_or_else(|e| panic!("{e}"));
                 let r = (head.project(&x, n), n);
                 t.enc += t0.elapsed().as_secs_f64() * 1e3;
-                return r;
+                r
             }
-        };
-        let t0 = Instant::now();
-        let mel = self.mel_tensor(pcm, dev);
-        t.mel += t0.elapsed().as_secs_f64() * 1e3;
-        let t0 = Instant::now();
-        let x = enc.fwd(mel, pcm.len());
-        let n = x.dims()[0];
-        let p = (x.matmul(joint_enc.0.clone()) + joint_enc.1.clone()).cast(FloatDType::F32);
-        let v = p.into_data().convert::<f32>().try_into_vec::<f32>().unwrap();
-        t.enc += t0.elapsed().as_secs_f64() * 1e3;
-        (v, n)
+        }
     }
 
     /// One piece (<= 30 s) -> tokens with their encoder frames.
@@ -268,32 +275,36 @@ impl Model {
 
     /// Speech probability per encoder frame for one block (subsampler + pause head only).
     fn speech_probs(&self, pcm: &[f32]) -> Vec<f32> {
-        let (enc, vad, dev) = match &self.engine {
-            Engine::Gpu { dev, enc, vad, .. } => (enc, vad, dev),
+        match &self.engine {
+            #[cfg(gpu)]
+            Engine::Gpu { dev, enc, vad, .. } => {
+                let len = valid_lengths(pcm.len(), self.hop);
+                let x = enc.pre.fwd_chunked(self.mel_tensor(pcm, dev), len, PRE_CHUNK);
+                let p = vad.fwd(x).into_data().convert::<f32>().try_into_vec::<f32>().unwrap();
+                p[..p.len().min(len[3])].to_vec()
+            }
             Engine::Cpu(c) => {
                 let (mel, frames) = self.mel_padded(pcm);
-                return c.speech_probs(&mel, frames, pcm.len(), self.hop);
+                c.speech_probs(&mel, frames, pcm.len(), self.hop)
             }
             #[cfg(target_os = "macos")]
             Engine::Ane { head, .. } => {
                 let (mel, frames) = self.mel_padded(pcm);
-                return head.speech_probs(&mel, frames, pcm.len(), self.hop);
+                head.speech_probs(&mel, frames, pcm.len(), self.hop)
             }
-        };
-        let len = valid_lengths(pcm.len(), self.hop);
-        let x = enc.pre.fwd_chunked(self.mel_tensor(pcm, dev), len, PRE_CHUNK);
-        let p = vad.fwd(x).into_data().convert::<f32>().try_into_vec::<f32>().unwrap();
-        p[..p.len().min(len[3])].to_vec()
+        }
     }
 
     /// Pause scan of one block (any length, normally only run on takes over 30 s); the sweep uses it to tune the
     /// pause head at short lengths (the last block of a take over 120 s).
+    #[cfg(gpu)]
     pub fn scan(&self, pcm: &[f32]) {
         let _ = self.speech_probs(pcm);
     }
 
     /// Audio just over 30 s: where its first piece ends (latest pause before 30 s, as for long takes). Runs the
     /// pause scan over all of `pcm` (the sweep uses it for that).
+    #[cfg(gpu)]
     pub fn first_cut(&self, pcm: &[f32]) -> usize {
         self.segments(pcm).first().map_or(pcm.len(), |&(s, l)| s + l)
     }
