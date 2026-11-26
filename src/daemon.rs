@@ -883,10 +883,10 @@ fn press_paste(kb: &mut Option<Keyboard>, keys: PasteKeys) -> Result<(), String>
     r
 }
 
-// ---------------------------------------------------------------- recordings (wav + opus + one JSON line per take)
+// ---------------------------------------------------------------- recordings (opus + one JSON line per take)
 
-/// The take as asr heard it (16 kHz wav) + `full`: the microphone's own audio as Opus (`opus`, `opus_rate` in the
-/// log line; voice data, e.g. for a voice model) + its log line. On a thread: encoding a long take takes a moment.
+/// `full`: the microphone's own audio, saved as Opus (`opus`, `opus_rate` in the log line; also voice data, e.g. for
+/// a voice model) + the take's log line. On a thread: encoding a long take takes a moment.
 fn save_take(t: Take, full: Option<(Vec<f32>, u32)>) {
     let name = time_name();
     std::thread::spawn(move || {
@@ -899,24 +899,13 @@ fn save_take(t: Take, full: Option<(Vec<f32>, u32)>) {
 fn write_take(name: &str, t: &Take, full: Option<(Vec<f32>, u32)>) -> std::io::Result<()> {
     let dir = crate::root().join("recordings");
     std::fs::create_dir_all(&dir)?;
-    let spec = hound::WavSpec { channels: 1, sample_rate: RATE as u32, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
-    let mut w = hound::WavWriter::create(dir.join(format!("{name}.wav")), spec).map_err(std::io::Error::other)?;
-    for &v in &t.audio {
-        w.write_sample((v.clamp(-1.0, 1.0) * 32767.0) as i16).map_err(std::io::Error::other)?;
-    }
-    w.finalize().map_err(std::io::Error::other)?;
+    // Only the Opus copy (no 16 kHz wav since 2026-11-26: the opus, decoded and resampled, is what asr heard, to
+    // within Opus' loss). Without the full-rate audio (shouldn't happen): the 16 kHz take itself.
+    let (x, rate) = full.unwrap_or_else(|| (t.audio.clone(), RATE as u32));
+    crate::media::write_opus(&dir.join(format!("{name}.opus")), &x, rate).map_err(std::io::Error::other)?;
+    let line = serde_json::json!({"opus": format!("{name}.opus"), "opus_rate": rate,
+        "seconds": (t.audio.len() as f64 / RATE as f64 * 100.0).round() / 100.0, "text": t.text, "ms": t.ms.round()});
     use std::io::Write;
-    let mut line = serde_json::json!({"wav": format!("{name}.wav"), "seconds": (t.audio.len() as f64 / RATE as f64 * 100.0).round() / 100.0,
-        "text": t.text, "ms": t.ms.round()});
-    if let Some((x, rate)) = full {
-        match crate::media::write_opus(&dir.join(format!("{name}.opus")), &x, rate) {
-            Ok(()) => {
-                line["opus"] = format!("{name}.opus").into();
-                line["opus_rate"] = rate.into();
-            }
-            Err(e) => eprintln!("save recording (opus): {e}"),
-        }
-    }
     writeln!(std::fs::OpenOptions::new().create(true).append(true).open(dir.join("log.jsonl"))?, "{line}")
 }
 

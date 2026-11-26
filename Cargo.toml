@@ -23,7 +23,6 @@ arboard = { version = "3.7.0", default-features = false, features = ["wayland-da
 cpal = { version = "0.18.2", features = ["pulseaudio"] }
 directories = "6.0.0"
 futures-util = "0.3.34"
-hound = "3"
 jiff = "1.0.1"
 libc = "0.2.191"
 log = "0.4.35"
@@ -70,6 +69,10 @@ enigo = "0.6.1"
 global-hotkey = "0.10.0"
 tao = "0.37.3"
 tray-icon = "0.26.1"
+
+# Only the test tools in experiments/ (rec.rs writes wav files); the app saves takes as Opus.
+[dev-dependencies]
+hound = "3"
 
 # Research tool, not part of the app: WER/timing check on recorded takes.
 [[example]]
