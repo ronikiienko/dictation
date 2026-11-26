@@ -19,15 +19,20 @@ app on every system.
 
 | System | State |
 |---|---|
-| Linux, KDE Plasma (Wayland) | used daily |
+| Linux x86_64, KDE Plasma 6 (Wayland) | used daily |
 | macOS 14 or newer, Apple Silicon | used daily |
 | Windows | not tested: the code is written, but the app hasn't been built or run there |
-| Other Linux desktops | untested |
+| Other Linux desktops | untested; without a tray (e.g. plain GNOME) the app doesn't start |
 
 ## Install
 
 macOS: download `Dictation-macos-arm64.zip` from Releases, unzip it and move `Dictation.app` to Applications. The
 app isn't signed by Apple, so the first open is blocked: then System Settings → Privacy & Security → Open Anyway.
+
+Linux: download `dictation-linux-x86_64.tar.gz` from Releases, extract it and put the `dictation` file somewhere it
+stays, e.g. `~/.local/bin/`. Run it once: it adds itself to the app menu (it writes
+`~/.local/share/applications/local.dictation.Dictation.desktop` pointing at the file; run it again after moving it).
+Allow pasting once (see Notes per system → Linux). Needs glibc 2.35 or newer (distros from 2022 on).
 
 ## First start
 
@@ -59,12 +64,14 @@ Tray menu → Model. Switching restarts the app.
 
 **Linux**
 
-- To paste, the app needs access to `/dev/uinput`. Run once, then log out and back in:
+- To paste, the app needs access to `/dev/uinput`. Run once, then log out and back in (not needed if KDE Connect is
+  installed: it ships the same rule):
 
   ```sh
   echo 'KERNEL=="uinput", TAG+="uaccess"' | sudo tee /etc/udev/rules.d/70-uinput.rules
   ```
 
+- Start at login: System Settings → Autostart → Add → Add Application → Dictation.
 - The tray icon needs a desktop with StatusNotifierItem support, and the shortcut needs the desktop's global
   shortcuts portal. KDE Plasma has both.
 

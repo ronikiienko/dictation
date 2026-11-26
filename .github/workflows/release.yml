@@ -1,13 +1,15 @@
-# On a version tag (git tag v0.1.0 && git push origin v0.1.0): build the macOS app and attach its zip to a GitHub
-# Release for that tag. macOS only for now; a Linux job can sit next to it later.
+# On a version tag (git tag v0.1.0 && git push origin v0.1.0): build the macOS app and the Linux tarball and attach
+# both to a GitHub Release for that tag. Run by hand (Actions -> release -> Run workflow) it only builds: the files
+# are then under the run's artifacts, no release.
 name: release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
-  contents: write # create the release and upload the zip
+  contents: write # create the release and upload the files
 
 jobs:
   macos:
@@ -16,6 +18,34 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup update stable && rustup default stable
       - run: packaging/macos/make-app.sh dist
-      - run: gh release create "$GITHUB_REF_NAME" dist/Dictation-macos-arm64.zip --title "$GITHUB_REF_NAME" --generate-notes
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/Dictation-macos-arm64.zip
+
+  linux:
+    # The binary needs a glibc at least as new as the one it's built on: 22.04's 2.35 covers distros from 2022 on.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      # Headers for ALSA (cpal) and Wayland (rfd's file dialog); everything else is pure Rust.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev libwayland-dev
+      - run: rustup update stable && rustup default stable
+      - run: packaging/linux/make-tar.sh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/dictation-linux-x86_64.tar.gz
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [macos, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}
