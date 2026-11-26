@@ -254,6 +254,10 @@ struct Tray {
     gpus: Vec<(String, &'static str)>,
     /// While optimizing: percent done.
     sweep: u32,
+    /// The last take's length and how long transcribing it took ("" before the first take).
+    last: String,
+    /// When the take being recorded started (shown as its length, live).
+    rec_since: Option<Instant>,
     tx: mpsc::UnboundedSender<Ev>,
 }
 
@@ -269,7 +273,10 @@ impl Tray {
             State::NoModel => "No model yet — click to download".into(),
             State::Idle => format!("Ready{key}"),
             State::Starting => "Starting the microphone…".into(),
-            State::Recording => format!("● Recording{key}"),
+            State::Recording => {
+                let s = self.rec_since.map_or(0, |t| t.elapsed().as_secs());
+                format!("● Recording {}:{:02}{key}", s / 60, s % 60)
+            }
             State::Transcribing => "Transcribing…".into(),
             State::Optimizing if models::current().ane => format!("Preparing for the Neural Engine… {}%", self.sweep),
             State::Optimizing => {
@@ -481,6 +488,9 @@ impl tray::Model for Tray {
         };
 
         let mut items = vec![Label(self.status_text())];
+        if !self.last.is_empty() {
+            items.push(Label(self.last.clone()));
+        }
         if self.state == State::Optimizing {
             // Two lines: one long line made the whole menu too wide.
             items.push(Label(self.mem_text()));
@@ -936,6 +946,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         gpu: asr::gpu().to_string(),
         gpus: asr::gpus().into_iter().map(|g| (g.name, g.kind)).collect(),
         sweep: 0,
+        last: String::new(),
+        rec_since: None,
         tx: tx.clone(),
     };
     // The tray on this (main) thread, everything else on the app thread's runtime.
@@ -1036,6 +1048,18 @@ async fn main_loop(
             loop {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 if tx.send(Ev::Tick).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    {
+        // While recording: redraw every second for the take's length in the status line.
+        let tray = tray.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if tray.update(|t: &mut Tray| t.rec_since.is_some()).await.is_none() {
                     break;
                 }
             }
@@ -1191,6 +1215,9 @@ async fn main_loop(
                             notice.show("Nothing recognized", "", "dialog-information").await;
                         }
                         println!("{:.1}s audio, {:.0} ms: {}", t.audio.len() as f64 / RATE as f64, t.ms, t.text);
+                        let took = if t.ms < 1000.0 { format!("{:.0} ms", t.ms) } else { format!("{:.1} s", t.ms / 1000.0) };
+                        let last = format!("Last take: {:.1} s, transcribed in {took}", t.audio.len() as f64 / RATE as f64);
+                        tray.update(move |tr: &mut Tray| tr.last = last).await;
                         if cfg.save_recordings {
                             if let Err(e) = save_take(&t) {
                                 eprintln!("save recording: {e}");
@@ -1392,6 +1419,11 @@ async fn main_loop(
         }
         let (s, m, c) = (state, mem, cfg.clone());
         tray.update(move |t: &mut Tray| {
+            if !matches!(s, State::Starting | State::Recording) {
+                t.rec_since = None;
+            } else if t.rec_since.is_none() {
+                t.rec_since = Some(Instant::now());
+            }
             t.state = s;
             t.mem = m;
             t.cfg = c;
