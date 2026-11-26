@@ -1,0 +1,21 @@
+# On a version tag (git tag v0.1.0 && git push origin v0.1.0): build the macOS app and attach its zip to a GitHub
+# Release for that tag. macOS only for now; a Linux job can sit next to it later.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release and upload the zip
+
+jobs:
+  macos:
+    runs-on: macos-15 # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup default stable
+      - run: packaging/macos/make-app.sh dist
+      - run: gh release create "$GITHUB_REF_NAME" dist/Dictation-macos-arm64.zip --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
