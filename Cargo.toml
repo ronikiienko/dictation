@@ -63,6 +63,10 @@ objc2-core-ml = { version = "0.3.2", default-features = false, features = ["std"
 ashpd = { version = "0.14.1", default-features = false, features = ["tokio", "global_shortcuts"] }
 evdev = "0.13.2"
 ksni = "0.3.7"
+# Which inputs can only record silence (unplugged jack, monitor of an output without a screen): port states from the
+# sound server, through the same PulseAudio client cpal uses (audio.rs `unplugged`).
+pulseaudio = "0.3.2"
+futures-executor = "0.3.34"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 enigo = "0.6.1"

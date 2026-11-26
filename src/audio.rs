@@ -25,18 +25,53 @@ fn host() -> cpal::Host {
 pub const SYSTEM_AUDIO: &str = "system-audio";
 
 /// (id, human name) of every input device; id "" = system default. On macOS and Windows also SYSTEM_AUDIO (on
-/// Linux the sound server already lists "Monitor of …" sources for that).
+/// Linux the sound server already lists "Monitor of …" sources for that; those of unplugged outputs and microphone
+/// jacks with nothing in them are left out, see `unplugged`).
 pub fn input_devices() -> Vec<(String, String)> {
     let mut out = vec![(String::new(), "System default".to_string())];
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     out.push((SYSTEM_AUDIO.to_string(), "System audio (what's playing)".to_string()));
+    #[cfg(target_os = "linux")]
+    let hidden = unplugged();
     if let Ok(devs) = host().input_devices() {
         for d in devs {
             let (Ok(id), Ok(desc)) = (d.id(), d.description()) else { continue };
-            out.push((id.to_string(), desc.name().to_string()));
+            let id = id.to_string();
+            #[cfg(target_os = "linux")]
+            if id.split_once(':').is_some_and(|(_, name)| hidden.contains(name)) {
+                continue;
+            }
+            out.push((id, desc.name().to_string()));
         }
     }
     out
+}
+
+/// Sound server names of the sources that can only record silence: whose own port (a microphone jack) or, for a
+/// "Monitor of …", whose output's port (an HDMI/DisplayPort output without a monitor or one without speakers) the
+/// server reports as not available (jack detection; the HDMI/DP state comes from the monitor itself). "Unknown"
+/// (built-in microphones and speakers, no detection) stays listed. Empty when the server can't be asked.
+#[cfg(target_os = "linux")]
+fn unplugged() -> std::collections::HashSet<String> {
+    use pulseaudio::protocol::port_info::{PortAvailable, PortInfo};
+    use std::collections::HashSet;
+    let off = |ports: &[PortInfo], active: usize| ports.get(active).is_some_and(|p| p.available == PortAvailable::No);
+    // `Client::from_env` can block without a timeout (cpal does the same): ask on a thread, give up after 1 s.
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let r = (|| {
+            let c = pulseaudio::Client::from_env(c"dictation-devices").ok()?;
+            let sinks = futures_executor::block_on(c.list_sinks()).ok()?;
+            let sources = futures_executor::block_on(c.list_sources()).ok()?;
+            let off_sinks: HashSet<u32> = sinks.iter().filter(|s| off(&s.ports, s.active_port)).map(|s| s.index).collect();
+            let names = sources.into_iter().filter(|s| {
+                off(&s.ports, s.active_port) || s.monitor_of_sink_index.is_some_and(|i| off_sinks.contains(&i))
+            });
+            Some(names.map(|s| s.name.to_string_lossy().into_owned()).collect::<HashSet<String>>())
+        })();
+        let _ = tx.send(r.unwrap_or_default());
+    });
+    rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default()
 }
 
 /// A running recording. Audio is captured on its own thread (cpal streams are not Send); stop() returns the take.
