@@ -27,25 +27,31 @@ static CODECS: LazyLock<CodecRegistry> = LazyLock::new(|| {
 });
 
 /// Mono samples at the file's rate in, 16 kHz out, chunk by chunk.
+/// Mono resampler (rubato FFT), any rate -> `to` (16 kHz for asr; 48 kHz for Opus).
 struct To16k {
-    rs: Option<Fft<f32>>, // None: the file is 16 kHz already
+    rs: Option<Fft<f32>>, // None: already at `to`
     pending: Vec<f32>,
     inbuf: Vec<f32>,
     outbuf: Vec<f32>,
     out: Vec<f32>,
     frames_in: usize,
     rate: usize,
+    to: usize,
 }
 
 impl To16k {
     fn new(rate: usize) -> Result<To16k, String> {
-        let rs = if rate == RATE {
+        Self::to(rate, RATE)
+    }
+
+    fn to(rate: usize, to: usize) -> Result<To16k, String> {
+        let rs = if rate == to {
             None
         } else {
-            Some(Fft::<f32>::new(rate, RATE, 1024, 1, FixedSync::Both).map_err(|e| format!("resampler: {e}"))?)
+            Some(Fft::<f32>::new(rate, to, 1024, 1, FixedSync::Both).map_err(|e| format!("resampler: {e}"))?)
         };
         let (inbuf, outbuf) = rs.as_ref().map_or((vec![], vec![]), |r| (vec![0.0; r.input_frames_max()], vec![0.0; r.output_frames_max()]));
-        Ok(To16k { rs, pending: Vec::new(), inbuf, outbuf, out: Vec::new(), frames_in: 0, rate })
+        Ok(To16k { rs, pending: Vec::new(), inbuf, outbuf, out: Vec::new(), frames_in: 0, rate, to })
     }
 
     fn push(&mut self, x: &[f32]) -> Result<(), String> {
@@ -79,7 +85,7 @@ impl To16k {
     /// The rest of the input, then silence until the resampler's delay is out; that delay is cut off the start.
     fn finish(mut self) -> Result<Vec<f32>, String> {
         let Some(rs) = self.rs.as_mut() else { return Ok(self.out) };
-        let want = (self.frames_in as u64 * RATE as u64).div_ceil(self.rate as u64) as usize;
+        let want = (self.frames_in as u64 * self.to as u64).div_ceil(self.rate as u64) as usize;
         let delay = rs.output_delay();
         let mut partial = Some(self.pending.len());
         self.inbuf.fill(0.0);
@@ -99,6 +105,48 @@ pub(crate) fn mono_to_16k(x: &[f32], rate: usize) -> Result<Vec<f32>, String> {
     let mut c = To16k::new(rate)?;
     c.push(x)?;
     c.finish()
+}
+
+/// Mono samples at `rate` -> an Ogg Opus file (`opus-pure`, pure Rust), fullband ~48 kbit/s: the recordings'
+/// full-quality copy (the 16 kHz wav next to it is what asr heard). Opus takes 8/12/16/24/48 kHz; any other rate
+/// (44.1 kHz USB mics) is resampled to 48 kHz first.
+pub(crate) fn write_opus(path: &Path, x: &[f32], rate: u32) -> Result<(), String> {
+    use opus_pure::{Application, MAX_PACKET_BYTES, OggOpusWriter, OpusEncoder, OpusHead};
+    let e = |e: opus_pure::Error| e.to_string();
+    let resampled;
+    let (x, rate) = if [8000, 12000, 16000, 24000, 48000].contains(&rate) {
+        (x, rate)
+    } else {
+        let mut c = To16k::to(rate as usize, 48000)?;
+        c.push(x)?;
+        resampled = c.finish()?;
+        (&resampled[..], 48000)
+    };
+    let mut enc = OpusEncoder::new(rate as i32, 1, Application::Audio).map_err(e)?;
+    enc.bitrate_bps = 48_000;
+    let head = OpusHead::for_encoder(&enc, rate);
+    // As opus-pure's example: encode the encoder's lookahead too (zeros), then end the last page exactly at the
+    // audio's end (granule = pre-skip + length, in 48 kHz ticks).
+    let (frame, ticks) = (rate as usize / 50, 48000 / rate as usize);
+    let frames = (x.len() + (head.pre_skip as usize).div_ceil(ticks)).div_ceil(frame);
+    let end = u64::from(head.pre_skip) + (x.len() * ticks) as u64;
+    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let mut w = OggOpusWriter::new(std::io::BufWriter::new(file), head).map_err(e)?;
+    let (mut packet, mut block) = (vec![0u8; MAX_PACKET_BYTES], vec![0.0f32; frame]);
+    for i in 0..frames {
+        let s = (i * frame).min(x.len());
+        let t = (s + frame).min(x.len());
+        block[..t - s].copy_from_slice(&x[s..t]);
+        block[t - s..].fill(0.0);
+        let n = enc.encode(&block, frame, &mut packet).map_err(e)?;
+        if i + 1 == frames {
+            w.write_packet_with_duration(&packet[..n], (end - w.granule() as u64) as u32).map_err(e)?;
+        } else {
+            w.write_packet(&packet[..n]).map_err(e)?;
+        }
+    }
+    w.finish().map_err(e)?;
+    Ok(())
 }
 
 /// The file's first audio track as 16 kHz mono (channels averaged).

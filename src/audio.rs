@@ -39,10 +39,19 @@ pub fn input_devices() -> Vec<(String, String)> {
     out
 }
 
-/// A running recording. Audio is captured on its own thread (cpal streams are not Send); stop() returns 16 kHz mono.
+/// A running recording. Audio is captured on its own thread (cpal streams are not Send); stop() returns the take.
 pub struct Recorder {
     stop: mpsc::Sender<()>,
-    thread: std::thread::JoinHandle<Result<Vec<f32>, String>>,
+    thread: std::thread::JoinHandle<Result<Captured, String>>,
+}
+
+/// A stopped take.
+pub struct Captured {
+    /// 16 kHz mono: what asr gets.
+    pub audio: Vec<f32>,
+    /// Mono at the device's own rate (`rate`), for the full-quality copy of the recording.
+    pub full: Vec<f32>,
+    pub rate: u32,
 }
 
 impl Recorder {
@@ -57,7 +66,7 @@ impl Recorder {
         let buf = Arc::new(Mutex::new(Vec::<f32>::with_capacity(RATE * 60)));
         let live = Arc::new(AtomicBool::new(device == SYSTEM_AUDIO));
         let (b, l) = (buf, live);
-        let thread = std::thread::spawn(move || -> Result<Vec<f32>, String> {
+        let thread = std::thread::spawn(move || -> Result<Captured, String> {
             let (stream, rate, channels) = match open(&device, b.clone(), l.clone()) {
                 Ok(s) => {
                     let _ = ready_tx.send(Ok(()));
@@ -84,13 +93,14 @@ impl Recorder {
             std::thread::sleep(TAIL); // let the last block arrive before closing
             drop(stream);
             let raw = std::mem::take(&mut *b.lock().unwrap());
-            Ok(to_16k_mono(&raw, rate, channels))
+            let full = mono(&raw, channels);
+            Ok(Captured { audio: to_16k(&full, rate), full, rate })
         });
         ready_rx.recv().map_err(|_| "audio thread died".to_string())??;
         Ok(Recorder { stop: stop_tx, thread })
     }
 
-    pub fn stop(self) -> Result<Vec<f32>, String> {
+    pub fn stop(self) -> Result<Captured, String> {
         let _ = self.stop.send(());
         self.thread.join().map_err(|_| "audio thread panicked".to_string())?
     }
@@ -110,7 +120,7 @@ fn open(device: &str, buf: Arc<Mutex<Vec<f32>>>, live: Arc<AtomicBool>) -> Resul
     }
     .ok_or(if system { "no output device found" } else { "no microphone found" })?;
     let err = |e: cpal::Error| eprintln!("audio: {e}");
-    // Record in the format the device already runs at and convert in the app (to_16k_mono). Never ask for another
+    // Record in the format the device already runs at and convert in the app (to_16k). Never ask for another
     // format: on macOS cpal applies the requested rate to the device itself, for every app, and leaves it there
     // (16 kHz on Bluetooth headphones = headset/call quality, even after the app quits).
     let def = if system { dev.default_output_config() } else { dev.default_input_config() }.map_err(|e| e.to_string())?;
@@ -178,14 +188,16 @@ fn open(device: &str, buf: Arc<Mutex<Vec<f32>>>, live: Arc<AtomicBool>) -> Resul
 
 /// Downmix (average of channels) + resample to 16 kHz (rubato, band-limited, so nothing above 8 kHz folds back
 /// into the speech band).
-fn to_16k_mono(x: &[f32], rate: u32, channels: u16) -> Vec<f32> {
+fn mono(x: &[f32], channels: u16) -> Vec<f32> {
     let ch = channels.max(1) as usize;
-    let mono: Vec<f32> =
-        if ch == 1 { x.to_vec() } else { x.chunks(ch).map(|f| f.iter().sum::<f32>() / ch as f32).collect() };
+    if ch == 1 { x.to_vec() } else { x.chunks(ch).map(|f| f.iter().sum::<f32>() / ch as f32).collect() }
+}
+
+fn to_16k(mono: &[f32], rate: u32) -> Vec<f32> {
     if rate as usize == RATE || mono.is_empty() {
-        return mono;
+        return mono.to_vec();
     }
-    crate::media::mono_to_16k(&mono, rate as usize).unwrap_or_else(|e| {
+    crate::media::mono_to_16k(mono, rate as usize).unwrap_or_else(|e| {
         eprintln!("audio: {e}");
         Vec::new()
     })

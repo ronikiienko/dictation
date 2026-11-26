@@ -874,12 +874,22 @@ fn press_paste(kb: &mut Option<Keyboard>, keys: PasteKeys) -> Result<(), String>
     r
 }
 
-// ---------------------------------------------------------------- recordings (wav + one JSON line per take)
+// ---------------------------------------------------------------- recordings (wav + opus + one JSON line per take)
 
-fn save_take(t: &Take) -> std::io::Result<()> {
+/// The take as asr heard it (16 kHz wav) + `full`: the microphone's own audio as Opus (`opus`, `opus_rate` in the
+/// log line; voice data, e.g. for a voice model) + its log line. On a thread: encoding a long take takes a moment.
+fn save_take(t: Take, full: Option<(Vec<f32>, u32)>) {
+    let name = time_name();
+    std::thread::spawn(move || {
+        if let Err(e) = write_take(&name, &t, full) {
+            eprintln!("save recording: {e}");
+        }
+    });
+}
+
+fn write_take(name: &str, t: &Take, full: Option<(Vec<f32>, u32)>) -> std::io::Result<()> {
     let dir = crate::root().join("recordings");
     std::fs::create_dir_all(&dir)?;
-    let name = time_name();
     let spec = hound::WavSpec { channels: 1, sample_rate: RATE as u32, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
     let mut w = hound::WavWriter::create(dir.join(format!("{name}.wav")), spec).map_err(std::io::Error::other)?;
     for &v in &t.audio {
@@ -887,8 +897,17 @@ fn save_take(t: &Take) -> std::io::Result<()> {
     }
     w.finalize().map_err(std::io::Error::other)?;
     use std::io::Write;
-    let line = serde_json::json!({"wav": format!("{name}.wav"), "seconds": (t.audio.len() as f64 / RATE as f64 * 100.0).round() / 100.0,
+    let mut line = serde_json::json!({"wav": format!("{name}.wav"), "seconds": (t.audio.len() as f64 / RATE as f64 * 100.0).round() / 100.0,
         "text": t.text, "ms": t.ms.round()});
+    if let Some((x, rate)) = full {
+        match crate::media::write_opus(&dir.join(format!("{name}.opus")), &x, rate) {
+            Ok(()) => {
+                line["opus"] = format!("{name}.opus").into();
+                line["opus_rate"] = rate.into();
+            }
+            Err(e) => eprintln!("save recording (opus): {e}"),
+        }
+    }
     writeln!(std::fs::OpenOptions::new().create(true).append(true).open(dir.join("log.jsonl"))?, "{line}")
 }
 
@@ -1074,6 +1093,8 @@ async fn main_loop(
     let mut take_no = 0u64; // numbers takes, so a late Ev::MicLive of a stopped take is ignored
     let mut shortcut = String::new();
     let mut busy = 0usize; // takes queued in the engine
+    // Their audio at the microphone's own rate (with that rate), for the full-quality copy saved with the take.
+    let mut full: std::collections::VecDeque<(Vec<f32>, u32)> = Default::default();
     let mut downloading = false;
     let mut mem = Mem::Unloaded;
     let mut last_used = Instant::now();
@@ -1144,7 +1165,7 @@ async fn main_loop(
                     }
                     state = if busy > 0 { State::Transcribing } else { State::Idle };
                     match r.stop() {
-                        Ok(x) if cfg.microphone == audio::SYSTEM_AUDIO && x.iter().all(|&v| v == 0.0) => {
+                        Ok(c) if cfg.microphone == audio::SYSTEM_AUDIO && c.audio.iter().all(|&v| v == 0.0) => {
                             notice
                                 .show(
                                     "System audio was silent",
@@ -1153,9 +1174,10 @@ async fn main_loop(
                                 )
                                 .await
                         }
-                        Ok(x) if x.len() >= RATE / 4 => {
+                        Ok(c) if c.audio.len() >= RATE / 4 => {
                             busy += 1;
-                            let _ = jobs.send(Job::Transcribe(x));
+                            let _ = jobs.send(Job::Transcribe(c.audio));
+                            full.push_back((c.full, c.rate));
                             state = State::Transcribing;
                         }
                         Ok(_) => notice.show("Too short, skipped", "", "dialog-information").await,
@@ -1193,6 +1215,7 @@ async fn main_loop(
             }
             Ev::Done(r) => {
                 busy = busy.saturating_sub(1);
+                let full = full.pop_front(); // the engine runs takes in order
                 last_used = Instant::now();
                 if state == State::Transcribing && busy == 0 {
                     state = State::Idle;
@@ -1224,9 +1247,7 @@ async fn main_loop(
                         let last = format!("Last take: {:.1} s, transcribed in {took}", t.audio.len() as f64 / RATE as f64);
                         tray.update(move |tr: &mut Tray| tr.last = last).await;
                         if cfg.save_recordings {
-                            if let Err(e) = save_take(&t) {
-                                eprintln!("save recording: {e}");
-                            }
+                            save_take(t, full);
                         }
                     }
                     Err(e) => notice.show("Transcription failed", &e, "dialog-error").await,

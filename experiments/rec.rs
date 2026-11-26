@@ -11,7 +11,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (src, secs, out) = (&a[1], a[2].parse::<f64>()?, &a[3]);
     let r = dictation::audio::Recorder::start(src, || {})?;
     std::thread::sleep(std::time::Duration::from_secs_f64(secs));
-    let x = r.stop()?;
+    let x = r.stop()?.audio;
     let peak = x.iter().fold(0f32, |m, v| m.max(v.abs()));
     let rms = (x.iter().map(|v| v * v).sum::<f32>() / x.len().max(1) as f32).sqrt();
     let first = x.iter().position(|v| v.abs() > 0.01).map_or(-1.0, |i| i as f64 / 16000.0);

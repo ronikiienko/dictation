@@ -2630,6 +2630,7 @@ dependencies = [
  "objc2-core-ml",
  "objc2-foundation",
  "open",
+ "opus-pure",
  "rayon",
  "realfft",
  "rfd",
@@ -5731,6 +5732,12 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "opus-pure"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2da6dcc20af557d030b6f206e75c764bcda8c28a5bd03c73935c7e8fcf5f4f4a"
 
 [[package]]
 name = "ordered-float"
