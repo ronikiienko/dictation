@@ -4,3 +4,7 @@
 /.cache/
 /.venv*/
 __pycache__/
+# local only: instructions for Claude Code (personal workflow rules)
+/CLAUDE.md
+# macOS Finder metadata
+.DS_Store
