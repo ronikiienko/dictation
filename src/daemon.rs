@@ -923,7 +923,10 @@ impl log::Log for StderrLog {
         m.level() <= log::Level::Warn
     }
     fn log(&self, r: &log::Record) {
-        if self.enabled(r.metadata()) {
+        // The PulseAudio client logs its normal close as an error: each device listing (cpal, audio::unplugged)
+        // opens and drops a connection.
+        let closed = r.target() == "pulseaudio::client::reactor" && r.args().to_string().contains("Client disconnected");
+        if self.enabled(r.metadata()) && !closed {
             eprintln!("{} {}: {}", r.target(), r.level(), r.args());
         }
     }
