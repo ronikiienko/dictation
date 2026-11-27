@@ -54,6 +54,8 @@ pub enum Ev {
     Done(Result<Take, String>),
     /// A file's audio (media::read) -> its text, or subtitles (.srt content) if `srt`, back to the sender.
     File(Vec<f32>, bool, tokio::sync::oneshot::Sender<Result<String, String>>),
+    /// The take or file being transcribed: share done, 0..1 (audio over 30 s only).
+    Progress(f64),
     /// A file's text was sent back.
     FileDone,
     /// Tray "Transcribe a file": pick files, each one's text (or subtitles if true) saved next to it.
@@ -121,6 +123,17 @@ fn timing_line(what: &str, s: &asr::Timing) {
 /// down when idle and the take's own encode would pay +100-140 ms after 16+ s. One run (~130 ms) every 4 s leaves
 /// ~15 ms; a stop during a run waits for its rest (~3.5% of takes, ~65 ms on average).
 const KEEP_AWAKE: Duration = Duration::from_secs(4);
+
+/// `progress(done)` for a transcription -> Ev::Progress, at most once per percent.
+fn progress_sender(ev: &mpsc::UnboundedSender<Ev>) -> impl FnMut(f64) + '_ {
+    let mut sent = 0.0;
+    move |done| {
+        if done - sent >= 0.01 {
+            sent = done;
+            let _ = ev.send(Ev::Progress(done));
+        }
+    }
+}
 
 fn engine(jobs: std_mpsc::Receiver<Job>, ev: mpsc::UnboundedSender<Ev>) {
     let mut model: Option<asr::Asr> = None;
@@ -220,7 +233,7 @@ fn engine(jobs: std_mpsc::Receiver<Job>, ev: mpsc::UnboundedSender<Ev>) {
             Job::Transcribe(x) => {
                 let t = Instant::now();
                 let r = match model.as_mut() {
-                    Some(a) => a.run(&x),
+                    Some(a) => a.run_progress(&x, progress_sender(&ev)),
                     None => Err("model not loaded".into()),
                 };
                 let ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -231,9 +244,10 @@ fn engine(jobs: std_mpsc::Receiver<Job>, ev: mpsc::UnboundedSender<Ev>) {
             }
             Job::File(x, srt, reply) => {
                 let t = Instant::now();
+                let progress = progress_sender(&ev);
                 let r = match model.as_mut() {
-                    Some(a) if srt => a.run_words(&x).map(|(w, s)| (crate::subtitles::srt(&w), s)),
-                    Some(a) => a.run(&x),
+                    Some(a) if srt => a.run_words_progress(&x, progress).map(|(w, s)| (crate::subtitles::srt(&w), s)),
+                    Some(a) => a.run_progress(&x, progress),
                     None => Err("model not loaded".into()),
                 };
                 if let Ok((_, s)) = &r {
@@ -263,6 +277,8 @@ struct Tray {
     gpus: Vec<(String, &'static str)>,
     /// While optimizing: percent done.
     sweep: u32,
+    /// While a take or file over 30 s is transcribed: percent done.
+    progress: Option<u32>,
     /// The last take's length and how long transcribing it took ("" before the first take).
     last: String,
     /// When the take being recorded started (shown as its length, live).
@@ -286,7 +302,10 @@ impl Tray {
                 let s = self.rec_since.map_or(0, |t| t.elapsed().as_secs());
                 format!("● Recording {}:{:02}{key}", s / 60, s % 60)
             }
-            State::Transcribing => "Transcribing…".into(),
+            State::Transcribing => match self.progress {
+                Some(pct) => format!("Transcribing… {pct}%"),
+                None => "Transcribing…".into(),
+            },
             State::Optimizing if models::current().ane => format!("Preparing for the Neural Engine… {}%", self.sweep),
             State::Optimizing => {
                 format!("Speeding up dictation for {}… {}%", self.gpu, self.sweep)
@@ -967,6 +986,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         gpu: asr::gpu().to_string(),
         gpus: asr::gpus().into_iter().map(|g| (g.name, g.kind)).collect(),
         sweep: 0,
+        progress: None,
         last: String::new(),
         rec_since: None,
         tx: tx.clone(),
@@ -1129,6 +1149,10 @@ async fn main_loop(
                 tray.update(move |t: &mut Tray| t.sweep = (done * 100.0) as u32).await;
                 continue;
             }
+            Ev::Progress(done) => {
+                tray.update(move |t: &mut Tray| t.progress = Some((done * 100.0) as u32)).await;
+                continue;
+            }
             ev => ev,
         };
         match ev {
@@ -1215,6 +1239,7 @@ async fn main_loop(
                 }
             }
             Ev::Done(r) => {
+                tray.update(|t: &mut Tray| t.progress = None).await;
                 busy = busy.saturating_sub(1);
                 let full = full.pop_front(); // the engine runs takes in order
                 last_used = Instant::now();
@@ -1286,6 +1311,7 @@ async fn main_loop(
                 }
             },
             Ev::FileDone => {
+                tray.update(|t: &mut Tray| t.progress = None).await;
                 busy = busy.saturating_sub(1);
                 last_used = Instant::now();
                 if state == State::Transcribing && busy == 0 {
@@ -1384,7 +1410,7 @@ async fn main_loop(
             }
             Ev::ShortcutFailed(e) => notice.show("Shortcut not set", &format!("{e}. Pick another in the tray menu."), "dialog-error").await,
             Ev::Quit => break,
-            Ev::SweepProgress(_) => unreachable!("handled above"),
+            Ev::SweepProgress(_) | Ev::Progress(_) => unreachable!("handled above"),
         }
         notice.enabled = cfg.notifications;
         if state == State::NoModel && installed() {

@@ -52,6 +52,14 @@ pub struct Timing {
     pub vad: f64,
 }
 
+/// Progress of a long transcription, done 0..1 (only takes over 30 s report any).
+pub type Progress<'a> = &'a mut dyn FnMut(f64);
+
+/// The pause scan's share of a long file's time in progress reports, the pieces get the rest. Measured on the Neural
+/// Engine (M-series Mac, 30 min file): pauses 3.5 s of 14 s; the GPU's tuned scan is cheaper (NOTES.md), so there
+/// the first part moves faster.
+const SCAN_SHARE: f64 = 0.25;
+
 /// GGUF floats like 0.1000000015 back to the decimal the converter meant (transcribe.cpp `as_decimal`).
 fn dec(v: f64) -> f64 {
     (v * 1e6).round() / 1e6
@@ -195,20 +203,31 @@ impl Model {
 
     /// Tokens of each piece (start, length) of `pcm`. GPU: piece i is decoded on a CPU thread while the GPU encodes
     /// piece i + 1 (CPU encoder: one after the other, both want the same cores). `t.dec` then also counts decoder
-    /// time hidden behind the encoder.
-    fn pieces_tokens(&self, pcm: &[f32], segs: &[(usize, usize)], t: &mut Timing) -> Vec<Vec<(usize, usize)>> {
+    /// time hidden behind the encoder. `progress(done 0..1)` after each piece (by where it ends in `pcm`), scaled to
+    /// the share after the pause scan.
+    fn pieces_tokens(&self, pcm: &[f32], segs: &[(usize, usize)], t: &mut Timing, progress: Progress) -> Vec<Vec<(usize, usize)>> {
+        let mut report = |done: usize| {
+            let (start, len) = segs[done - 1];
+            progress(SCAN_SHARE + (1.0 - SCAN_SHARE) * (start + len) as f64 / pcm.len() as f64);
+        };
         if matches!(self.engine, Engine::Cpu(_)) || segs.len() < 2 {
-            return segs.iter().map(|&(start, len)| self.one_shot_tokens(&pcm[start..start + len], t)).collect();
+            let mut out = Vec::new();
+            for &(start, len) in segs {
+                out.push(self.one_shot_tokens(&pcm[start..start + len], t));
+                report(out.len());
+            }
+            return out;
         }
         type Job<'s> = std::thread::ScopedJoinHandle<'s, (Vec<(usize, usize)>, f64)>;
         let dec = &self.dec;
         std::thread::scope(|s| {
             let mut out = Vec::new();
             let mut pending: Option<Job> = None;
-            let join = |h: Job, out: &mut Vec<_>, t: &mut Timing| {
+            let mut join = |h: Job, out: &mut Vec<_>, t: &mut Timing| {
                 let (toks, ms) = h.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
                 t.dec += ms;
                 out.push(toks);
+                report(out.len());
             };
             for &(start, len) in segs {
                 let piece = &pcm[start..start + len];
@@ -249,19 +268,19 @@ impl Model {
     }
 
     /// Like `transcribe`, but words with times (for subtitles). Same pieces, so the same text.
-    pub fn transcribe_words(&self, pcm: &[f32]) -> (Vec<Word>, Timing) {
+    pub fn transcribe_words(&self, pcm: &[f32], progress: Progress) -> (Vec<Word>, Timing) {
         let mut t = Timing::default();
         let segs = if self.lf.fits_one_segment(pcm.len()) {
             vec![(0, pcm.len())]
         } else {
             let t0 = Instant::now();
-            let s = self.segments(pcm);
+            let s = self.segments(pcm, progress);
             t.vad = t0.elapsed().as_secs_f64() * 1e3;
             s
         };
         let (rate, frame) = (self.lf.sample_rate as f64, self.lf.frame_seconds);
         let mut words = Vec::new();
-        for (&(start, _), toks) in segs.iter().zip(self.pieces_tokens(pcm, &segs, &mut t)) {
+        for (&(start, _), toks) in segs.iter().zip(self.pieces_tokens(pcm, &segs, &mut t, progress)) {
             let at = start as f64 / rate;
             words.extend(self.tok.words(&toks).into_iter().map(|(text, a, b)| Word {
                 text,
@@ -306,14 +325,16 @@ impl Model {
     /// pause scan over all of `pcm` (the sweep uses it for that).
     #[cfg(gpu)]
     pub fn first_cut(&self, pcm: &[f32]) -> usize {
-        self.segments(pcm).first().map_or(pcm.len(), |&(s, l)| s + l)
+        self.segments(pcm, &mut |_| {}).first().map_or(pcm.len(), |&(s, l)| s + l)
     }
 
-    /// Pieces as (start sample, length); one piece for takes up to 30 s.
-    fn segments(&self, pcm: &[f32]) -> Vec<(usize, usize)> {
+    /// Pieces as (start sample, length); one piece for takes up to 30 s. `progress(done)` after each scan block, up
+    /// to SCAN_SHARE.
+    fn segments(&self, pcm: &[f32], progress: Progress) -> Vec<(usize, usize)> {
         let rate = self.lf.sample_rate as f64;
         longform::pause_segments(pcm.len(), &self.lf, |start, len| {
             let probs = self.speech_probs(&pcm[start..start + len]);
+            progress(SCAN_SHARE * (start + len) as f64 / pcm.len() as f64);
             let duration = len as f64 / rate;
             longform::speech_regions(&probs, &self.lf).into_iter().map(|r| (r.0, r.1.min(duration))).collect()
         })
@@ -335,22 +356,22 @@ impl Model {
 
     /// Takes over 30 s are cut at pauses (the model's own pause head) and the pieces' texts joined with spaces.
     /// Afterwards the GPU memory pool hands its free pages back.
-    pub fn transcribe(&self, pcm: &[f32]) -> (String, Timing) {
+    pub fn transcribe(&self, pcm: &[f32], progress: Progress) -> (String, Timing) {
         let mut t = Timing::default();
-        let text = self.transcribe_inner(pcm, &mut t);
+        let text = self.transcribe_inner(pcm, &mut t, progress);
         self.cleanup();
         (text, t)
     }
 
-    fn transcribe_inner(&self, pcm: &[f32], t: &mut Timing) -> String {
+    fn transcribe_inner(&self, pcm: &[f32], t: &mut Timing, progress: Progress) -> String {
         if self.lf.fits_one_segment(pcm.len()) {
             return self.one_shot(pcm, t);
         }
         let t0 = Instant::now();
-        let segs = self.segments(pcm);
+        let segs = self.segments(pcm, progress);
         t.vad = t0.elapsed().as_secs_f64() * 1e3;
         let mut text = String::new();
-        for toks in self.pieces_tokens(pcm, &segs, t) {
+        for toks in self.pieces_tokens(pcm, &segs, t, progress) {
             let ids: Vec<usize> = toks.into_iter().map(|(id, _)| id).collect();
             let s = self.tok.decode(&ids);
             if !s.is_empty() {

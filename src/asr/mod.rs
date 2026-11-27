@@ -209,11 +209,16 @@ impl Asr {
 
     /// `run` with each word's time (subtitles).
     pub fn run_words(&mut self, pcm: &[f32]) -> Result<(Vec<Word>, Timing), String> {
+        self.run_words_progress(pcm, |_| {})
+    }
+
+    /// `run_words` with `progress(done 0..1)` along the way (audio over 30 s only).
+    pub fn run_words_progress(&mut self, pcm: &[f32], mut progress: impl FnMut(f64)) -> Result<(Vec<Word>, Timing), String> {
         if pcm.is_empty() {
             return Ok((Vec::new(), Timing::default()));
         }
         let m = self.model.as_ref().ok_or("model not loaded")?;
-        guard(|| Ok(m.transcribe_words(pcm)))
+        guard(|| Ok(m.transcribe_words(pcm, &mut progress)))
     }
 
     /// Neural Engine: one encode of silence to keep it from winding down during a take (pipeline::Model::keep_awake).
@@ -223,11 +228,16 @@ impl Asr {
     }
 
     pub fn run(&mut self, pcm: &[f32]) -> Result<(String, Timing), String> {
+        self.run_progress(pcm, |_| {})
+    }
+
+    /// `run` with `progress(done 0..1)` along the way (audio over 30 s only).
+    pub fn run_progress(&mut self, pcm: &[f32], mut progress: impl FnMut(f64)) -> Result<(String, Timing), String> {
         if pcm.is_empty() {
             return Ok((String::new(), Timing::default()));
         }
         let m = self.model.as_ref().ok_or("model not loaded")?;
-        guard(|| Ok(m.transcribe(pcm)))
+        guard(|| Ok(m.transcribe(pcm, &mut progress)))
     }
 }
 
