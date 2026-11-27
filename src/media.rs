@@ -15,8 +15,10 @@ use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 
 /// symphonia's codecs plus Opus. At the fallback tier, so a future symphonia Opus decoder takes over by itself.
 static CODECS: LazyLock<CodecRegistry> = LazyLock::new(|| {
@@ -149,10 +151,49 @@ pub(crate) fn write_opus(path: &Path, x: &[f32], rate: u32) -> Result<(), String
     Ok(())
 }
 
+/// A file that tells how far into it reading has got (bytes): `read_progress`.
+struct Tracked {
+    file: std::fs::File,
+    pos: Arc<AtomicU64>,
+}
+
+impl Read for Tracked {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.file.read(buf)?;
+        self.pos.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+impl Seek for Tracked {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        let at = self.file.seek(to)?;
+        self.pos.store(at, Ordering::Relaxed);
+        Ok(at)
+    }
+}
+
+impl symphonia::core::io::MediaSource for Tracked {
+    fn is_seekable(&self) -> bool {
+        self.file.is_seekable()
+    }
+    fn byte_len(&self) -> Option<u64> {
+        self.file.byte_len()
+    }
+}
+
 /// The file's first audio track as 16 kHz mono (channels averaged).
 pub fn read(path: &Path) -> Result<Vec<f32>, String> {
+    read_progress(path, |_| {})
+}
+
+/// `read` with `progress(done 0..1)` after every packet: the share of the file's bytes read (audio and video
+/// tracks are interleaved through the file, so it runs with the audio).
+pub fn read_progress(path: &Path, mut progress: impl FnMut(f64)) -> Result<Vec<f32>, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let len = file.metadata().map_or(0, |m| m.len()).max(1) as f64;
+    let pos = Arc::new(AtomicU64::new(0));
+    let mss = MediaSourceStream::new(Box::new(Tracked { file, pos: pos.clone() }), Default::default());
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
@@ -179,6 +220,7 @@ pub fn read(path: &Path) -> Result<Vec<f32>, String> {
             Err(Error::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(format!("{}: {e}", path.display())),
         };
+        progress((pos.load(Ordering::Relaxed) as f64 / len).min(1.0));
         if packet.track_id != track_id {
             continue;
         }

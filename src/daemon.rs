@@ -56,6 +56,8 @@ pub enum Ev {
     File(Vec<f32>, bool, tokio::sync::oneshot::Sender<Result<String, String>>),
     /// The take or file being transcribed: share done, 0..1 (audio over 30 s only).
     Progress(f64),
+    /// A file being read (decoded) before it's transcribed: (its name, share done 0..1); None = reading ended.
+    Reading(Option<(String, f64)>),
     /// A file's text was sent back.
     FileDone,
     /// Tray "Transcribe a file": pick files, each one's text (or subtitles if true) saved next to it.
@@ -124,15 +126,35 @@ fn timing_line(what: &str, s: &asr::Timing) {
 /// ~15 ms; a stop during a run waits for its rest (~3.5% of takes, ~65 ms on average).
 const KEEP_AWAKE: Duration = Duration::from_secs(4);
 
-/// `progress(done)` for a transcription -> Ev::Progress, at most once per percent.
-fn progress_sender(ev: &mpsc::UnboundedSender<Ev>) -> impl FnMut(f64) + '_ {
+/// `f(done)` at most once per percent of progress.
+fn every_percent(mut f: impl FnMut(f64)) -> impl FnMut(f64) {
     let mut sent = 0.0;
     move |done| {
         if done - sent >= 0.01 {
             sent = done;
-            let _ = ev.send(Ev::Progress(done));
+            f(done);
         }
     }
+}
+
+/// `progress(done)` for a transcription -> Ev::Progress.
+fn progress_sender(ev: &mpsc::UnboundedSender<Ev>) -> impl FnMut(f64) + '_ {
+    every_percent(move |done| {
+        let _ = ev.send(Ev::Progress(done));
+    })
+}
+
+/// A media file -> 16 kHz audio (media::read) off the async thread, its progress shown in the tray (Ev::Reading).
+async fn read_file(tx: &mpsc::UnboundedSender<Ev>, path: std::path::PathBuf) -> Result<Vec<f32>, String> {
+    let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let _ = tx.send(Ev::Reading(Some((name.clone(), 0.0))));
+    let t = tx.clone();
+    let progress = every_percent(move |done| {
+        let _ = t.send(Ev::Reading(Some((name.clone(), done))));
+    });
+    let r = tokio::task::spawn_blocking(move || crate::media::read_progress(&path, progress)).await;
+    let _ = tx.send(Ev::Reading(None));
+    r.unwrap_or_else(|e| Err(e.to_string()))
 }
 
 fn engine(jobs: std_mpsc::Receiver<Job>, ev: mpsc::UnboundedSender<Ev>) {
@@ -279,6 +301,8 @@ struct Tray {
     sweep: u32,
     /// While a take or file over 30 s is transcribed: percent done.
     progress: Option<u32>,
+    /// While a file is read before transcribing: (its name, percent done).
+    reading: Option<(String, u32)>,
     /// The last take's length and how long transcribing it took ("" before the first take).
     last: String,
     /// When the take being recorded started (shown as its length, live).
@@ -296,6 +320,7 @@ impl Tray {
         }
         match self.state {
             State::NoModel => "No model yet — click to download".into(),
+            State::Idle | State::Transcribing if let Some((name, pct)) = &self.reading => format!("Reading {name}… {pct}%"),
             State::Idle => format!("Ready{key}"),
             State::Starting => "Starting the microphone…".into(),
             State::Recording => {
@@ -405,6 +430,7 @@ impl tray::Model for Tray {
             State::Starting => Icon::Starting,
             _ if self.download.is_some() => Icon::Downloading,
             State::Transcribing => Icon::Transcribing,
+            State::Idle if self.reading.is_some() => Icon::Transcribing,
             State::Optimizing => Icon::Optimizing,
             State::NoModel => Icon::Warning,
             State::Idle => Icon::Idle,
@@ -743,16 +769,15 @@ async fn socket_task(tx: mpsc::UnboundedSender<Ev>, status: tokio::sync::watch::
                 l if l.starts_with("transcribe ") || l.starts_with("subtitles ") => {
                     let (cmd, path) = l.split_once(' ').unwrap();
                     let (srt, path) = (cmd == "subtitles", std::path::PathBuf::from(path));
-                    let r = match tokio::task::spawn_blocking(move || crate::media::read(&path)).await {
-                        Ok(Ok(x)) => {
+                    let r = match read_file(&tx, path).await {
+                        Ok(x) => {
                             let (reply, back) = tokio::sync::oneshot::channel();
                             match tx.send(Ev::File(x, srt, reply)) {
                                 Ok(()) => back.await.unwrap_or_else(|_| Err("the app stopped".into())),
                                 Err(_) => Err("the app is shutting down".into()),
                             }
                         }
-                        Ok(Err(e)) => Err(e),
-                        Err(e) => Err(e.to_string()),
+                        Err(e) => Err(e),
                     };
                     Ok(match r {
                         Ok(text) => serde_json::json!({ "text": text }),
@@ -794,17 +819,15 @@ async fn pick_files(tx: mpsc::UnboundedSender<Ev>, srt: bool) {
     // Transcribe all first; failures are reported as they happen.
     let mut done: Vec<(PathBuf, String)> = Vec::new();
     for path in files.iter().cloned() {
-        let p = path.clone();
-        let r = match tokio::task::spawn_blocking(move || crate::media::read(&p)).await {
-            Ok(Ok(x)) => {
+        let r = match read_file(&tx, path.clone()).await {
+            Ok(x) => {
                 let (reply, back) = tokio::sync::oneshot::channel();
                 if tx.send(Ev::File(x, srt, reply)).is_err() {
                     return;
                 }
                 back.await.unwrap_or_else(|_| Err("the app stopped".into()))
             }
-            Ok(Err(e)) => Err(e),
-            Err(e) => Err(e.to_string()),
+            Err(e) => Err(e),
         };
         match r {
             Ok(text) => done.push((path, text)),
@@ -987,6 +1010,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         gpus: asr::gpus().into_iter().map(|g| (g.name, g.kind)).collect(),
         sweep: 0,
         progress: None,
+        reading: None,
         last: String::new(),
         rec_since: None,
         tx: tx.clone(),
@@ -1114,6 +1138,8 @@ async fn main_loop(
     let mut take_no = 0u64; // numbers takes, so a late Ev::MicLive of a stopped take is ignored
     let mut shortcut = String::new();
     let mut busy = 0usize; // takes queued in the engine
+    let mut files = 0usize; // files queued in the engine (also counted in `busy`)
+    let mut reading = false; // a file is being read before it's transcribed
     // Their audio at the microphone's own rate (with that rate), for the full-quality copy saved with the take.
     let mut full: std::collections::VecDeque<(Vec<f32>, u32)> = Default::default();
     let mut downloading = false;
@@ -1149,6 +1175,11 @@ async fn main_loop(
                 tray.update(move |t: &mut Tray| t.sweep = (done * 100.0) as u32).await;
                 continue;
             }
+            Ev::Reading(r) => {
+                reading = r.is_some();
+                tray.update(move |t: &mut Tray| t.reading = r.map(|(name, done)| (name, (done * 100.0) as u32))).await;
+                continue;
+            }
             Ev::Progress(done) => {
                 tray.update(move |t: &mut Tray| t.progress = Some((done * 100.0) as u32)).await;
                 continue;
@@ -1156,6 +1187,11 @@ async fn main_loop(
             ev => ev,
         };
         match ev {
+            // A take during a file would wait in the queue behind it, its text pasted minutes later wherever the
+            // focus is then: no takes until the file is done.
+            Ev::Toggle if rec.is_none() && (files > 0 || reading) => {
+                notice.show("Transcribing a file", "Dictation is available again when it's done; progress is in the tray menu.", "dialog-information").await
+            }
             Ev::Toggle => match (state, rec.take()) {
                 (State::Idle | State::Transcribing, None) => match {
                     // Show the click at once: opening the microphone can take a moment (blocks this loop).
@@ -1289,6 +1325,7 @@ async fn main_loop(
                         load(&mut mem);
                     }
                     busy += 1;
+                    files += 1;
                     let _ = jobs.send(Job::File(x, srt, reply));
                     if state == State::Idle {
                         state = State::Transcribing;
@@ -1313,6 +1350,7 @@ async fn main_loop(
             Ev::FileDone => {
                 tray.update(|t: &mut Tray| t.progress = None).await;
                 busy = busy.saturating_sub(1);
+                files = files.saturating_sub(1);
                 last_used = Instant::now();
                 if state == State::Transcribing && busy == 0 {
                     state = State::Idle;
@@ -1410,7 +1448,7 @@ async fn main_loop(
             }
             Ev::ShortcutFailed(e) => notice.show("Shortcut not set", &format!("{e}. Pick another in the tray menu."), "dialog-error").await,
             Ev::Quit => break,
-            Ev::SweepProgress(_) | Ev::Progress(_) => unreachable!("handled above"),
+            Ev::SweepProgress(_) | Ev::Progress(_) | Ev::Reading(_) => unreachable!("handled above"),
         }
         notice.enabled = cfg.notifications;
         if state == State::NoModel && installed() {
