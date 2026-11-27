@@ -28,9 +28,8 @@ static CODECS: LazyLock<CodecRegistry> = LazyLock::new(|| {
     r
 });
 
-/// Mono samples at the file's rate in, 16 kHz out, chunk by chunk.
-/// Mono resampler (rubato FFT), any rate -> `to` (16 kHz for asr; 48 kHz for Opus).
-struct To16k {
+/// Mono resampler (rubato FFT), any rate -> `to` (16 kHz for asr; 48 kHz for Opus), chunk by chunk.
+pub(crate) struct To16k {
     rs: Option<Fft<f32>>, // None: already at `to`
     pending: Vec<f32>,
     inbuf: Vec<f32>,
@@ -42,8 +41,14 @@ struct To16k {
 }
 
 impl To16k {
-    fn new(rate: usize) -> Result<To16k, String> {
+    pub(crate) fn new(rate: usize) -> Result<To16k, String> {
         Self::to(rate, RATE)
+    }
+
+    /// The output so far (taken: the next call returns only what came after). The resampler's start-up delay stays
+    /// in (a few ms of silence at the very start; `finish` cuts it, streams don't need to).
+    pub(crate) fn take(&mut self) -> Vec<f32> {
+        std::mem::take(&mut self.out)
     }
 
     fn to(rate: usize, to: usize) -> Result<To16k, String> {
@@ -56,7 +61,7 @@ impl To16k {
         Ok(To16k { rs, pending: Vec::new(), inbuf, outbuf, out: Vec::new(), frames_in: 0, rate, to })
     }
 
-    fn push(&mut self, x: &[f32]) -> Result<(), String> {
+    pub(crate) fn push(&mut self, x: &[f32]) -> Result<(), String> {
         self.frames_in += x.len();
         let Some(rs) = self.rs.as_mut() else {
             self.out.extend_from_slice(x);

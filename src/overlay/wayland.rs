@@ -43,7 +43,7 @@ pub fn show(v: View) {
 }
 
 fn wanted() -> View {
-    WANT.lock().unwrap().unwrap_or(View::Hidden)
+    WANT.lock().unwrap().clone().unwrap_or(View::Hidden)
 }
 
 struct State {
@@ -59,6 +59,8 @@ struct State {
     configured: bool,
     /// Pixels per point of the screen it's on.
     scale: u32,
+    /// Size of the open surface, points.
+    size: (f32, f32),
     painter: Painter,
     next: Instant,
 }
@@ -82,17 +84,19 @@ fn run() -> Result<(), String> {
         layer: None,
         configured: false,
         scale: 1,
+        size: (WIDTH, HEIGHT),
         painter: Painter::default(),
         next: Instant::now(),
     };
     loop {
         let v = wanted();
+        let hidden = v == View::Hidden;
         if s.painter.set(v) {
-            if v == View::Hidden {
+            if hidden {
                 s.layer = None; // destroys the surface
                 s.configured = false;
-            } else if s.layer.is_none() {
-                s.open(&qh);
+            } else if s.layer.is_none() || s.painter.size() != s.size {
+                s.open(&qh); // a new size (pill <-> subtitles): a new surface, configured for it
             }
         }
         if s.configured && s.painter.visible() && Instant::now() >= s.next {
@@ -116,9 +120,10 @@ impl State {
     fn open(&mut self, qh: &QueueHandle<State>) {
         let surface = self.compositor.create_surface(qh);
         let layer = self.layer_shell.create_layer_surface(qh, surface, Layer::Overlay, Some("dictation"), None);
+        self.size = self.painter.size();
         layer.set_anchor(Anchor::BOTTOM);
         layer.set_margin(0, 0, BOTTOM as i32, 0);
-        layer.set_size(WIDTH as u32, HEIGHT as u32);
+        layer.set_size(self.size.0 as u32, self.size.1 as u32);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         if let Ok(r) = Region::new(&self.compositor) {
             layer.set_input_region(Some(r.wl_region())); // empty: clicks go to what's below

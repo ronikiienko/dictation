@@ -141,6 +141,53 @@ impl Recorder {
     }
 }
 
+/// A microphone (or system audio) listened to continuously (live subtitles): `take` returns what came in since the
+/// last call, 16 kHz mono, converted as it arrives, so nothing grows with the session. The stream lives on its own
+/// thread (cpal streams are not Send); dropping the Listener stops it.
+pub struct Listener {
+    stop: mpsc::Sender<()>,
+    buf: Arc<Mutex<Vec<f32>>>,
+    channels: u16,
+    conv: crate::media::To16k,
+}
+
+impl Listener {
+    pub fn start(device: &str) -> Result<Listener, String> {
+        let device = device.to_string();
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let buf = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let b = buf.clone();
+        std::thread::spawn(move || match open(&device, b, Arc::new(AtomicBool::new(true))) {
+            Ok((stream, rate, channels)) => {
+                let _ = ready_tx.send(Ok((rate, channels)));
+                let _ = stop_rx.recv(); // until stopped (or dropped)
+                drop(stream);
+            }
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+            }
+        });
+        let (rate, channels) = ready_rx.recv().map_err(|_| "audio thread died".to_string())??;
+        Ok(Listener { stop: stop_tx, buf, channels, conv: crate::media::To16k::new(rate as usize)? })
+    }
+
+    /// The audio since the last call, 16 kHz mono.
+    pub fn take(&mut self) -> Vec<f32> {
+        let raw = std::mem::take(&mut *self.buf.lock().unwrap());
+        if let Err(e) = self.conv.push(&mono(&raw, self.channels)) {
+            eprintln!("live: {e}");
+        }
+        self.conv.take()
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+    }
+}
+
 fn open(device: &str, buf: Arc<Mutex<Vec<f32>>>, live: Arc<AtomicBool>) -> Result<(cpal::Stream, u32, u16), String> {
     let host = host();
     // System audio: an input stream on the output device. cpal records it with a Core Audio process tap on macOS

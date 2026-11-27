@@ -200,8 +200,8 @@ impl Asr {
         Ok(())
     }
 
-    /// Audio just over 30 s: where its first piece ends (latest pause before 30 s). The sweep uses it for the pause scan.
-    #[cfg(gpu)]
+    /// Audio just over 30 s: where its first piece ends (latest pause before 30 s). The sweep uses it for the pause
+    /// scan, live subtitles to end a window.
     pub fn first_cut(&mut self, pcm: &[f32]) -> Result<usize, String> {
         let m = self.model.as_ref().ok_or("model not loaded")?;
         guard(|| Ok(m.first_cut(pcm)))

@@ -43,6 +43,8 @@ opus-pure = "0.2.5"
 rfd = "0.18.0"
 # The recording window (src/overlay): drawn in code, pure Rust.
 tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd"] }
+# Text of live subtitles (src/overlay/paint.rs): font parsing and glyph rasterizing, pure Rust.
+fontdue = "0.9.5"
 
 # The GPU path (src/asr/encoder.rs, gpu.rs; Linux, Windows): burn on CubeCL, Vulkan (kernels as SPIR-V, not WGSL).
 # macOS has no GPU path (Neural Engine or CPU), so no burn there; build.rs sets `cfg(gpu)` for the code using it.

@@ -323,7 +323,6 @@ impl Model {
 
     /// Audio just over 30 s: where its first piece ends (latest pause before 30 s, as for long takes). Runs the
     /// pause scan over all of `pcm` (the sweep uses it for that).
-    #[cfg(gpu)]
     pub fn first_cut(&self, pcm: &[f32]) -> usize {
         self.segments(pcm, &mut |_| {}).first().map_or(pcm.len(), |&(s, l)| s + l)
     }

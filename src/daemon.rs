@@ -35,6 +35,10 @@ fn socket_name() -> std::io::Result<interprocess::local_socket::Name<'static>> {
 pub enum Ev {
     /// Start or stop a take (tray menu, `dictation toggle`).
     Toggle,
+    /// Tray "Live subtitles": start or stop them.
+    ToggleSubtitles,
+    /// Live subtitles: the text to show now.
+    Subtitles(String),
     /// The global shortcut went down: starts or stops a take like Toggle.
     ShortcutDown,
     /// The global shortcut was released: if it started the take and was held down (HOLD), the take stops.
@@ -118,6 +122,8 @@ enum Job {
     /// A take started (true) or stopped (false): while one is recorded, the Neural Engine is kept awake.
     Recording(bool),
     Transcribe(Vec<f32>),
+    /// Live subtitles on (what to listen to, crate::live) or off. While on, a pass every LIVE_STEP -> Ev::Subtitles.
+    Live(Option<crate::live::Live>),
     /// A file: the text (`srt`: subtitles) goes straight back to the sender, then Ev::FileDone.
     File(Vec<f32>, bool, tokio::sync::oneshot::Sender<Result<String, String>>),
 }
@@ -135,6 +141,10 @@ const HOLD: Duration = Duration::from_millis(400);
 /// Presses closer together than this while the shortcut is not released count as key repeat (key repeat runs at
 /// ~30-80 ms); without release events (an old desktop) a real second press is practically always further apart.
 const REPEAT_GAP: Duration = Duration::from_millis(500);
+
+/// Live subtitles: the current window is transcribed again this often (a pass takes ~0.15-0.4 s on the Neural
+/// Engine; a slower one just makes the next start right after it).
+const LIVE_STEP: Duration = Duration::from_secs(1);
 
 const KEEP_AWAKE: Duration = Duration::from_secs(4);
 
@@ -173,8 +183,25 @@ fn engine(jobs: std_mpsc::Receiver<Job>, ev: mpsc::UnboundedSender<Ev>) {
     let mut model: Option<asr::Asr> = None;
     let mut recording = false;
     let mut awake_runs = 0u32;
+    let mut live: Option<crate::live::Live> = None;
+    let mut next_pass = Instant::now();
     loop {
-        let job = if recording && model.is_some() {
+        let job = if let (Some(l), Some(a)) = (live.as_mut(), model.as_mut()) {
+            match jobs.recv_timeout(next_pass.saturating_duration_since(Instant::now())) {
+                Ok(job) => job,
+                Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                    next_pass = Instant::now() + LIVE_STEP;
+                    match l.pass(a) {
+                        Ok(text) => {
+                            let _ = ev.send(Ev::Subtitles(text));
+                        }
+                        Err(e) => eprintln!("live: {e}"),
+                    }
+                    continue;
+                }
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else if recording && model.is_some() {
             match jobs.recv_timeout(KEEP_AWAKE) {
                 Ok(job) => job,
                 Err(std_mpsc::RecvTimeoutError::Timeout) => {
@@ -195,6 +222,10 @@ fn engine(jobs: std_mpsc::Receiver<Job>, ev: mpsc::UnboundedSender<Ev>) {
             }
         };
         match job {
+            Job::Live(l) => {
+                live = l;
+                next_pass = Instant::now() + LIVE_STEP;
+            }
             Job::Recording(on) => {
                 recording = on;
                 if !on && awake_runs > 0 {
@@ -317,6 +348,8 @@ struct Tray {
     reading: Option<(String, u32)>,
     /// Takes (not files) waiting for or being transcribed: the recording window shows for those only.
     takes: usize,
+    /// While live subtitles are on: their text.
+    subtitles: Option<String>,
     /// The last take's length and how long transcribing it took ("" before the first take).
     last: String,
     /// When the take being recorded started (shown as its length, live).
@@ -456,10 +489,15 @@ impl tray::Model for Tray {
     fn overlay(&self) -> crate::overlay::View {
         use crate::overlay::View;
         match self.state {
-            _ if !self.cfg.overlay => View::Hidden,
+            // Subtitles have no other place to show: shown even with the recording window off.
+            _ if !self.cfg.overlay && self.subtitles.is_none() => View::Hidden,
+            State::Starting | State::Recording | State::Transcribing if !self.cfg.overlay => {
+                View::Subtitles(self.subtitles.clone().unwrap_or_default())
+            }
             State::Starting => View::Starting,
             State::Recording => View::Recording,
             State::Transcribing if self.takes > 0 => View::Transcribing(self.progress),
+            _ if self.subtitles.is_some() => View::Subtitles(self.subtitles.clone().unwrap_or_default()),
             _ => View::Hidden,
         }
     }
@@ -659,6 +697,12 @@ impl tray::Model for Tray {
             },
             Check { label: "Sounds".into(), checked: self.cfg.sounds, enabled: true, click: self.setting(|c| c.sounds = !c.sounds) },
             Check { label: "Recording window".into(), checked: self.cfg.overlay, enabled: true, click: self.setting(|c| c.overlay = !c.overlay) },
+            Check {
+                label: "Live subtitles (what the input hears)".into(),
+                checked: self.subtitles.is_some(),
+                enabled: !matches!(self.state, State::NoModel | State::Optimizing),
+                click: self.send(|| Ev::ToggleSubtitles),
+            },
             Check {
                 label: "Notifications".into(),
                 checked: self.cfg.notifications,
@@ -1042,6 +1086,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         progress: None,
         reading: None,
         takes: 0,
+        subtitles: None,
         last: String::new(),
         rec_since: None,
         tx: tx.clone(),
@@ -1173,6 +1218,7 @@ async fn main_loop(
     let mut busy = 0usize; // takes queued in the engine
     let mut files = 0usize; // files queued in the engine (also counted in `busy`)
     let mut reading = false; // a file is being read before it's transcribed
+    let mut subtitles = false; // live subtitles on
     // Their audio at the microphone's own rate (with that rate), for the full-quality copy saved with the take.
     let mut full: std::collections::VecDeque<(Vec<f32>, u32)> = Default::default();
     let mut downloading = false;
@@ -1229,6 +1275,12 @@ async fn main_loop(
             Ev::Reading(r) => {
                 reading = r.is_some();
                 tray.update(move |t: &mut Tray| t.reading = r.map(|(name, done)| (name, (done * 100.0) as u32))).await;
+                continue;
+            }
+            Ev::Subtitles(text) => {
+                if subtitles {
+                    tray.update(move |t: &mut Tray| t.subtitles = Some(text)).await;
+                }
                 continue;
             }
             Ev::Progress(done) => {
@@ -1384,6 +1436,26 @@ async fn main_loop(
                     last_used = Instant::now();
                 }
             }
+            Ev::ToggleSubtitles if subtitles => {
+                subtitles = false;
+                let _ = jobs.send(Job::Live(None));
+                tray.update(|t: &mut Tray| t.subtitles = None).await;
+                last_used = Instant::now();
+                println!("live subtitles off");
+            }
+            Ev::ToggleSubtitles => match audio::Listener::start(&cfg.microphone) {
+                Ok(l) => {
+                    if mem == Mem::Unloaded {
+                        load_failed = false;
+                        load(&mut mem);
+                    }
+                    subtitles = true;
+                    let _ = jobs.send(Job::Live(Some(crate::live::Live::new(l))));
+                    tray.update(|t: &mut Tray| t.subtitles = Some(String::new())).await;
+                    println!("live subtitles on");
+                }
+                Err(e) => notice.show("Live subtitles: can't listen", &e, "dialog-error").await,
+            },
             Ev::PickFiles(srt) => {
                 tokio::spawn(pick_files(tx.clone(), srt));
             }
@@ -1499,7 +1571,7 @@ async fn main_loop(
             }
             Ev::ShortcutFailed(e) => notice.show("Shortcut not set", &format!("{e}. Pick another in the tray menu."), "dialog-error").await,
             Ev::Quit => break,
-            Ev::SweepProgress(_) | Ev::Progress(_) | Ev::Reading(_) | Ev::ShortcutDown | Ev::ShortcutUp => unreachable!("handled above"),
+            Ev::SweepProgress(_) | Ev::Progress(_) | Ev::Reading(_) | Ev::Subtitles(_) | Ev::ShortcutDown | Ev::ShortcutUp => unreachable!("handled above"),
         }
         notice.enabled = cfg.notifications;
         if state == State::NoModel && installed() {
@@ -1547,7 +1619,7 @@ async fn main_loop(
             );
             notice.show("Speeding up dictation for your GPU", &body, "dialog-information").await;
         }
-        if rec.is_none() && busy == 0 && !matches!(state, State::NoModel | State::Optimizing) {
+        if rec.is_none() && busy == 0 && !subtitles && !matches!(state, State::NoModel | State::Optimizing) {
             if cfg.keep_loaded == KeepLoaded::Always && mem == Mem::Unloaded && !load_failed {
                 load(&mut mem);
             }

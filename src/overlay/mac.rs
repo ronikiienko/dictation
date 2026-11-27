@@ -51,6 +51,8 @@ pub struct Window {
     win: TaoWindow,
     painter: Painter,
     next: Instant,
+    /// Current size, points (the pill or the subtitles box).
+    size: (f32, f32),
 }
 
 impl Window {
@@ -70,7 +72,7 @@ impl Window {
             .build(target)
             .map_err(|e| e.to_string())?;
         let _ = win.set_ignore_cursor_events(true);
-        Ok(Window { win, painter: Painter::default(), next: Instant::now() })
+        Ok(Window { win, painter: Painter::default(), next: Instant::now(), size: (WIDTH, HEIGHT) })
     }
 
     /// Show `v` (Hidden = hide). Placed at the bottom middle of the screen the mouse is on, when it appears.
@@ -82,6 +84,15 @@ impl Window {
         if !self.painter.visible() {
             self.win.set_visible(false);
             return;
+        }
+        let size = self.painter.size();
+        if size != self.size {
+            self.size = size;
+            self.win.set_inner_size(LogicalSize::new(size.0 as f64, size.1 as f64));
+            if was {
+                self.place();
+                self.draw();
+            }
         }
         if !was {
             self.place();
@@ -100,8 +111,9 @@ impl Window {
         let Some(m) = mon else { return };
         let scale = m.scale_factor();
         let (pos, size) = (m.position().to_logical::<f64>(scale), m.size().to_logical::<f64>(scale));
-        let x = pos.x + (size.width - WIDTH as f64) / 2.0;
-        let y = pos.y + size.height - HEIGHT as f64 - BOTTOM as f64;
+        let (w, h) = self.size;
+        let x = pos.x + (size.width - w as f64) / 2.0;
+        let y = pos.y + size.height - h as f64 - BOTTOM as f64;
         self.win.set_outer_position(LogicalPosition::new(x, y));
     }
 

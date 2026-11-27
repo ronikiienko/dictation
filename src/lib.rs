@@ -3,6 +3,7 @@ pub mod audio;
 pub mod config;
 pub mod daemon;
 pub mod icons;
+pub mod live;
 pub mod media;
 pub mod models;
 pub mod output;

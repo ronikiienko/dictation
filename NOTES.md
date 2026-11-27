@@ -1640,3 +1640,33 @@ rows 32x128, <= 64 rows 64x128 so weights are read once, K split until ~32 cubes
 - Pitfalls: zsh doesn't word-split `$var` (sweeps silently ran defaults; use bash); CubeCL `terminate!()` did not end
   the kernel, so "empty kernel" tests are invalid; burn's `x + 1` on a big f16 tensor ran ~57 GB/s vs ~192 GB/s
   spec (not investigated).
+
+### Progress, hold to talk, recording window (2026-11-27, M1; Linux parts not run yet)
+- **Progress**: "Transcribing… N%" in the tray for audio over 30 s (takes and files). Pause scan = first 25%
+  (`SCAN_SHARE`, pipeline.rs; measured on the ANE: pauses 3.5 of 14 s on a 30 min file; the tuned GPU scan is
+  cheaper, so there the first quarter goes faster), then each piece by where it ends. Files: "Reading <name>… N%"
+  while decoding first (share of the file's bytes read, media::read_progress); a 3 h 22 min mp3 took 98 s to
+  transcribe after it was read.
+- **No takes while a file is read or transcribed**: a take queued behind a file was transcribed only after it (98 s)
+  and pasted wherever the focus was then (seen in app.log). The shortcut shows a notice instead.
+- **Hold to talk**: same shortcut; a take starts on press; held >= 0.4 s (`HOLD`), release stops it; a tap toggles as
+  before. Releases: portal `Deactivated` (Linux, untested on KDE), global-hotkey `Released` (macOS: one press and one
+  release per keystroke, no repeats). Presses within 0.5 s without a release count as key repeat.
+- **Recording window** (src/overlay, tray checkbox, config `overlay`): 136x40 pt pill at the bottom middle (user
+  asked for a bit bigger than the first 112x32). macOS: tao window, `with_focusable(false)` (never key: paste still
+  lands in the app in front, checked), frames as CGImage on its layer (softbuffer ignores alpha on macOS). Linux:
+  wlr layer-shell surface (smithay-client-toolkit 0.21) on its own thread: on Wayland a normal window can't place
+  itself, stay on top, or avoid taking focus. Not available on GNOME (no layer shell) or X11: logged once. Linux
+  code only type-checked on the Mac (`.cache/tmp/overlay-check`, sctk copy patched: its clipboard code uses the
+  Linux-only `pipe_with`).
+- **Cancel a take**: on hold. macOS could register Esc only during a take; on KDE portal shortcuts stay bound, so
+  Esc would be taken from every app; untested idea: bind it in a separate portal session per take and close it.
+
+### Live subtitles proof of concept (2026-11-27, M1; not committed, working tree only)
+Tray "Live subtitles": what the selected input (mic or system audio) hears, shown in a 640x76 box at the bottom.
+src/live.rs: every 1 s the current window (<= 30 s) is transcribed again and replaces the shown text; a full window
+ends at its latest pause (first_cut), is transcribed whole and kept; old live mode's windowing without pasting
+(shown text can be corrected, so its quality problem doesn't apply). audio::Listener streams and resamples as audio
+arrives (memory doesn't grow). Text via fontdue with the system's font (Arial; Noto/DejaVu on Linux), nothing
+bundled. ANE pass ~125 ms encode for any length (fixed 30 s window). User: works, "consider adding it later".
+Open: dim the words still changing, bundle a font, the jump at window ends, battery cost of a pass per second.
