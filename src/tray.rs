@@ -46,6 +46,10 @@ pub trait Model: Send + 'static {
     }
     fn hotkey_pressed(&self) {}
     fn hotkey_released(&self) {}
+    /// What the recording window (crate::overlay) shows.
+    fn overlay(&self) -> crate::overlay::View {
+        crate::overlay::View::Hidden
+    }
     /// Registering `hotkey()` worked, or why not (taken by another app, not a valid key).
     fn hotkey_result(&self, _key: &str, _result: Result<(), String>) {}
 }
@@ -77,7 +81,13 @@ mod imp {
     impl<M: Model> Handle<M> {
         /// Change the model; the tray redraws. None once the tray is gone.
         pub async fn update<R: Send + 'static>(&self, f: impl FnOnce(&mut M) -> R + Send + 'static) -> Option<R> {
-            self.0.update(|k| f(&mut k.0)).await
+            self.0
+                .update(|k| {
+                    let r = f(&mut k.0);
+                    crate::overlay::show(k.0.overlay());
+                    r
+                })
+                .await
         }
     }
 
@@ -267,8 +277,19 @@ mod imp {
         let mut keys = Keys { manager: None, registered: None };
         let mut shown = Shown::default();
         let mut clicks: HashMap<MenuId, Click> = HashMap::new();
-        el.run_return(|event, _, flow| {
+        #[cfg(target_os = "macos")]
+        let mut overlay: Option<crate::overlay::Window> = None;
+        el.run_return(|event, _target, flow| {
+            // The recording window animates while shown: wake up for its next frame.
+            #[cfg(target_os = "macos")]
+            if let Some(o) = overlay.as_mut() {
+                o.tick();
+            }
             *flow = ControlFlow::Wait;
+            #[cfg(target_os = "macos")]
+            if let Some(t) = overlay.as_ref().and_then(|o| o.next_frame()) {
+                *flow = ControlFlow::WaitUntil(t);
+            }
             match event {
                 // macOS: the tray can only be made once the loop runs.
                 Event::NewEvents(StartCause::Init) => {
@@ -279,6 +300,11 @@ mod imp {
                     }
                     // Also main-thread only on macOS.
                     keys.manager = Some(GlobalHotKeyManager::new().map_err(|e| e.to_string()));
+                    #[cfg(target_os = "macos")]
+                    match crate::overlay::Window::new(_target) {
+                        Ok(w) => overlay = Some(w),
+                        Err(e) => log::error!("recording window: {e}"),
+                    }
                 }
                 Event::UserEvent(Ev::HotKey(e)) => {
                     if keys.registered.is_some_and(|k| k.id() == e.id) {
@@ -310,6 +336,13 @@ mod imp {
                 _ => return,
             }
             keys.update(&model, &mut shown);
+            #[cfg(target_os = "macos")]
+            if let Some(o) = overlay.as_mut() {
+                o.set(model.overlay());
+                if let Some(t) = o.next_frame() {
+                    *flow = ControlFlow::WaitUntil(t);
+                }
+            }
             if let Some(t) = &tray {
                 refresh(t, &model, &mut shown, &mut clicks);
             }

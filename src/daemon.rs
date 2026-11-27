@@ -315,6 +315,8 @@ struct Tray {
     progress: Option<u32>,
     /// While a file is read before transcribing: (its name, percent done).
     reading: Option<(String, u32)>,
+    /// Takes (not files) waiting for or being transcribed: the recording window shows for those only.
+    takes: usize,
     /// The last take's length and how long transcribing it took ("" before the first take).
     last: String,
     /// When the take being recorded started (shown as its length, live).
@@ -450,6 +452,16 @@ impl tray::Model for Tray {
     }
     fn attention(&self) -> bool {
         self.state == State::Recording
+    }
+    fn overlay(&self) -> crate::overlay::View {
+        use crate::overlay::View;
+        match self.state {
+            _ if !self.cfg.overlay => View::Hidden,
+            State::Starting => View::Starting,
+            State::Recording => View::Recording,
+            State::Transcribing if self.takes > 0 => View::Transcribing(self.progress),
+            _ => View::Hidden,
+        }
     }
     fn tooltip(&self) -> (String, String) {
         (format!("Dictation: {}", self.status_text()), self.mem_text())
@@ -646,6 +658,7 @@ impl tray::Model for Tray {
                 ],
             },
             Check { label: "Sounds".into(), checked: self.cfg.sounds, enabled: true, click: self.setting(|c| c.sounds = !c.sounds) },
+            Check { label: "Recording window".into(), checked: self.cfg.overlay, enabled: true, click: self.setting(|c| c.overlay = !c.overlay) },
             Check {
                 label: "Notifications".into(),
                 checked: self.cfg.notifications,
@@ -1028,6 +1041,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         sweep: 0,
         progress: None,
         reading: None,
+        takes: 0,
         last: String::new(),
         rec_since: None,
         tx: tx.clone(),
@@ -1546,8 +1560,9 @@ async fn main_loop(
                 }
             }
         }
-        let (s, m, c) = (state, mem, cfg.clone());
+        let (s, m, c, takes) = (state, mem, cfg.clone(), busy.saturating_sub(files));
         tray.update(move |t: &mut Tray| {
+            t.takes = takes;
             if !matches!(s, State::Starting | State::Recording) {
                 t.rec_since = None;
             } else if t.rec_since.is_none() {

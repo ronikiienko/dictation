@@ -6,6 +6,7 @@ pub mod icons;
 pub mod media;
 pub mod models;
 pub mod output;
+pub mod overlay;
 pub mod subtitles;
 pub mod tray;
 

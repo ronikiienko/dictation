@@ -174,10 +174,13 @@ fn open(device: &str, buf: Arc<Mutex<Vec<f32>>>, live: Arc<AtomicBool>) -> Resul
     }
     let (rate, ch) = (cfg.sample_rate, cfg.channels);
     // Appends a block; before the mic is live, from its first non-zero value on (whole frames), dropping the rest.
+    // The block's loudest sample also goes to the recording window's bars.
     let keep = move |d: &mut dyn Iterator<Item = f32>| {
         let mut b = buf.lock().unwrap();
         if live.load(Ordering::Relaxed) {
-            b.extend(d);
+            let mut peak = 0.0f32;
+            b.extend(d.inspect(|v| peak = peak.max(v.abs())));
+            crate::overlay::level(peak);
             return;
         }
         let x: Vec<f32> = d.collect();

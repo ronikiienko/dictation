@@ -41,6 +41,8 @@ symphonia-opus = "0.1.3"
 rubato = "5.1.0"
 opus-pure = "0.2.5"
 rfd = "0.18.0"
+# The recording window (src/overlay): drawn in code, pure Rust.
+tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd"] }
 
 # The GPU path (src/asr/encoder.rs, gpu.rs; Linux, Windows): burn on CubeCL, Vulkan (kernels as SPIR-V, not WGSL).
 # macOS has no GPU path (Neural Engine or CPU), so no burn there; build.rs sets `cfg(gpu)` for the code using it.
@@ -67,6 +69,9 @@ ksni = "0.3.7"
 # sound server, through the same PulseAudio client cpal uses (audio.rs `unplugged`).
 pulseaudio = "0.3.2"
 futures-executor = "0.3.34"
+# The recording window as a layer-shell surface (src/overlay/wayland.rs); wayland-client is already in (arboard).
+smithay-client-toolkit = { version = "0.21.1", default-features = false }
+wayland-client = "0.31"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 enigo = "0.6.1"

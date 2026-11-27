@@ -19,6 +19,8 @@ pub struct Config {
     pub paste_keys: PasteKeys,
     /// Start / stop sounds.
     pub sounds: bool,
+    /// The small window at the bottom of the screen while recording / transcribing a take (src/overlay).
+    pub overlay: bool,
     /// Desktop notifications (recording, transcribing, result).
     pub notifications: bool,
     /// Keep every take as wav + a line in recordings/log.jsonl (off by default: it stores the user's voice).
@@ -83,6 +85,7 @@ impl Default for Config {
             output: Output::Paste,
             paste_keys: PasteKeys::CtrlV,
             sounds: true,
+            overlay: true,
             notifications: true,
             save_recordings: false,
             keep_loaded: KeepLoaded::OneMinute,
