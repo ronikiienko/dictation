@@ -45,6 +45,7 @@ pub trait Model: Send + 'static {
         String::new()
     }
     fn hotkey_pressed(&self) {}
+    fn hotkey_released(&self) {}
     /// Registering `hotkey()` worked, or why not (taken by another app, not a valid key).
     fn hotkey_result(&self, _key: &str, _result: Result<(), String>) {}
 }
@@ -280,8 +281,11 @@ mod imp {
                     keys.manager = Some(GlobalHotKeyManager::new().map_err(|e| e.to_string()));
                 }
                 Event::UserEvent(Ev::HotKey(e)) => {
-                    if e.state == HotKeyState::Pressed && keys.registered.is_some_and(|k| k.id() == e.id) {
-                        model.hotkey_pressed();
+                    if keys.registered.is_some_and(|k| k.id() == e.id) {
+                        match e.state {
+                            HotKeyState::Pressed => model.hotkey_pressed(),
+                            HotKeyState::Released => model.hotkey_released(),
+                        }
                     }
                     return;
                 }

@@ -33,7 +33,12 @@ fn socket_name() -> std::io::Result<interprocess::local_socket::Name<'static>> {
 }
 
 pub enum Ev {
+    /// Start or stop a take (tray menu, `dictation toggle`).
     Toggle,
+    /// The global shortcut went down: starts or stops a take like Toggle.
+    ShortcutDown,
+    /// The global shortcut was released: if it started the take and was held down (HOLD), the take stops.
+    ShortcutUp,
     /// The microphone of take number .0 delivers real sound (audio::Recorder::start): now show "recording".
     MicLive(u64),
     /// New settings chosen in the tray menu.
@@ -124,6 +129,13 @@ fn timing_line(what: &str, s: &asr::Timing) {
 /// While a take is recorded, the Neural Engine runs one encode of silence after this long without work: it winds
 /// down when idle and the take's own encode would pay +100-140 ms after 16+ s. One run (~130 ms) every 4 s leaves
 /// ~15 ms; a stop during a run waits for its rest (~3.5% of takes, ~65 ms on average).
+/// The shortcut held at least this long when starting a take = push to talk (release stops it); a shorter tap
+/// leaves the take running until the next press. Taps last ~0.1-0.2 s.
+const HOLD: Duration = Duration::from_millis(400);
+/// Presses closer together than this while the shortcut is not released count as key repeat (key repeat runs at
+/// ~30-80 ms); without release events (an old desktop) a real second press is practically always further apart.
+const REPEAT_GAP: Duration = Duration::from_millis(500);
+
 const KEEP_AWAKE: Duration = Duration::from_secs(4);
 
 /// `f(done)` at most once per percent of progress.
@@ -456,7 +468,10 @@ impl tray::Model for Tray {
         self.cfg.shortcut.clone()
     }
     fn hotkey_pressed(&self) {
-        let _ = self.tx.send(Ev::Toggle);
+        let _ = self.tx.send(Ev::ShortcutDown);
+    }
+    fn hotkey_released(&self) {
+        let _ = self.tx.send(Ev::ShortcutUp);
     }
     fn hotkey_result(&self, key: &str, result: Result<(), String>) {
         match result {
@@ -695,10 +710,12 @@ async fn shortcut_task(tx: mpsc::UnboundedSender<Ev>, mut configure: mpsc::Unbou
     };
     let _ = tx.send(Ev::Shortcut(describe(bound.shortcuts())));
     let mut activated = gs.receive_activated().await?;
+    let mut deactivated = gs.receive_deactivated().await?;
     let mut changed = gs.receive_shortcuts_changed().await?;
     loop {
         tokio::select! {
-            Some(a) = activated.next() => if a.shortcut_id() == "toggle" { let _ = tx.send(Ev::Toggle); },
+            Some(a) = activated.next() => if a.shortcut_id() == "toggle" { let _ = tx.send(Ev::ShortcutDown); },
+            Some(d) = deactivated.next() => if d.shortcut_id() == "toggle" { let _ = tx.send(Ev::ShortcutUp); },
             Some(c) = changed.next() => { let _ = tx.send(Ev::Shortcut(describe(c.shortcuts()))); },
             Some(()) = configure.recv() => {
                 if gs.version() >= 2 {
@@ -1135,6 +1152,8 @@ async fn main_loop(
     let mut kb = Keyboard::new(true).map_err(|e| eprintln!("virtual keyboard: {e}")).ok();
     let mut notice = Notice { enabled: cfg.notifications, ..Default::default() };
     let mut rec: Option<audio::Recorder> = None;
+    let mut held: Option<Instant> = None; // when the shortcut press that started the current take went down
+    let mut key_down: Option<Instant> = None; // the shortcut's last press (or key repeat), until released
     let mut take_no = 0u64; // numbers takes, so a late Ev::MicLive of a stopped take is ignored
     let mut shortcut = String::new();
     let mut busy = 0usize; // takes queued in the engine
@@ -1171,6 +1190,24 @@ async fn main_loop(
         let Some(ev) = rx.recv().await else { break };
         // Sweep progress changes no state shown in the tray: handled here, without the bookkeeping below.
         let ev = match ev {
+            // Tap = toggle, hold = push to talk: a take starts on the press either way; releasing after HOLD stops
+            // it. A press repeated while held (key repeat, if a desktop sends it) is not a new press.
+            Ev::ShortcutDown => {
+                let repeat = key_down.is_some_and(|t| t.elapsed() < REPEAT_GAP);
+                key_down = Some(Instant::now());
+                if repeat {
+                    continue;
+                }
+                held = rec.is_none().then(Instant::now);
+                Ev::Toggle
+            }
+            Ev::ShortcutUp => {
+                key_down = None;
+                match held.take() {
+                    Some(t) if rec.is_some() && t.elapsed() >= HOLD => Ev::Toggle,
+                    _ => continue,
+                }
+            }
             Ev::SweepProgress(done) => {
                 tray.update(move |t: &mut Tray| t.sweep = (done * 100.0) as u32).await;
                 continue;
@@ -1448,7 +1485,7 @@ async fn main_loop(
             }
             Ev::ShortcutFailed(e) => notice.show("Shortcut not set", &format!("{e}. Pick another in the tray menu."), "dialog-error").await,
             Ev::Quit => break,
-            Ev::SweepProgress(_) | Ev::Progress(_) | Ev::Reading(_) => unreachable!("handled above"),
+            Ev::SweepProgress(_) | Ev::Progress(_) | Ev::Reading(_) | Ev::ShortcutDown | Ev::ShortcutUp => unreachable!("handled above"),
         }
         notice.enabled = cfg.notifications;
         if state == State::NoModel && installed() {
