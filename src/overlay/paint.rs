@@ -24,8 +24,8 @@ pub const HEIGHT: f32 = 40.0;
 pub const BOTTOM: f32 = 96.0;
 /// Redraw interval while shown.
 pub const FRAME: Duration = Duration::from_millis(33);
-/// A new bar every STEP: BARS * STEP = how much time the bars show (0.75 s).
-const BARS: usize = 15;
+/// A new bar every STEP: BARS * STEP = how much time the bars show (0.95 s).
+const BARS: usize = 19;
 const STEP: Duration = Duration::from_millis(50);
 
 /// The loudest sample (absolute value, f32 bits) since the overlay last took it. Positive f32s order like their
@@ -105,11 +105,20 @@ impl Painter {
                 let total = BARS as f32 * bw + (BARS - 1) as f32 * gap;
                 let x0 = (WIDTH - total) / 2.0;
                 let alpha = if self.view == View::Starting { 90 } else { 255 };
+                // The bars reach into the round ends; there they're cut off by the curve (7 pt inside it).
+                let r = HEIGHT / 2.0;
                 for (i, &v) in self.bars.iter().enumerate() {
-                    let bh = 3.0 + v * (HEIGHT - 14.0);
                     let x = x0 + i as f32 * (bw + gap);
+                    let cx = x + bw / 2.0;
+                    let dx = (r - cx).max(cx - (WIDTH - r)).max(0.0);
+                    let room = 2.0 * ((r * r - dx * dx).max(0.0).sqrt() - 7.0);
+                    let bh = (3.0 + v * (HEIGHT - 14.0)).min(room.max(3.0));
+                    // Fade in the round ends only: full on the straight part, about a third at the outermost bars.
+                    let k = (dx / (r - x0 - bw / 2.0)).clamp(0.0, 1.0);
+                    let fade = 1.0 - 0.65 * k * k * (3.0 - 2.0 * k);
+                    let a = (alpha as f32 * fade) as u8;
                     if let Some(p) = rounded(x, (HEIGHT - bh) / 2.0, bw, bh, bw / 2.0) {
-                        px.fill_path(&p, &white(alpha), FillRule::Winding, t, None);
+                        px.fill_path(&p, &white(a), FillRule::Winding, t, None);
                     }
                 }
             }
