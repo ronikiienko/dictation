@@ -1591,6 +1591,19 @@ No GPU, no tuning.
   and `sincos` (tables, same bytes as CoreML's) replace `pos`; consts.bin 57 KB; the app's build (anebuild) gives
   CoreML's weight.bin byte for byte and the same texts. New folder name, so existing installs download and build again.
   The listening test above was on the inexact tables.
+  **More after adopting (2026-11-27, tried, nothing gained)** (.cache/tmp/ane/sub/: abl.py, rot.py, fast.py; 6-layer
+  cuts, base 32.1-32.8 ms). CoreML's cost estimate for the shipped model: linear 43%, add 13%, mul 10%, matmul 8%,
+  conv 5.5%, transpose 5%. Ablations (ops dropped, wrong math, timing only): sin/cos rotation (A, B: 6 elementwise
+  ops on [8, 376, 512] per layer) -3.4 ms = ~0.57 ms/layer, ~14 ms (~12%) of the full encoder; score scaling, attention
+  mask, bias_u/v adds ~0; all masks (subsampler + attention + conv) -3.5 ms. Exact rewrites, none faster: rotation
+  tables pre-expanded to 8 heads 33.3; [A|B] fused from P = qv@[Ws|Wc], Q = qv@[Wc|Ws] + one K=1024 matmul 33.2;
+  5-op rotation (t = SI * qv@(Ws+Wc), A = t + uc*(CI-SI), B = t - us*(SI+CI)) 32.2. The rotation's cost is its
+  volume of elementwise work, not broadcasting. Subsampler: dropping the redundant masks (after the depthwise convs:
+  the pointwise mask redoes them; after pw2: padded rows are ignored downstream) 33.1; conv1's mask (24.6M values)
+  folded into conv1 as a 2nd input channel (-1e4 on padded mel rows, centre tap only, relu zeroes them): exact, but
+  CoreML puts that conv on the CPU (49.6 ms; with the weights as a constant still CPU in the plan, 32.2 ms = no
+  gain). A standalone 2-channel conv runs on the ANE, so it's the stacked input (stack/tile on the CPU). Left at
+  that: at most ~2-3 ms per window there.
 - **Smaller window for short takes (discussed, not done)**: takes are short (median 7.3 s, 63% under
   10 s, 31% under 4 s; Silero VAD: 34% of the audio is silence, median 0.7 s before the first word). A 10 s window
   (~35 ms encoder, between the old 5 s 21 ms and 15 s 47 ms) would bring short takes from ~150-200 to ~60-110 ms.
