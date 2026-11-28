@@ -22,11 +22,14 @@ pub enum View {
 /// How a take ended, as the overlay shows it.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Outcome {
-    /// Text pasted or put on the clipboard: a green check.
+    /// Text pasted, or put on the clipboard when that's the chosen output: a green check.
     Text,
+    /// Meant to be pasted, but the paste keys couldn't be pressed (macOS: no Accessibility permission): the text is
+    /// on the clipboard. An amber check.
+    Copied,
     /// Nothing recognized: a dim dash.
     Empty,
-    /// Copying, pasting or transcribing failed: a red cross.
+    /// Copying or transcribing failed: a red cross.
     Failed,
 }
 
@@ -194,6 +197,7 @@ impl Painter {
                 let (cx, cy) = (WIDTH / 2.0, HEIGHT / 2.0);
                 let (strokes, color): (&[&[(f32, f32)]], Paint) = match o {
                     Outcome::Text => (&[&[(-7.5, 0.5), (-2.5, 5.5), (8.0, -6.0)]], rgba(48, 209, 88, 255)),
+                    Outcome::Copied => (&[&[(-7.5, 0.5), (-2.5, 5.5), (8.0, -6.0)]], rgba(255, 179, 64, 255)),
                     Outcome::Empty => (&[&[(-7.0, 0.0), (7.0, 0.0)]], white(150)),
                     Outcome::Failed => (&[&[(-5.5, -5.5), (5.5, 5.5)], &[(5.5, -5.5), (-5.5, 5.5)]], rgba(255, 69, 58, 255)),
                 };

@@ -60,7 +60,8 @@ mod keyboard {
     /// Shown when the paste keys can't be pressed.
     #[cfg(target_os = "macos")]
     pub const PASTE_HELP: &str = "Allow Dictation (or the terminal it runs in) in System Settings -> Privacy & Security \
-        -> Accessibility, so it can press Cmd+V.";
+        -> Accessibility, so it can press Cmd+V. Already on there? Remove it with - and add it again: an update makes \
+        macOS forget it. The tray menu links there.";
     #[cfg(not(target_os = "macos"))]
     pub const PASTE_HELP: &str = "The system refused the simulated paste keys.";
 

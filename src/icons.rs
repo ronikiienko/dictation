@@ -16,7 +16,7 @@ pub enum Icon {
     Downloading,
     /// Open ring on amber (one-time GPU tuning).
     Optimizing,
-    /// "!" on orange (no model yet).
+    /// "!" on orange: no model yet, or a permission is missing (the tray menu says which).
     Warning,
 }
 
@@ -92,12 +92,13 @@ impl Icon {
 impl Icon {
     /// macOS menu bar look: the symbol alone (no disc), scaled up to fill the bar's height. Black + alpha, to be shown
     /// as a template image (macOS tints it for light/dark menu bars), except Recording: a red symbol, not a template
-    /// (macOS apps show recording in red), and Starting: amber. Returns (RGBA, template).
+    /// (macOS apps show recording in red), Starting: amber, and Warning: orange (something needs attention).
+    /// Returns (RGBA, template).
     pub fn glyph_rgba(self, size: u32) -> (Vec<u8>, bool) {
         const SS: u32 = 4;
         // The symbols are drawn inside the disc (about 0.18..0.82 of the square): zoom in so they span ~0.03..0.97.
         const ZOOM: f32 = 0.66;
-        let template = !matches!(self, Icon::Recording | Icon::Starting);
+        let template = !matches!(self, Icon::Recording | Icon::Starting | Icon::Warning);
         let rgb = if template { [0, 0, 0] } else { self.background() };
         let mut out = Vec::with_capacity((size * size * 4) as usize);
         for py in 0..size {

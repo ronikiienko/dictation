@@ -1719,3 +1719,27 @@ open is the kind of audio workaround ruled out.
   here (no Linux target installed), CI builds it.
 - Done mark: green check (text pasted or copied), dim dash (nothing recognized), red cross (copy/paste/transcription
   failed), 650 ms then the pill fades. User after the fix: "much smoother".
+
+### Open at login, permission warnings, version (2026-11-27, M1)
+- **Version**: tray menu line "Dictation <version>" above Quit, `dictation --version`; both from Cargo.toml (Info.plist
+  already had it). A release is still the pushed `v*` tag; nothing checks the tag matches Cargo.toml (user: fine).
+- **Open at login** (tray checkbox, src/login.rs; the system keeps the setting, not config.toml). macOS: SMAppService
+  main app (13+), only as Dictation.app (a bare binary has no bundle: the checkbox is hidden); tested register ->
+  enabled -> unregister. Login items added by hand are another list the app can't read (user: assume the app does
+  it). Linux: `~/.config/autostart/dictation.desktop`, one file whatever binary ticks it; at start only its Exec line
+  follows a moved binary; Hidden=true (switched off in KDE) reads as off. Linux logic run against a temp home on the
+  Mac, the app's Linux build not compiled here.
+- **Permissions** (src/perms.rs, macOS): Accessibility (AXIsProcessTrusted) and microphone (AVCaptureDevice status)
+  checked without prompting; missing -> tray icon "!" in orange (not a template) and a ⚠ line at the top of the menu
+  that opens the settings page (user: never open settings by itself). Rechecked every event / 10 s tick, so granting
+  clears it. Not checkable: system audio recording, notifications.
+  - Microphone: when the first take's prompt came from opening the audio stream, "Don't Allow" left this process
+    reading "not asked yet" (measured: status 0 after the denial) and takes recorded silence. Now the app asks via
+    AVFoundation before opening the mic (needs Info.plist's usage text: .app only; the bare binary keeps the old way).
+  - Accessibility: the app asks once at start; the ⚠ line asks again (re-adds Dictation to the list) and opens it.
+  - Every build is ad-hoc signed anew: macOS keeps one entry per bundle ID per permission, with the signature it was
+    granted to; a new build doesn't match ("Failed to match existing code requirement" in tccd's log), the switch still
+    shows on but doesn't apply. Users hit this on every update: remove it with "-" and add again (paste notice says
+    so). Real fix: a Developer ID signature (same identity every build), user's decision.
+- **Pill**: amber check = meant to paste, couldn't (text on the clipboard); red cross only for copy or transcription
+  failures.

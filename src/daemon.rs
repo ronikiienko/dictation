@@ -50,6 +50,8 @@ pub enum Ev {
     Downloaded(Result<(), String>),
     ConfigureShortcut,
     Quit,
+    /// Tray "Open at login" ticked (true) or unticked.
+    SetLogin(bool),
     /// Periodic check for the idle unload.
     Tick,
     UnloadNow,
@@ -319,6 +321,10 @@ struct Tray {
     reading: Option<(String, u32)>,
     /// Takes (not files) waiting for or being transcribed: the recording window shows for those only.
     takes: usize,
+    /// Permissions the system withholds (crate::perms): tray lines that open their settings page.
+    missing: Vec<crate::perms::Missing>,
+    /// Opens at login (crate::login); None: can't be set here (not running as Dictation.app, other systems).
+    login: Option<bool>,
     /// How the last take ended and its number: the recording window's done mark (shown once per take).
     done: Option<(crate::overlay::Outcome, u64)>,
     /// The last take's length and how long transcribing it took ("" before the first take).
@@ -451,6 +457,7 @@ impl tray::Model for Tray {
             State::Idle if self.reading.is_some() => Icon::Transcribing,
             State::Optimizing => Icon::Optimizing,
             State::NoModel => Icon::Warning,
+            State::Idle if !self.missing.is_empty() => Icon::Warning, // a permission is missing: the menu says which
             State::Idle => Icon::Idle,
         }
     }
@@ -480,6 +487,8 @@ impl tray::Model for Tray {
     }
     fn menu_opening(&mut self) {
         self.mics = audio::input_devices(); // pick up newly plugged microphones
+        self.login = crate::login::enabled(); // may have been switched in the system's settings
+        self.missing = crate::perms::missing(self.cfg.microphone != audio::SYSTEM_AUDIO); // granted meanwhile?
     }
     fn hotkey(&self) -> String {
         self.cfg.shortcut.clone()
@@ -575,6 +584,9 @@ impl tray::Model for Tray {
         };
 
         let mut items = vec![Label(self.status_text())];
+        for &m in &self.missing {
+            items.push(Action { label: m.label().into(), enabled: true, click: tray::click(move || m.open_settings()) });
+        }
         if !self.last.is_empty() {
             items.push(Label(self.last.clone()));
         }
@@ -676,6 +688,11 @@ impl tray::Model for Tray {
                 enabled: true,
                 click: self.setting(|c| c.save_recordings = !c.save_recordings),
             },
+        ]);
+        if let Some(on) = self.login {
+            items.push(Check { label: "Open at login".into(), checked: on, enabled: true, click: self.send(move || Ev::SetLogin(!on)) });
+        }
+        items.extend([
             Action {
                 label: "Open app folder…".into(),
                 enabled: true,
@@ -1019,6 +1036,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     if log::set_logger(&LOG).is_ok() {
         log::set_max_level(log::LevelFilter::Warn);
     }
+    crate::login::refresh(); // an autostart entry follows the binary if it moved (Linux)
     if std::env::var_os(RESTARTED).is_some() {
         // Started by the old instance as it quits (see the end of `run`): give it time to go.
         // SAFETY: still single-threaded here (main thread, before the tray and runtime start).
@@ -1048,6 +1066,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         progress: None,
         reading: None,
         takes: 0,
+        login: crate::login::enabled(),
+        missing: crate::perms::missing(cfg.microphone != audio::SYSTEM_AUDIO),
         done: None,
         last: String::new(),
         rec_since: None,
@@ -1252,6 +1272,11 @@ async fn main_loop(
                 notice.show("Transcribing a file", "Dictation is available again when it's done; progress is in the tray menu.", "dialog-information").await
             }
             Ev::Toggle => match (state, rec.take()) {
+                (State::Idle | State::Transcribing, None) if cfg.microphone != audio::SYSTEM_AUDIO && !crate::perms::microphone_allowed() => {
+                    let missing = crate::perms::missing(true);
+                    tray.update(move |t: &mut Tray| t.missing = missing).await;
+                    notice.show("Microphone not allowed", "Allow Dictation in System Settings → Privacy & Security → Microphone (the tray menu links there).", "dialog-error").await
+                }
                 (State::Idle | State::Transcribing, None) => match {
                     // Show the click at once: opening the microphone can take a moment (blocks this loop).
                     tray.update(|t: &mut Tray| t.state = State::Starting).await;
@@ -1285,6 +1310,12 @@ async fn main_loop(
                     }
                     state = if busy > 0 { State::Transcribing } else { State::Idle };
                     match r.stop() {
+                        // Denied in the system's prompt during this take (the first take asks): it recorded silence.
+                        Ok(_) if cfg.microphone != audio::SYSTEM_AUDIO && crate::perms::microphone_denied() => {
+                            let missing = crate::perms::missing(true);
+                            tray.update(move |t: &mut Tray| t.missing = missing).await;
+                            notice.show("Microphone not allowed", "Allow Dictation in System Settings → Privacy & Security → Microphone (the tray menu links there).", "dialog-error").await
+                        }
                         Ok(c) if cfg.microphone == audio::SYSTEM_AUDIO && c.audio.iter().all(|&v| v == 0.0) => {
                             notice
                                 .show(
@@ -1346,6 +1377,7 @@ async fn main_loop(
                     Ok(t) => {
                         // (title, body) of a notice about what went wrong.
                         let mut problem: Option<(&str, String)> = None;
+                        let mut copied_only = false;
                         if !t.text.is_empty() {
                             if let Err(e) = clipboard.set(&t.text) {
                                 eprintln!("clipboard: {e}");
@@ -1353,13 +1385,16 @@ async fn main_loop(
                             } else if cfg.output == Output::Paste {
                                 if let Err(e) = press_paste(&mut kb, cfg.paste_keys) {
                                     eprintln!("paste: {e}");
+                                    copied_only = true;
                                     problem = Some(("Not pasted: the text is on the clipboard", crate::output::PASTE_HELP.into()));
                                 }
                             }
                         }
                         // Only when something needs attention: a working take shows its result by itself (pasted or
                         // on the clipboard), a notification on every take was just noise (user, 2026-11-20).
-                        let outcome = if problem.is_some() {
+                        let outcome = if copied_only {
+                            Outcome::Copied
+                        } else if problem.is_some() {
                             Outcome::Failed
                         } else if t.text.is_empty() {
                             Outcome::Empty
@@ -1387,7 +1422,12 @@ async fn main_loop(
                 };
                 done_no += 1;
                 let n = done_no;
-                tray.update(move |t: &mut Tray| t.done = Some((outcome, n))).await;
+                let missing = crate::perms::missing(cfg.microphone != audio::SYSTEM_AUDIO); // a failed paste: say why
+                tray.update(move |t: &mut Tray| {
+                    t.done = Some((outcome, n));
+                    t.missing = missing;
+                })
+                .await;
             }
             Ev::File(x, srt, reply) => {
                 if matches!(state, State::NoModel | State::Optimizing) {
@@ -1522,6 +1562,18 @@ async fn main_loop(
             }
             Ev::ShortcutFailed(e) => notice.show("Shortcut not set", &format!("{e}. Pick another in the tray menu."), "dialog-error").await,
             Ev::Quit => break,
+            Ev::SetLogin(on) => {
+                match crate::login::set(on) {
+                    Ok(None) => println!("open at login: {on}"),
+                    Ok(Some(note)) => notice.show("Open at login", &note, "dialog-information").await,
+                    Err(e) => {
+                        eprintln!("open at login: {e}");
+                        notice.show("Open at login: couldn't change it", &e, "dialog-error").await
+                    }
+                }
+                let now = crate::login::enabled();
+                tray.update(move |t: &mut Tray| t.login = now).await;
+            }
             Ev::SweepProgress(_) | Ev::Progress(_) | Ev::Reading(_) | Ev::ShortcutDown(_) | Ev::ShortcutUp(_) => unreachable!("handled above"),
         }
         notice.enabled = cfg.notifications;
@@ -1584,8 +1636,11 @@ async fn main_loop(
             }
         }
         let (s, m, c, takes) = (state, mem, cfg.clone(), busy.saturating_sub(files));
+        // Permissions granted (or taken away) in the system's settings show up within a tick (10 s) or the next event.
+        let missing = crate::perms::missing(cfg.microphone != audio::SYSTEM_AUDIO);
         tray.update(move |t: &mut Tray| {
             t.takes = takes;
+            t.missing = missing;
             if !matches!(s, State::Starting | State::Recording) {
                 t.rec_since = None;
             } else if t.rec_since.is_none() {

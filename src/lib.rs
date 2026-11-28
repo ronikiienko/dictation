@@ -3,10 +3,12 @@ pub mod audio;
 pub mod config;
 pub mod daemon;
 pub mod icons;
+pub mod login;
 pub mod media;
 pub mod models;
 pub mod output;
 pub mod overlay;
+pub mod perms;
 pub mod subtitles;
 pub mod tray;
 
