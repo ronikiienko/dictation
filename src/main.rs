@@ -1,6 +1,7 @@
 //! dictation — offline dictation (Parakeet Ultra, own Rust port: GPU via burn/Vulkan on Linux and Windows, Neural Engine
 //! on macOS, or the CPU). Settings are in the tray menu.
 //!   dictation            run the tray app
+//!   dictation --version  the app's version
 //!   dictation toggle     start / stop a take in the running app (for a custom shortcut or scripts)
 //!   dictation transcribe [--srt] <file>...   text (or subtitles, .srt format) of audio/video files on stdout (by
 //!                        the running app if there is one, else loads the model itself)
@@ -111,6 +112,10 @@ fn main() {
     }
     let r = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         [] => daemon::run(),
+        ["--version" | "-V" | "version"] => {
+            println!("dictation {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         [cmd @ "toggle"] => match daemon::send(cmd) {
             Ok(_) => Ok(()),
             Err(_) => Err("Dictation is not running (start it with `dictation`).".into()),
@@ -121,7 +126,7 @@ fn main() {
         ["sweep", "full"] => sweep(true).map_err(Into::into),
         ["transcribe", "--srt", files @ ..] if !files.is_empty() => transcribe(files, true).map_err(Into::into),
         ["transcribe", files @ ..] if !files.is_empty() => transcribe(files, false).map_err(Into::into),
-        _ => Err("usage: dictation [toggle | sweep | transcribe [--srt] <file>...]".into()),
+        _ => Err("usage: dictation [toggle | sweep | transcribe [--srt] <file>... | --version]".into()),
     };
     if let Err(e) = r {
         if !e.to_string().is_empty() {

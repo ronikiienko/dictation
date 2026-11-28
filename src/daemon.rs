@@ -687,6 +687,7 @@ impl tray::Model for Tray {
             },
             self.shortcut_item(),
             Separator,
+            Label(concat!("Dictation ", env!("CARGO_PKG_VERSION")).into()),
             Action { label: "Quit".into(), enabled: true, click: self.send(|| Ev::Quit) },
         ]);
         items
