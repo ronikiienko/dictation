@@ -35,10 +35,12 @@ fn socket_name() -> std::io::Result<interprocess::local_socket::Name<'static>> {
 pub enum Ev {
     /// Start or stop a take (tray menu, `dictation toggle`).
     Toggle,
-    /// The global shortcut went down: starts or stops a take like Toggle.
-    ShortcutDown,
-    /// The global shortcut was released: if it started the take and was held down (HOLD), the take stops.
-    ShortcutUp,
+    /// The global shortcut went down (when): starts or stops a take like Toggle.
+    ShortcutDown(Instant),
+    /// The global shortcut was released (when): if it started the take and was held down (HOLD), the take stops.
+    /// Both carry the time they happened: the loop can be busy between handling the two (opening the microphone
+    /// blocks it), and timing that instead made a quick tap count as held, stopping the take at once.
+    ShortcutUp(Instant),
     /// The microphone of take number .0 delivers real sound (audio::Recorder::start): now show "recording".
     MicLive(u64),
     /// New settings chosen in the tray menu.
@@ -483,10 +485,10 @@ impl tray::Model for Tray {
         self.cfg.shortcut.clone()
     }
     fn hotkey_pressed(&self) {
-        let _ = self.tx.send(Ev::ShortcutDown);
+        let _ = self.tx.send(Ev::ShortcutDown(Instant::now()));
     }
     fn hotkey_released(&self) {
-        let _ = self.tx.send(Ev::ShortcutUp);
+        let _ = self.tx.send(Ev::ShortcutUp(Instant::now()));
     }
     fn hotkey_result(&self, key: &str, result: Result<(), String>) {
         match result {
@@ -730,8 +732,8 @@ async fn shortcut_task(tx: mpsc::UnboundedSender<Ev>, mut configure: mpsc::Unbou
     let mut changed = gs.receive_shortcuts_changed().await?;
     loop {
         tokio::select! {
-            Some(a) = activated.next() => if a.shortcut_id() == "toggle" { let _ = tx.send(Ev::ShortcutDown); },
-            Some(d) = deactivated.next() => if d.shortcut_id() == "toggle" { let _ = tx.send(Ev::ShortcutUp); },
+            Some(a) = activated.next() => if a.shortcut_id() == "toggle" { let _ = tx.send(Ev::ShortcutDown(Instant::now())); },
+            Some(d) = deactivated.next() => if d.shortcut_id() == "toggle" { let _ = tx.send(Ev::ShortcutUp(Instant::now())); },
             Some(c) = changed.next() => { let _ = tx.send(Ev::Shortcut(describe(c.shortcuts()))); },
             Some(()) = configure.recv() => {
                 if gs.version() >= 2 {
@@ -1211,19 +1213,19 @@ async fn main_loop(
         let ev = match ev {
             // Tap = toggle, hold = push to talk: a take starts on the press either way; releasing after HOLD stops
             // it. A press repeated while held (key repeat, if a desktop sends it) is not a new press.
-            Ev::ShortcutDown => {
-                let repeat = key_down.is_some_and(|t| t.elapsed() < REPEAT_GAP);
-                key_down = Some(Instant::now());
+            Ev::ShortcutDown(at) => {
+                let repeat = key_down.is_some_and(|t| at.duration_since(t) < REPEAT_GAP);
+                key_down = Some(at);
                 if repeat {
                     continue;
                 }
-                held = rec.is_none().then(Instant::now);
+                held = rec.is_none().then_some(at);
                 Ev::Toggle
             }
-            Ev::ShortcutUp => {
+            Ev::ShortcutUp(at) => {
                 key_down = None;
                 match held.take() {
-                    Some(t) if rec.is_some() && t.elapsed() >= HOLD => Ev::Toggle,
+                    Some(t) if rec.is_some() && at.duration_since(t) >= HOLD => Ev::Toggle,
                     _ => continue,
                 }
             }
@@ -1519,7 +1521,7 @@ async fn main_loop(
             }
             Ev::ShortcutFailed(e) => notice.show("Shortcut not set", &format!("{e}. Pick another in the tray menu."), "dialog-error").await,
             Ev::Quit => break,
-            Ev::SweepProgress(_) | Ev::Progress(_) | Ev::Reading(_) | Ev::ShortcutDown | Ev::ShortcutUp => unreachable!("handled above"),
+            Ev::SweepProgress(_) | Ev::Progress(_) | Ev::Reading(_) | Ev::ShortcutDown(_) | Ev::ShortcutUp(_) => unreachable!("handled above"),
         }
         notice.enabled = cfg.notifications;
         if state == State::NoModel && installed() {
