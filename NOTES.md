@@ -1515,7 +1515,7 @@ No GPU, no tuning.
   finfo.min, which is -inf in fp16 and gave NaN rows), one fixed 30 s window (3001 mel frames; shorter pieces padded,
   exact), a plain model (1.2 GB). Was: 3 windows (5 / 15 / 30 s) as one multifunction model sharing the weights, dropped
   because macOS recompiled it on every load (see "Load").
-- **The app builds it itself** from the download (pinned revision, SHA-checked) as `ane/enc-30s.mlmodelc` (an older
+- **The app builds it itself** from the download (pinned revision, SHA-checked) as `ane/enc-30s-noshift.mlmodelc` (was `enc-30s.mlmodelc` before 2026-11-27; an older
   build under another name counts as not installed: downloaded and built again): assets/parakeet-ultra-ane (0.8 MB:
   compiled model without weight.bin + recipe.json + consts.bin, experiments/ane/recipe.py) + src/asr/ane_build.rs
   writes weight.bin in ~5 s: 540 tensors copied, 48 depthwise convs with batch norm folded (same bytes as CoreML),
@@ -1569,6 +1569,28 @@ No GPU, no tuning.
   i and j, as RoPE: one plain matmul, no shift): 112 vs 128 ms (-13%, 99 takes encoder 14.9 vs 17.2 s) but worse on
   the reference texts, 75 vs 73 errors of 1360 words (2 words, both wrong: "energy bar bars", "deck" -> "duck"; fp16
   in the rotation). User: worse = not used. Scripts were deleted with the experiment.
+  **Retried 2026-11-27** (.cache/tmp/ane/sf/): the precision theory was wrong. Position term of layer 17 on the real
+  ANE (compute plan: all on the ANE) vs fp32: today's matmul + shift rms 0.085, shift-free (A_i . cos jw + B_i .
+  sin jw, 1024-long dot per head) rms 0.079, so no fp16 loss on the ANE (it sums in higher precision; the CPU in
+  fp16 does not: 0.45 vs 1.41). Full model, 10 reference takes: 73 = 73 errors (2 words flip, one each way: noise of
+  any equivalent change). But this version is not faster: encoder 4733 vs 4790 ms (-1%); the 1024-long dot (~2.5
+  GFLOP more per layer) eats what the shift saved. How the 2026-11-25 version got 112 ms is not known (script gone).
+  **Found (`sfp`)**: sin and cos halves of relative_k_proj as two separate weights (`Wh[..., 0::2]`, `[..., 1::2]`)
+  instead of one interleaved output split on the ANE. 6-layer cut: 33.5 vs 38.5 ms. Full model, 10 reference takes:
+  encoder 4266 vs 4823 ms (-11.5%), 74 vs 73 errors. vs fp32 (CPU, transformers), 33 windows of the same takes: rel rms
+  3.862% vs 3.876% (today), further in 17 of 33 windows, so equal. All 1751 takes (5.6 h; check stops at the unreadable
+  20261127-012452.opus): encoder 215.5 vs 248.0 s (-13.1%), 20 spots / 24 words differ (0.08%). User listened blind
+  (.cache/tmp/ane/sf/listen/index.html, clips + comments): today right 9, new right 7, 4 ties. My reading-only verdict
+  (8 worse, 1-3 better) was wrong on several (fillers and repeats the user really said). Scripts: .cache/tmp/ane/sf/
+  (export_sf.py, bench6.py, vsfp32b.py, alldiff.py, listen/make.py).
+  **Adopted 2026-11-27**, with one fix: CoreML had folded the sin/cos tables (built from torch ops in the graph) with a
+  poor sin for large angles (sin(374) stored as -0.113, true -0.150; 22% of the table's values off). export.py now
+  computes them (f64 -> f32) and passes finished constants. Exact tables: vs fp32 closer than today in 20 of 33
+  windows (max abs 0.108 vs 0.115), 10 reference takes: only "energy bar bars" differs (a stumble, user: either fits;
+  ONNX/int8 flips gone), encoder 4168 vs 4823 ms (-13.6%). Recipe kinds `rkp` (relative_k_proj's sin/cos half, copied)
+  and `sincos` (tables, same bytes as CoreML's) replace `pos`; consts.bin 57 KB; the app's build (anebuild) gives
+  CoreML's weight.bin byte for byte and the same texts. New folder name, so existing installs download and build again.
+  The listening test above was on the inexact tables.
 - **Smaller window for short takes (discussed, not done)**: takes are short (median 7.3 s, 63% under
   10 s, 31% under 4 s; Silero VAD: 34% of the audio is silence, median 0.7 s before the first word). A 10 s window
   (~35 ms encoder, between the old 5 s 21 ms and 15 s 47 ms) would bring short takes from ~150-200 to ~60-110 ms.

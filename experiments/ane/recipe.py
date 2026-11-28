@@ -4,7 +4,8 @@ the compiled model folder without weights/weight.bin, plus recipe.json for weigh
   ["bytes", start, len]              literal bytes from consts.bin (file/blob headers, architecture-only constants)
   ["tensor", name]                   a safetensors tensor as fp16 (F32 ones rounded), same element order
   ["bn_w", layer] / ["bn_b", layer]  depthwise conv with its batch norm folded in (weight / bias)
-  ["pos", layer, P]                  relative_k_proj(position table of P positions), as [1, 8, 128, P]
+  ["rkp", layer, half]               relative_k_proj's sin (half 0: even inputs) or cos (1: odd) columns, as [1, 8, 128, 512]
+  ["sincos", "sin"|"cos", T, tr]      sin/cos(j w) of the attention's position term, [T, 512] (tr 1: [512, T])
 Checks that numpy's version of every computed blob matches CoreML's (prints the worst difference).
 One plain 30 s model, not several windows: one compiled program for macOS to keep instead of 3 (NOTES.md "Neural Engine").
 usage: python recipe.py <hf dir> <enc3001.mlpackage> <out dir, e.g. assets/parakeet-ultra-ane>"""
@@ -48,18 +49,15 @@ def bn(i):
     s = g(p + 'weight') / np.sqrt(g(p + 'running_var') + np.float32(eps))
     return (w * s[:, None, None]).astype(np.float16), (g(p + 'bias') - g(p + 'running_mean') * s).astype(np.float16)
 
-def pos_table(P):
-    """transformers' ParakeetEncoderRelPositionalEncoding for P = 2T-1 positions (T-1 .. -(T-1))."""
-    T = (P + 1) // 2
-    pos = np.arange(T - 1, -T, -1, dtype=np.float32)
-    inv = 1.0 / (10000.0 ** (np.arange(0, D, 2, dtype=np.float32) / D))
-    ang = pos[:, None] * inv[None, :]
-    pe = np.zeros((P, D), np.float32); pe[:, 0::2] = np.sin(ang); pe[:, 1::2] = np.cos(ang)
-    return pe
+def sincos(fn, T):
+    """export.py's sincos(), rounded to fp16 (as CoreML stores it)."""
+    ang = np.arange(T, dtype=np.float64)[:, None] / 10000 ** (np.arange(0, D, 2, dtype=np.float64) / D)
+    return getattr(np, fn)(ang).astype(np.float32).astype(np.float16)
 
-def posw(i, P):
-    y = pos_table(P) @ g(f'encoder.layers.{i}.self_attn.relative_k_proj.weight').T   # [P, D]
-    return y.reshape(P, H, D // H).transpose(1, 2, 0)[None].astype(np.float16)        # [1, H, D/H, P]
+for i in range(L):   # relative_k_proj's halves, exact copies
+    w = f.get_tensor(f'encoder.layers.{i}.self_attn.relative_k_proj.weight').astype(np.float16).reshape(H, D // H, D)
+    for half in (0, 1):
+        src.setdefault(hashlib.sha1(np.ascontiguousarray(w[..., half::2]).tobytes()).digest(), ('rkp', i, half))
 
 cands = {}
 for i in range(L):
@@ -75,12 +73,15 @@ for off in sorted(blobs):
     k = src.get(hashlib.sha1(data).digest())
     kind = None
     if k is not None:
-        kind = ['tensor', k]
-    elif bl['dt'] == 'fp16' and len(bl['shape']) == 4 and bl['shape'][:3] == (1, H, D // H):
-        P = bl['shape'][3]
+        kind = list(k) if isinstance(k, tuple) else ['tensor', k]
+    elif bl['dt'] == 'fp16' and len(bl['shape']) == 2 and D // 2 in bl['shape']:
+        tr = int(bl['shape'][0] == D // 2); T = bl['shape'][tr]
         got = np.frombuffer(data, np.float16).reshape(bl['shape']).astype(np.float32)
-        errs = [(np.abs(posw(i, P).astype(np.float32) - got).max(), i) for i in range(L)]
-        e, i = min(errs); kind = ['pos', i, P]; worst['pos'] = max(worst.get('pos', 0), e / max(np.abs(got).max(), 1e-9))
+        for fn in ('sin', 'cos'):
+            want = sincos(fn, T).astype(np.float32); want = want.T if tr else want
+            e = np.abs(want - got).max()
+            if e <= 1e-3:
+                kind = ['sincos', fn, T, tr]; worst['sincos'] = max(worst.get('sincos', 0), e); break
     elif bl['dt'] == 'fp16':
         got = np.frombuffer(data, np.float16)
         best = min(((np.abs(c.reshape(-1).astype(np.float32) - got.astype(np.float32)).max(), key)

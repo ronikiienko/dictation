@@ -5,18 +5,18 @@
 //! - literal bytes (file and blob headers, architecture-only constants: index ranges, zero biases), from consts.bin;
 //! - an encoder tensor as fp16 (published fp16: copied; the few f32 ones, norms etc.: rounded to nearest);
 //! - the depthwise conv with its batch norm folded in (CoreML folds it at export; same f32 formula, same bytes);
-//! - `relative_k_proj` applied to the position table of one window (CoreML folds that too): f32 here from our
-//!   f64 table (shapes::pos_emb_vec), rounded once; CoreML's own differs by at most one fp16 step.
+//! - `relative_k_proj`'s sin or cos half (attention's position term without the shift, export.py): copied;
+//! - the sin/cos tables of that term (f64, rounded to f32, then fp16: the same bytes as CoreML's).
 //! One plain model, one 30 s window (why: ane.rs); ane.rs loads it.
-use super::shapes::{pos_emb_vec, D, DK, H};
+use super::shapes::{D, DK, H};
 use super::redux::St;
 use half::f16;
 use std::io::{self, Write};
 use std::path::Path;
 
 /// The built model's folder name in the model folder. A new name for a new template, so an older build is not taken
-/// for this one (models.rs: not installed, downloaded and built again).
-pub const MODEL: &str = "enc-30s.mlmodelc";
+/// for this one (models.rs: not installed, downloaded and built again). Was enc-30s.mlmodelc (with the shift).
+pub const MODEL: &str = "enc-30s-noshift.mlmodelc";
 const DIR: &str = "parakeet-ultra-ane";
 const MIL: &[u8] = include_bytes!("../../assets/parakeet-ultra-ane/model.mil");
 const COREMLDATA: &[u8] = include_bytes!("../../assets/parakeet-ultra-ane/coremldata.bin");
@@ -59,28 +59,27 @@ fn bn(st: &St, i: usize, bias: bool) -> io::Result<Vec<u8>> {
     Ok(f16_bytes(w.iter().enumerate().map(|(j, x)| x * s[j / k])))
 }
 
-/// relative_k_proj (no bias) of layer `i` applied to the position table of `p` = 2T-1 positions, laid out as
-/// [1][H][DK][p] (heads, head dims, positions).
-fn pos(st: &St, i: usize, p: usize) -> io::Result<Vec<u8>> {
+/// relative_k_proj (no bias, [D out][D in], inputs = (sin, cos) interleaved) of layer `i`: its sin (`half` 0, even
+/// inputs) or cos (1, odd) columns, laid out as [1][H][DK][D/2] (heads, head dims, frequencies).
+fn rkp(st: &St, i: usize, half: usize) -> io::Result<Vec<u8>> {
     let (w, shape) = st.f32(&format!("encoder.layers.{i}.self_attn.relative_k_proj.weight"))?;
-    if shape != [D, D] || p % 2 == 0 {
-        return Err(bad(format!("relative_k_proj {shape:?}, positions {p}")));
+    if shape != [D, D] || half > 1 {
+        return Err(bad(format!("relative_k_proj {shape:?}, half {half}")));
     }
-    let table = pos_emb_vec(p.div_ceil(2)); // [p][D]
-    let mut y = vec![0f32; p * D]; // [p][D] = table · Wᵀ
-    unsafe {
-        // SAFETY: plain row-major buffers of exactly these sizes.
-        matrixmultiply::sgemm(p, D, D, 1.0, table.as_ptr(), D as isize, 1, w.as_ptr(), 1, D as isize, 0.0, y.as_mut_ptr(), D as isize, 1);
+    Ok(f16_bytes((0..H * DK).flat_map(|o| (0..D / 2).map(move |k| (o, k))).map(|(o, k)| w[o * D + 2 * k + half])))
+}
+
+/// sin or cos of position j times frequency k (export.py `sincos`): [t][D/2], or [D/2][t] when `transposed`.
+fn sincos(cos: bool, t: usize, transposed: bool) -> Vec<u8> {
+    let v = |j: usize, k: usize| {
+        let a = j as f64 / 10000f64.powf((2 * k) as f64 / D as f64);
+        (if cos { a.cos() } else { a.sin() }) as f32
+    };
+    if transposed {
+        f16_bytes((0..D / 2).flat_map(|k| (0..t).map(move |j| v(j, k))))
+    } else {
+        f16_bytes((0..t).flat_map(|j| (0..D / 2).map(move |k| v(j, k))))
     }
-    let mut out = Vec::with_capacity(p * D * 2);
-    for h in 0..H {
-        for d in 0..DK {
-            for r in 0..p {
-                out.extend_from_slice(&f16::from_f32(y[r * D + h * DK + d]).to_le_bytes());
-            }
-        }
-    }
-    Ok(out)
 }
 
 /// `safetensors` (moondream/parakeet-ultra's model.safetensors) -> `<dir>/`[`MODEL`], written next to it first and
@@ -110,7 +109,15 @@ pub fn build(safetensors: &Path, dir: &Path, mut progress: impl FnMut(f64)) -> i
             Some("tensor") => tensor(&st, a.get(1).and_then(|v| v.as_str()).ok_or_else(|| bad("recipe: tensor name".into()))?)?,
             Some("bn_w") => bn(&st, num(1)?, false)?,
             Some("bn_b") => bn(&st, num(1)?, true)?,
-            Some("pos") => pos(&st, num(1)?, num(2)?)?,
+            Some("rkp") => rkp(&st, num(1)?, num(2)?)?,
+            Some("sincos") => {
+                let cos = match a.get(1).and_then(|v| v.as_str()) {
+                    Some("sin") => false,
+                    Some("cos") => true,
+                    f => return Err(bad(format!("recipe: sincos {f:?}"))),
+                };
+                sincos(cos, num(2)?, num(3)? == 1)
+            }
             k => return Err(bad(format!("recipe: segment kind {k:?}"))),
         };
         f.write_all(&bytes)?;
