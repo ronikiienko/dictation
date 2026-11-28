@@ -1704,3 +1704,18 @@ cpal's macOS backend reports Core Audio's `kAudioDeviceProcessorOverload` (the d
 stream opens (MOMENTUM 4 switching to headset mode restarts its I/O), never mid-take, since the first day. Before the
 mic counts as live (25-38 ms), so no speech lost. Not changed (user OK): hiding it would be cosmetic, keeping the mic
 open is the kind of audio workaround ruled out.
+
+### Recording window: smooth bars and a done mark (2026-11-27, M1, measured)
+- Smoothness measured from screen recordings, not by eye: `.cache/tmp/pill/record.sh <label>` (app on system audio +
+  clipboard-only output, config backed up and restored, `dictation toggle`, a generated burst sound, `screencapture
+  -v -R` of the pill), `motion.py <mov>` (bars' horizontal shift per frame by profile matching).
+- The stutter ("runs, then stops") was the bar step clock restarting at the frame time: frames rarely land on the
+  50 ms mark, so one frame in ~7 showed the row in the same place (54 of 366 frames). Steps now on a fixed 50 ms
+  grid: 0 stalled frames. Not the cause (measured): frame timing (16.7 ms steady, 0 late) and the mic (512 samples
+  every 11.6 ms). Remaining double jumps match frames missing in the recording (recorder or a skipped refresh).
+- 60 fps; the row slides between steps, the incoming bar follows the mic's peak live. macOS frames come from a
+  CoreVideo display link on the pill's screen (timer fallback); everything moves by time, so 120 Hz should work
+  (not tested, the M1 Air is 60 Hz). Linux keeps its timer (its frame callbacks not used); Linux side not compiled
+  here (no Linux target installed), CI builds it.
+- Done mark: green check (text pasted or copied), dim dash (nothing recognized), red cross (copy/paste/transcription
+  failed), 650 ms then the pill fades. User after the fix: "much smoother".
