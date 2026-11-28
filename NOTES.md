@@ -1662,3 +1662,32 @@ rows 32x128, <= 64 rows 64x128 so weights are read once, K split until ~32 cubes
 - Pitfalls: zsh doesn't word-split `$var` (sweeps silently ran defaults; use bash); CubeCL `terminate!()` did not end
   the kernel, so "empty kernel" tests are invalid; burn's `x + 1` on a big f16 tensor ran ~57 GB/s vs ~192 GB/s
   spec (not investigated).
+
+### Long-file speed and other Parakeet-on-Apple numbers (2026-11-27, M1, measured)
+A Reddit comment claimed Parakeet v3 at ~415x on an M3 Max (Argmax Playground, encoder + decoder on the Neural Engine;
+its "Transcribe" 7.15 s leaves out time its own "Total" 11.59 s counts = ~256x) and "M1 Air only 50% slower". Published:
+Argmax "over 100x" on an M1 Air (v2), FluidAudio ~110-145x on an M4 Pro. Argmax ships compressed weights (~0.4-0.5 GB,
+probably palettized; older ANEs don't run those natively, as our int8 test). So nobody is far ahead on the M1.
+Ours, 3.4 h podcast (12,120 s mp3) through the app (`dictation transcribe`, old encoder): 104 s transcription = 116x,
+119 s end to end with mp3 decoding (102x); mel 4.4 s, pause scan 22.9 s, encoder 71.1 s, decoder 69.2 s, which runs
+on CPU threads while the ANE encodes the next piece, so it costs only ~6 s of waiting. The critical path is pause
+scan + encoder. The same file through `check` while the user was dictating: 157 s (77x; the app and check share the
+ANE/CPU). With the ~13% faster encoder (below in "Faster encoder?"): ~125x estimated, not measured.
+New encoder, all 1751 takes: under 5 s median 117 ms (~25x), 5-10 s 127 ms (~57x), 10-30 s 142 ms (~114x), 30-60 s
+339 ms, over 60 s 566 ms (~132x); short takes are low because every take costs one full 30 s window.
+Dictation: takes <= 30 s have no pause scan and decode after the encode (decoder 15-30% of a take); over 30 s the scan
+runs after the stop, before the first encode.
+Ideas not done (long files only): pause scan ahead of the encoder (scan a few minutes, start encoding; same text, up to
+~20 s of 104 saved); padding: pieces cut at the last pause before 30 s are padded to 30 s (encoder 176 ms per window
+on average assumes 404 full windows; more, shorter pieces at ~130 ms fit as well; count pieces before changing cuts).
+Attention tiled for the ANE's 32 MB on-chip memory (Orion paper, arXiv 2603.06728: ~30% slower past it): untested.
+Tooling found on the way: two big CoreML models used alternately in one Python process hung inside
+`MLE5ExecutionStream cancelPendingReset` on the second window: one model per process (vsfp32b.py). `check` stops at
+the first file it can't read: 20261127-012452.opus ("not a format this app reads"), not looked into.
+
+### "A buffer underrun or overrun occurred" in the log (2026-11-27)
+cpal's macOS backend reports Core Audio's `kAudioDeviceProcessorOverload` (the device's I/O thread missed a cycle) as
+`Xrun`; we print every cpal error with `audio:` (audio.rs). In the log: 101 of 861 takes (~12%), always as the mic
+stream opens (MOMENTUM 4 switching to headset mode restarts its I/O), never mid-take, since the first day. Before the
+mic counts as live (25-38 ms), so no speech lost. Not changed (user OK): hiding it would be cosmetic, keeping the mic
+open is the kind of audio workaround ruled out.
