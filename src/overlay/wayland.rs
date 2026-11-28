@@ -95,6 +95,10 @@ fn run() -> Result<(), String> {
                 s.open(&qh);
             }
         }
+        if s.painter.expire() {
+            s.layer = None; // the done mark's time is up
+            s.configured = false;
+        }
         if s.configured && s.painter.visible() && Instant::now() >= s.next {
             s.draw();
         }

@@ -15,7 +15,25 @@ pub enum View {
     Recording,
     /// The take is being transcribed: pulsing dots, or a progress line (percent) for takes over 30 s.
     Transcribing(Option<u32>),
+    /// The take is done (its number, so it shows once): a mark for [`DONE_FOR`], then the overlay hides itself.
+    Done(Outcome, u64),
 }
+
+/// How a take ended, as the overlay shows it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Outcome {
+    /// Text pasted or put on the clipboard: a green check.
+    Text,
+    /// Nothing recognized: a dim dash.
+    Empty,
+    /// Copying, pasting or transcribing failed: a red cross.
+    Failed,
+}
+
+/// How long the done mark shows: drawn in over the first `MARK_IN`, the pill fades out over the last `FADE`.
+pub const DONE_FOR: Duration = Duration::from_millis(650);
+const MARK_IN: Duration = Duration::from_millis(160);
+const FADE: Duration = Duration::from_millis(180);
 
 /// Size in logical pixels (points).
 pub const WIDTH: f32 = 136.0;
@@ -23,7 +41,7 @@ pub const HEIGHT: f32 = 40.0;
 /// Distance from the bottom of the screen (above the Dock / panel).
 pub const BOTTOM: f32 = 96.0;
 /// Redraw interval while shown.
-pub const FRAME: Duration = Duration::from_millis(33);
+pub const FRAME: Duration = Duration::from_millis(16);
 /// A new bar every STEP: BARS * STEP = how much time the bars show (0.95 s).
 const BARS: usize = 19;
 const STEP: Duration = Duration::from_millis(50);
@@ -49,17 +67,27 @@ pub struct Painter {
     bars: [f32; BARS],
     last_step: Instant,
     since: Instant,
+    /// The last take whose done mark was shown (each shows once).
+    done: Option<u64>,
 }
 
 impl Default for Painter {
     fn default() -> Self {
-        Painter { view: View::Hidden, bars: [0.0; BARS], last_step: Instant::now(), since: Instant::now() }
+        Painter { view: View::Hidden, bars: [0.0; BARS], last_step: Instant::now(), since: Instant::now(), done: None }
     }
 }
 
 impl Painter {
     /// Show this; true if it changed. A new take starts with flat bars.
-    pub fn set(&mut self, v: View) -> bool {
+    pub fn set(&mut self, mut v: View) -> bool {
+        if let View::Done(_, n) = v {
+            // Once per take, and only right after the pill showed that take (not out of nowhere).
+            if self.done == Some(n) || !matches!(self.view, View::Transcribing(_)) {
+                v = if matches!(self.view, View::Done(..)) { self.view } else { View::Hidden };
+            } else {
+                self.done = Some(n);
+            }
+        }
         if v == self.view {
             return false;
         }
@@ -78,11 +106,26 @@ impl Painter {
         self.view != View::Hidden
     }
 
+    /// Hides the done mark once its time is up; true if it just did (the window should hide too).
+    pub fn expire(&mut self) -> bool {
+        if matches!(self.view, View::Done(..)) && self.since.elapsed() >= DONE_FOR {
+            self.view = View::Hidden;
+            return true;
+        }
+        false
+    }
+
     /// The next frame, `scale` pixels per point.
     pub fn frame(&mut self, scale: f32) -> Option<Pixmap> {
         let now = Instant::now();
-        if now.duration_since(self.last_step) >= STEP {
-            self.last_step = now;
+        // Steps on a fixed 50 ms grid (not "now"): frames rarely land exactly on a step, and restarting the clock at
+        // the frame showed one frame without motion every step or so (the scroll stuttered). After a pause (hidden),
+        // catch up at once.
+        if now.duration_since(self.last_step) >= STEP * BARS as u32 {
+            self.last_step = now - STEP;
+        }
+        while now.duration_since(self.last_step) >= STEP {
+            self.last_step += STEP;
             let peak = f32::from_bits(PEAK.swap(0, Ordering::Relaxed));
             self.bars.rotate_left(1);
             self.bars[BARS - 1] = if self.view == View::Recording { norm(peak) } else { 0.0 };
@@ -91,13 +134,21 @@ impl Painter {
         let mut px = Pixmap::new(w.ceil() as u32, h.ceil() as u32)?;
         let t = Transform::from_scale(scale, scale);
 
+        // Fading out at the end of the done mark: everything, pill included.
+        let shown = now.duration_since(self.since);
+        let fade = match self.view {
+            View::Done(..) => (DONE_FOR.saturating_sub(shown).as_secs_f32() / FADE.as_secs_f32()).min(1.0),
+            _ => 1.0,
+        };
+        let rgba = |r: u8, g: u8, b: u8, a: u8| paint(Color::from_rgba8(r, g, b, (a as f32 * fade) as u8));
+
         // The pill: dark, slightly see-through, a faint edge.
         let pill = rounded(0.5, 0.5, WIDTH - 1.0, HEIGHT - 1.0, (HEIGHT - 1.0) / 2.0)?;
-        px.fill_path(&pill, &paint(Color::from_rgba8(18, 18, 20, 220)), FillRule::Winding, t, None);
+        px.fill_path(&pill, &rgba(18, 18, 20, 220), FillRule::Winding, t, None);
         let edge = Stroke { width: 1.0, ..Default::default() };
-        px.stroke_path(&pill, &paint(Color::from_rgba8(255, 255, 255, 40)), &edge, t, None);
+        px.stroke_path(&pill, &rgba(255, 255, 255, 40), &edge, t, None);
 
-        let white = |a: u8| paint(Color::from_rgba8(255, 255, 255, a));
+        let white = |a: u8| rgba(255, 255, 255, a);
         match self.view {
             View::Hidden => {}
             View::Starting | View::Recording => {
@@ -107,8 +158,12 @@ impl Painter {
                 let alpha = if self.view == View::Starting { 90 } else { 255 };
                 // The bars reach into the round ends; there they're cut off by the curve (7 pt inside it).
                 let r = HEIGHT / 2.0;
-                for (i, &v) in self.bars.iter().enumerate() {
-                    let x = x0 + i as f32 * (bw + gap);
+                // Smooth scrolling: the row slides left between steps, the incoming bar (right end) follows the
+                // loudest sample so far in this step; it becomes the newest bar at the next step.
+                let frac = (now.duration_since(self.last_step).as_secs_f32() / STEP.as_secs_f32()).min(1.0);
+                let live = if self.view == View::Recording { norm(f32::from_bits(PEAK.load(Ordering::Relaxed))) } else { 0.0 };
+                for (i, &v) in self.bars.iter().chain(std::iter::once(&live)).enumerate() {
+                    let x = x0 + (i as f32 - frac) * (bw + gap);
                     let cx = x + bw / 2.0;
                     let dx = (r - cx).max(cx - (WIDTH - r)).max(0.0);
                     let room = 2.0 * ((r * r - dx * dx).max(0.0).sqrt() - 7.0);
@@ -131,6 +186,22 @@ impl Painter {
                 let done = lw * pct.min(100) as f32 / 100.0;
                 if let Some(p) = rounded(x, y, done.max(lh), lh, lh / 2.0) {
                     px.fill_path(&p, &white(255), FillRule::Winding, t, None);
+                }
+            }
+            View::Done(o, _) => {
+                // Drawn in like a pen stroke over MARK_IN.
+                let k = (shown.as_secs_f32() / MARK_IN.as_secs_f32()).min(1.0);
+                let (cx, cy) = (WIDTH / 2.0, HEIGHT / 2.0);
+                let (strokes, color): (&[&[(f32, f32)]], Paint) = match o {
+                    Outcome::Text => (&[&[(-7.5, 0.5), (-2.5, 5.5), (8.0, -6.0)]], rgba(48, 209, 88, 255)),
+                    Outcome::Empty => (&[&[(-7.0, 0.0), (7.0, 0.0)]], white(150)),
+                    Outcome::Failed => (&[&[(-5.5, -5.5), (5.5, 5.5)], &[(5.5, -5.5), (-5.5, 5.5)]], rgba(255, 69, 58, 255)),
+                };
+                let pen = Stroke { width: 2.6, line_cap: tiny_skia::LineCap::Round, line_join: tiny_skia::LineJoin::Round, ..Default::default() };
+                for pts in strokes {
+                    if let Some(p) = partial(pts, k, cx, cy) {
+                        px.stroke_path(&p, &color, &pen, t, None);
+                    }
                 }
             }
             View::Transcribing(None) => {
@@ -158,6 +229,25 @@ fn paint(c: Color) -> Paint<'static> {
     p.set_color(c);
     p.anti_alias = true;
     p
+}
+
+/// The first `k` (0..1) of the polyline `pts` (offsets from `cx`, `cy`), by length.
+fn partial(pts: &[(f32, f32)], k: f32, cx: f32, cy: f32) -> Option<tiny_skia::Path> {
+    let seg = |i: usize| ((pts[i + 1].0 - pts[i].0).hypot(pts[i + 1].1 - pts[i].1), pts[i], pts[i + 1]);
+    let total: f32 = (0..pts.len() - 1).map(|i| seg(i).0).sum();
+    let mut left = total * k.max(0.01);
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx + pts[0].0, cy + pts[0].1);
+    for i in 0..pts.len() - 1 {
+        let (len, a, b) = seg(i);
+        let f = (left / len).min(1.0);
+        pb.line_to(cx + a.0 + (b.0 - a.0) * f, cy + a.1 + (b.1 - a.1) * f);
+        left -= len;
+        if left <= 0.0 {
+            break;
+        }
+    }
+    pb.finish()
 }
 
 /// A rectangle with round corners (radius `r`), as one path.

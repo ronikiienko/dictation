@@ -215,6 +215,8 @@ mod imp {
         HotKey(GlobalHotKeyEvent),
         /// The app thread is done: stop the loop.
         Done,
+        /// The screen refreshed while the recording window shows (macOS: its display link).
+        Frame,
     }
 
     /// Updates the tray from any thread (by sending the change to the main thread).
@@ -266,6 +268,8 @@ mod imp {
         GlobalHotKeyEvent::set_event_handler(Some(move |e| {
             hk.send(Ev::HotKey(e));
         }));
+        #[cfg(target_os = "macos")]
+        let hf = h.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::Builder::new().name("app".into()).spawn(move || {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app(h.clone())));
@@ -301,7 +305,10 @@ mod imp {
                     // Also main-thread only on macOS.
                     keys.manager = Some(GlobalHotKeyManager::new().map_err(|e| e.to_string()));
                     #[cfg(target_os = "macos")]
-                    match crate::overlay::Window::new(_target) {
+                    let hf = hf.clone();
+                    match crate::overlay::Window::new(_target, move || {
+                        hf.send(Ev::Frame);
+                    }) {
                         Ok(w) => overlay = Some(w),
                         Err(e) => log::error!("recording window: {e}"),
                     }
@@ -328,6 +335,13 @@ mod imp {
                         MouseButtonState::Up if button == MouseButton::Left => model.activate(),
                         _ => {}
                     }
+                }
+                Event::UserEvent(Ev::Frame) => {
+                    #[cfg(target_os = "macos")]
+                    if let Some(o) = overlay.as_mut() {
+                        o.refresh();
+                    }
+                    return;
                 }
                 Event::UserEvent(Ev::Done) => {
                     *flow = ControlFlow::Exit;

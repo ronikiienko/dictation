@@ -317,6 +317,8 @@ struct Tray {
     reading: Option<(String, u32)>,
     /// Takes (not files) waiting for or being transcribed: the recording window shows for those only.
     takes: usize,
+    /// How the last take ended and its number: the recording window's done mark (shown once per take).
+    done: Option<(crate::overlay::Outcome, u64)>,
     /// The last take's length and how long transcribing it took ("" before the first take).
     last: String,
     /// When the take being recorded started (shown as its length, live).
@@ -460,6 +462,7 @@ impl tray::Model for Tray {
             State::Starting => View::Starting,
             State::Recording => View::Recording,
             State::Transcribing if self.takes > 0 => View::Transcribing(self.progress),
+            State::Idle if let Some((o, n)) = self.done => View::Done(o, n),
             _ => View::Hidden,
         }
     }
@@ -1042,6 +1045,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         progress: None,
         reading: None,
         takes: 0,
+        done: None,
         last: String::new(),
         rec_since: None,
         tx: tx.clone(),
@@ -1171,6 +1175,7 @@ async fn main_loop(
     let mut take_no = 0u64; // numbers takes, so a late Ev::MicLive of a stopped take is ignored
     let mut shortcut = String::new();
     let mut busy = 0usize; // takes queued in the engine
+    let mut done_no = 0u64; // numbers finished takes for the recording window's done mark
     let mut files = 0usize; // files queued in the engine (also counted in `busy`)
     let mut reading = false; // a file is being read before it's transcribed
     // Their audio at the microphone's own rate (with that rate), for the full-quality copy saved with the take.
@@ -1333,7 +1338,8 @@ async fn main_loop(
                 if state == State::Transcribing && busy == 0 {
                     state = State::Idle;
                 }
-                match r {
+                use crate::overlay::Outcome;
+                let outcome = match r {
                     Ok(t) => {
                         // (title, body) of a notice about what went wrong.
                         let mut problem: Option<(&str, String)> = None;
@@ -1350,6 +1356,13 @@ async fn main_loop(
                         }
                         // Only when something needs attention: a working take shows its result by itself (pasted or
                         // on the clipboard), a notification on every take was just noise (user, 2026-11-20).
+                        let outcome = if problem.is_some() {
+                            Outcome::Failed
+                        } else if t.text.is_empty() {
+                            Outcome::Empty
+                        } else {
+                            Outcome::Text
+                        };
                         if let Some((title, body)) = problem {
                             notice.show(title, &body, "dialog-error").await;
                         } else if t.text.is_empty() && !matches!(state, State::Starting | State::Recording) {
@@ -1362,9 +1375,16 @@ async fn main_loop(
                         if cfg.save_recordings {
                             save_take(t, full);
                         }
+                        outcome
                     }
-                    Err(e) => notice.show("Transcription failed", &e, "dialog-error").await,
-                }
+                    Err(e) => {
+                        notice.show("Transcription failed", &e, "dialog-error").await;
+                        Outcome::Failed
+                    }
+                };
+                done_no += 1;
+                let n = done_no;
+                tray.update(move |t: &mut Tray| t.done = Some((outcome, n))).await;
             }
             Ev::File(x, srt, reply) => {
                 if matches!(state, State::NoModel | State::Optimizing) {

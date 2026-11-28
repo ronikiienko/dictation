@@ -6,10 +6,12 @@ use super::{BOTTOM, FRAME, HEIGHT, Painter, View, WIDTH};
 use objc2::msg_send;
 use objc2::runtime::AnyObject;
 use std::ffi::c_void;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tao::dpi::{LogicalPosition, LogicalSize};
 use tao::event_loop::EventLoopWindowTarget;
-use tao::platform::macos::{WindowBuilderExtMacOS, WindowExtMacOS};
+use tao::platform::macos::{MonitorHandleExtMacOS, WindowBuilderExtMacOS, WindowExtMacOS};
 use tao::window::{Window as TaoWindow, WindowBuilder};
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -39,6 +41,78 @@ unsafe extern "C" {
     fn CGImageRelease(image: *mut c_void);
 }
 
+#[link(name = "CoreVideo", kind = "framework")]
+unsafe extern "C" {
+    fn CVDisplayLinkCreateWithActiveCGDisplays(link: *mut *mut c_void) -> i32;
+    fn CVDisplayLinkSetOutputCallback(link: *mut c_void, cb: LinkCallback, ctx: *mut c_void) -> i32;
+    fn CVDisplayLinkStart(link: *mut c_void) -> i32;
+    fn CVDisplayLinkSetCurrentCGDisplay(link: *mut c_void, display: u32) -> i32;
+    fn CVDisplayLinkStop(link: *mut c_void) -> i32;
+    fn CVDisplayLinkRelease(link: *mut c_void);
+}
+
+type LinkCallback = unsafe extern "C" fn(*mut c_void, *const c_void, *const c_void, u64, *mut u64, *mut c_void) -> i32;
+
+/// What the display link's thread calls: the wake-up, once until the event loop took it.
+struct Wake {
+    wake: Box<dyn Fn() + Send + Sync>,
+    pending: Arc<AtomicBool>,
+}
+
+unsafe extern "C" fn on_refresh(_: *mut c_void, _: *const c_void, _: *const c_void, _: u64, _: *mut u64, ctx: *mut c_void) -> i32 {
+    let w = unsafe { &*(ctx as *const Wake) };
+    if !w.pending.swap(true, Ordering::AcqRel) {
+        (w.wake)();
+    }
+    0
+}
+
+/// A CoreVideo display link: a callback right after each screen refresh, so every refresh gets one new frame
+/// (a timer drifts against the screen's 60 Hz: now and then a frame is skipped or shown twice, a hitch in motion).
+struct DisplayLink {
+    link: *mut c_void,
+    ctx: *mut Wake,
+    pending: Arc<AtomicBool>,
+}
+
+impl DisplayLink {
+    fn new(wake: Box<dyn Fn() + Send + Sync>) -> Option<DisplayLink> {
+        let pending = Arc::new(AtomicBool::new(false));
+        let ctx = Box::into_raw(Box::new(Wake { wake, pending: pending.clone() }));
+        let mut link = std::ptr::null_mut();
+        // SAFETY: plain CoreVideo calls; ctx lives until Drop (after the link is stopped and released).
+        unsafe {
+            if CVDisplayLinkCreateWithActiveCGDisplays(&mut link) != 0 || link.is_null() {
+                drop(Box::from_raw(ctx));
+                return None;
+            }
+            CVDisplayLinkSetOutputCallback(link, on_refresh, ctx as *mut c_void);
+        }
+        Some(DisplayLink { link, ctx, pending })
+    }
+    fn set_display(&self, display: u32) {
+        unsafe { CVDisplayLinkSetCurrentCGDisplay(self.link, display) };
+    }
+    fn start(&self) {
+        self.pending.store(false, Ordering::Release);
+        unsafe { CVDisplayLinkStart(self.link) };
+    }
+    fn stop(&self) {
+        unsafe { CVDisplayLinkStop(self.link) };
+    }
+}
+
+impl Drop for DisplayLink {
+    fn drop(&mut self) {
+        // SAFETY: stopping waits for a running callback; then nothing uses ctx any more.
+        unsafe {
+            CVDisplayLinkStop(self.link);
+            CVDisplayLinkRelease(self.link);
+            drop(Box::from_raw(self.ctx));
+        }
+    }
+}
+
 /// kCGImageAlphaPremultipliedLast, default byte order: R, G, B, A in memory.
 const RGBA_PREMULTIPLIED: u32 = 1;
 
@@ -51,10 +125,14 @@ pub struct Window {
     win: TaoWindow,
     painter: Painter,
     next: Instant,
+    /// Wakes the event loop once per screen refresh while shown (None: couldn't make one, a timer drives it).
+    link: Option<DisplayLink>,
 }
 
 impl Window {
-    pub fn new<T: 'static>(target: &EventLoopWindowTarget<T>) -> Result<Window, String> {
+    /// `wake` is called from the display link's thread once per screen refresh while shown (at most one pending):
+    /// it should make the event loop call [`Window::refresh`].
+    pub fn new<T: 'static>(target: &EventLoopWindowTarget<T>, wake: impl Fn() + Send + Sync + 'static) -> Result<Window, String> {
         let win = WindowBuilder::new()
             .with_title("Dictation")
             .with_decorations(false)
@@ -70,7 +148,11 @@ impl Window {
             .build(target)
             .map_err(|e| e.to_string())?;
         let _ = win.set_ignore_cursor_events(true);
-        Ok(Window { win, painter: Painter::default(), next: Instant::now() })
+        let link = DisplayLink::new(Box::new(wake));
+        if link.is_none() {
+            log::warn!("recording window: no display link, drawing on a timer");
+        }
+        Ok(Window { win, painter: Painter::default(), next: Instant::now(), link })
     }
 
     /// Show `v` (Hidden = hide). Placed at the bottom middle of the screen the mouse is on, when it appears.
@@ -81,12 +163,18 @@ impl Window {
         }
         if !self.painter.visible() {
             self.win.set_visible(false);
+            if let Some(l) = &self.link {
+                l.stop();
+            }
             return;
         }
         if !was {
             self.place();
             self.draw();
             self.win.set_visible(true);
+            if let Some(l) = &self.link {
+                l.start();
+            }
         }
     }
 
@@ -103,16 +191,41 @@ impl Window {
         let x = pos.x + (size.width - WIDTH as f64) / 2.0;
         let y = pos.y + size.height - HEIGHT as f64 - BOTTOM as f64;
         self.win.set_outer_position(LogicalPosition::new(x, y));
+        // Time frames by this screen's refreshes (screens can differ: 120 Hz built-in, 60 Hz external).
+        if let Some(l) = &self.link {
+            l.set_display(m.native_id());
+        }
     }
 
-    /// When the next frame is due; None while hidden.
+    /// When the next frame is due; None while hidden or when the display link drives the frames.
     pub fn next_frame(&self) -> Option<Instant> {
-        self.painter.visible().then_some(self.next)
+        (self.painter.visible() && self.link.is_none()).then_some(self.next)
     }
 
     /// Draw a frame if one is due.
     pub fn tick(&mut self) {
+        if self.link.is_some() {
+            return; // frames come from `refresh`
+        }
+        if self.painter.expire() {
+            self.win.set_visible(false);
+            return;
+        }
         if self.painter.visible() && Instant::now() >= self.next {
+            self.draw();
+        }
+    }
+
+    /// The screen refreshed (the display link's wake-up): draw the next frame.
+    pub fn refresh(&mut self) {
+        let Some(l) = &self.link else { return };
+        l.pending.store(false, Ordering::Release);
+        if self.painter.expire() {
+            self.win.set_visible(false);
+            l.stop();
+            return;
+        }
+        if self.painter.visible() {
             self.draw();
         }
     }
